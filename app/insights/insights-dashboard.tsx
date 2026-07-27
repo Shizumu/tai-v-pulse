@@ -1,6 +1,8 @@
 "use client";
+/* eslint-disable react-hooks/set-state-in-effect */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FocusEvent, type PointerEvent as ReactPointerEvent } from "react";
+import SiteHeader from "../site-header";
 
 const API_BASE = process.env.NEXT_PUBLIC_TRACKER_API ?? "http://127.0.0.1:8787";
 
@@ -17,6 +19,8 @@ type Summary = {
   channels: Channel[];
   categories: { category: string; channel_count: number }[];
   settings: { min_subscribers: number };
+  owned_channel_id: string | null;
+  owned_channel: Channel | null;
 };
 
 type MetricValue = { median: number | null; p75: number | null };
@@ -40,9 +44,43 @@ type ChannelMetrics = {
   snapshot_count: number;
 };
 
+type RankedVideo = {
+  video_id: string;
+  title: string;
+  thumbnail_url: string | null;
+  channel_id: string;
+  channel_title: string;
+  subscriber_count: number | null;
+  view_count: number | null;
+  view_rate: number | null;
+  peak_concurrent: number | null;
+  ccv_rate: number | null;
+  content_type: string;
+  attributes: string[];
+  format_type: string;
+  published_at: string | null;
+};
+
+type ContentBreakdown = {
+  content_type: string;
+  description: string;
+  items: number;
+  share: number;
+  streams: number;
+  median_views: number | null;
+  median_view_rate: number | null;
+  median_peak_concurrent: number | null;
+  average_duration_seconds: number | null;
+  representative_videos: RankedVideo[];
+  is_attribute?: boolean;
+};
+
+type LandscapeFormat = "主要內容" | "直播" | "影片" | "Shorts" | "全部";
+
 type Insights = {
+  generated_at: string;
   period_days: number;
-  filters: { min_subscribers: number; max_subscribers: number; category: string };
+  filters: { min_subscribers: number; max_subscribers: number; category: string; include_graduated: boolean; channel_ids: string[] };
   overview: {
     channels: number;
     active_channels: number;
@@ -57,32 +95,16 @@ type Insights = {
   };
   benchmarks: Record<string, MetricValue>;
   reference: ChannelMetrics | null;
-  content_breakdown: {
-    content_type: string;
+  content_breakdown: ContentBreakdown[];
+  content_landscapes: Record<LandscapeFormat, {
     items: number;
-    share: number;
-    streams: number;
-    median_views: number | null;
-    median_view_rate: number | null;
-    median_peak_concurrent: number | null;
-    average_duration_seconds: number | null;
-  }[];
+    content_breakdown: ContentBreakdown[];
+    collaboration: ContentBreakdown;
+  }>;
   format_breakdown: { format_type: string; items: number }[];
   schedule: { count: number; median_peak: number | null }[][];
-  top_videos: {
-    video_id: string;
-    title: string;
-    thumbnail_url: string | null;
-    channel_id: string;
-    channel_title: string;
-    subscriber_count: number | null;
-    view_count: number | null;
-    view_rate: number | null;
-    peak_concurrent: number | null;
-    content_type: string;
-    format_type: string;
-    published_at: string | null;
-  }[];
+  top_videos: RankedVideo[];
+  top_videos_by_format: Record<"綜合" | "影片" | "直播" | "Shorts", RankedVideo[]>;
   top_channels: ChannelMetrics[];
   keywords: { keyword: string; count: number }[];
   coverage: {
@@ -134,13 +156,31 @@ export default function InsightsDashboard() {
   const [insights, setInsights] = useState<Insights | null>(null);
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [days, setDays] = useState(30);
   const [mode, setMode] = useState("all");
   const [tier, setTier] = useState("5k-10k");
+  const [customMin, setCustomMin] = useState(1000);
+  const [customMax, setCustomMax] = useState(5000);
+  const [selectedChannelIds, setSelectedChannelIds] = useState<string[]>([]);
+  const [savedGroups, setSavedGroups] = useState<{ name: string; ids: string[] }[]>([]);
+  const [groupName, setGroupName] = useState("");
   const [category, setCategory] = useState("全部");
   const [referenceId, setReferenceId] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
+  const [includeGraduated, setIncludeGraduated] = useState(false);
+  const [contentFormat, setContentFormat] = useState<"綜合" | "影片" | "直播" | "Shorts">("影片");
+  const [landscapeFormat, setLandscapeFormat] = useState<LandscapeFormat>("主要內容");
+  const [representativePopover, setRepresentativePopover] = useState<{
+    item: ContentBreakdown;
+    x: number;
+    y: number;
+    locked: boolean;
+  } | null>(null);
+  const insightsRef = useRef<Insights | null>(null);
+  const ownedDefaultApplied = useRef(false);
+  const closePopoverTimer = useRef<number | null>(null);
 
   const loadSummary = useCallback(async () => {
     try {
@@ -159,17 +199,125 @@ export default function InsightsDashboard() {
     return () => window.clearInterval(timer);
   }, [loadSummary]);
 
-  const reference = summary?.channels.find((channel) => channel.channel_id === referenceId) ?? null;
-  const cohortRange = useMemo(() => {
-    if (mode === "relative" && reference?.subscriber_count) {
-      return [Math.max(1, Math.floor(reference.subscriber_count * .5)), Math.ceil(reference.subscriber_count * 2)] as const;
-    }
-    if (mode === "tier") return [TIERS[tier][0], TIERS[tier][1]] as const;
-    return [summary?.settings.min_subscribers ?? 0, 100000000] as const;
-  }, [mode, reference, summary?.settings.min_subscribers, tier]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setRefreshKey((value) => value + 1), 300000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
-    if (!summary || (mode === "relative" && !reference)) {
+    const saved = window.localStorage.getItem("tai-v-pulse-efficiency-format");
+    if (saved && ["綜合", "影片", "直播", "Shorts"].includes(saved)) {
+      setContentFormat(saved as "綜合" | "影片" | "直播" | "Shorts");
+    }
+    const savedLandscape = window.localStorage.getItem("tai-v-pulse-landscape-format");
+    if (savedLandscape && ["主要內容", "直播", "影片", "Shorts", "全部"].includes(savedLandscape)) {
+      setLandscapeFormat(savedLandscape as LandscapeFormat);
+    }
+    try {
+      const groups = JSON.parse(window.localStorage.getItem("tai-v-pulse-comparison-groups") ?? "[]") as { name: string; ids: string[] }[];
+      if (Array.isArray(groups)) setSavedGroups(groups.filter((group) => group.name && Array.isArray(group.ids)));
+    } catch {
+      setSavedGroups([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("tai-v-pulse-efficiency-format", contentFormat);
+  }, [contentFormat]);
+
+  useEffect(() => {
+    window.localStorage.setItem("tai-v-pulse-landscape-format", landscapeFormat);
+    setRepresentativePopover(null);
+  }, [landscapeFormat]);
+
+  useEffect(() => {
+    if (!ownedDefaultApplied.current && summary?.owned_channel_id) {
+      ownedDefaultApplied.current = true;
+      setReferenceId(summary.owned_channel_id);
+      setMode("relative");
+    }
+  }, [summary?.owned_channel_id]);
+
+  const reference = summary?.channels.find((channel) => channel.channel_id === referenceId)
+    ?? (summary?.owned_channel?.channel_id === referenceId ? summary.owned_channel : null);
+  const summaryReady = Boolean(summary);
+  const referenceAvailable = Boolean(reference);
+  const referenceSubscribers = reference?.subscriber_count ?? null;
+  const cohortRange = useMemo(() => {
+    if (mode === "relative" && referenceSubscribers) {
+      return [Math.max(1, Math.floor(referenceSubscribers * .5)), Math.ceil(referenceSubscribers * 2)] as const;
+    }
+    if (mode === "tier") return [TIERS[tier][0], TIERS[tier][1]] as const;
+    if (mode === "range") return [Math.max(0, customMin), Math.max(customMin, customMax)] as const;
+    return [summary?.settings.min_subscribers ?? 0, 100000000] as const;
+  }, [customMax, customMin, mode, referenceSubscribers, summary?.settings.min_subscribers, tier]);
+
+  const selectedChannels = selectedChannelIds
+    .map((channelId) => summary?.channels.find((channel) => channel.channel_id === channelId))
+    .filter((channel): channel is Channel => Boolean(channel));
+
+  function addSelectedChannel(channelId: string) {
+    if (!channelId || channelId === referenceId) return;
+    setSelectedChannelIds((current) => [...new Set([...current, channelId])].slice(0, 5));
+  }
+
+  function saveComparisonGroup() {
+    const name = groupName.trim();
+    if (!name || selectedChannelIds.length === 0) return;
+    const next = [...savedGroups.filter((group) => group.name !== name), { name, ids: selectedChannelIds }];
+    setSavedGroups(next);
+    window.localStorage.setItem("tai-v-pulse-comparison-groups", JSON.stringify(next));
+    setGroupName("");
+  }
+
+  function popoverPosition(clientX: number, clientY: number) {
+    const width = Math.min(430, window.innerWidth - 24);
+    const height = 360;
+    const x = clientX + 16 + width > window.innerWidth - 12
+      ? Math.max(12, clientX - width - 16)
+      : clientX + 16;
+    const y = clientY + 14 + height > window.innerHeight - 12
+      ? Math.max(12, clientY - height - 14)
+      : clientY + 14;
+    return { x, y };
+  }
+
+  function cancelPopoverClose() {
+    if (closePopoverTimer.current !== null) {
+      window.clearTimeout(closePopoverTimer.current);
+      closePopoverTimer.current = null;
+    }
+  }
+
+  function schedulePopoverClose() {
+    cancelPopoverClose();
+    closePopoverTimer.current = window.setTimeout(() => {
+      setRepresentativePopover((current) => current?.locked ? current : null);
+    }, 140);
+  }
+
+  function openPopover(item: ContentBreakdown, clientX: number, clientY: number, locked = false) {
+    cancelPopoverClose();
+    setRepresentativePopover({ item, ...popoverPosition(clientX, clientY), locked });
+  }
+
+  function handleCardPointer(event: ReactPointerEvent<HTMLElement>, item: ContentBreakdown) {
+    if (event.pointerType !== "mouse") return;
+    setRepresentativePopover((current) => {
+      if (current?.locked) return current;
+      return { item, ...popoverPosition(event.clientX, event.clientY), locked: false };
+    });
+  }
+
+  function handleCardFocus(event: FocusEvent<HTMLElement>, item: ContentBreakdown) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    openPopover(item, rect.right, rect.top + 24);
+  }
+
+  const selectedChannelKey = selectedChannelIds.join(",");
+
+  useEffect(() => {
+    if (!summaryReady || (mode === "relative" && !referenceAvailable) || (mode === "channels" && !selectedChannelKey)) {
       setInsights(null);
       setLoading(false);
       return;
@@ -180,29 +328,40 @@ export default function InsightsDashboard() {
       min_subscribers: String(cohortRange[0]),
       max_subscribers: String(cohortRange[1]),
       category,
+      include_graduated: String(includeGraduated),
     });
     if (referenceId) params.set("reference_channel_id", referenceId);
-    setLoading(true);
+    if (mode === "channels" && selectedChannelKey) params.set("channel_ids", selectedChannelKey);
+    if (insightsRef.current) setRefreshing(true);
+    else setLoading(true);
     setError(null);
     fetch(`${API_BASE}/api/insights?${params}`, { cache: "no-store", signal: controller.signal })
       .then(async (response) => {
         const payload = await response.json() as Insights & { error?: string };
         if (!response.ok) throw new Error(payload.error ?? "無法載入分析資料");
+        insightsRef.current = payload;
         setInsights(payload);
       })
       .catch((reason: unknown) => {
         if (reason instanceof DOMException && reason.name === "AbortError") return;
         setError(reason instanceof Error ? reason.message : "無法載入分析資料");
       })
-      .finally(() => setLoading(false));
+      .finally(() => { setLoading(false); setRefreshing(false); });
     return () => controller.abort();
-  }, [category, cohortRange, days, mode, reference, referenceId, refreshKey, summary]);
+  }, [category, cohortRange, days, includeGraduated, mode, referenceAvailable, referenceId, refreshKey, selectedChannelKey, summaryReady]);
 
   const cohortLabel = mode === "relative"
     ? reference ? `${reference.title} 的 0.5～2 倍訂閱` : "請選擇參考頻道"
-    : mode === "tier" ? `${TIERS[tier][2]} 訂閱` : "全部已收錄頻道";
+    : mode === "tier" ? `${TIERS[tier][2]} 訂閱`
+      : mode === "range" ? `${exact(cohortRange[0])}～${exact(cohortRange[1])} 訂閱`
+        : mode === "channels" ? `${selectedChannelIds.length} 個指定頻道` : "全部已收錄頻道";
   const heatMax = Math.max(1, ...(insights?.schedule.flat().map((cell) => cell.count) ?? [1]));
-  const contentMax = Math.max(1, ...(insights?.content_breakdown.map((item) => item.items) ?? [1]));
+  const activeLandscape = insights?.content_landscapes?.[landscapeFormat];
+  const landscapeItems = activeLandscape
+    ? [...activeLandscape.content_breakdown, ...(activeLandscape.collaboration.items ? [activeLandscape.collaboration] : [])]
+    : insights?.content_breakdown ?? [];
+  const contentMax = Math.max(1, ...(landscapeItems.map((item) => item.items) ?? [1]));
+  const efficientVideos = insights?.top_videos_by_format?.[contentFormat] ?? [];
 
   const benchmarkRows = [
     ["weekly_frequency", "每週內容數", (value: number | null) => value === null ? "—" : `${value.toFixed(1)} 個`],
@@ -217,11 +376,14 @@ export default function InsightsDashboard() {
 
   return (
     <main className="app-shell insights-shell">
-      <header className="topbar insights-topbar">
-        <div className="brand-block"><div className="brand-mark" aria-hidden="true">V</div><div><p className="eyebrow">CONTENT LANDSCAPE</p><h1>內容環境</h1></div></div>
-        <nav className="page-nav" aria-label="主要頁面"><a href="/">監測首頁</a><a className="active" href="/insights">內容環境</a></nav>
-        <div className="status-cluster"><span className={`connection ${connected ? "online" : "offline"}`}><i />{connected ? "本機資料已連線" : "等待本機服務"}</span><button className="button ghost" type="button" onClick={() => setRefreshKey((value) => value + 1)} disabled={!connected || loading}>更新分析</button></div>
-      </header>
+      <SiteHeader
+        active="insights"
+        eyebrow="CONTENT LANDSCAPE"
+        title="內容環境"
+        connected={connected}
+        statusText={refreshing ? "背景更新中，閱讀位置會保留" : insights ? `分析更新 ${new Intl.DateTimeFormat("zh-TW", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Taipei" }).format(new Date(insights.generated_at))}` : undefined}
+        actions={<button className="button ghost" type="button" onClick={() => setRefreshKey((value) => value + 1)} disabled={!connected || loading || refreshing}>{refreshing ? "更新中…" : "更新分析"}</button>}
+      />
 
       {!connected && <section className="notice warning"><span className="notice-icon">!</span><div><strong>資料服務尚未啟動</strong><p>啟動台V Pulse 後，這個頁面會自動讀取已收錄資料。</p></div></section>}
       {error && <section className="inline-message">{error}</section>}
@@ -230,15 +392,19 @@ export default function InsightsDashboard() {
         <div className="control-intro"><p className="section-kicker">COHORT BUILDER</p><h2>選擇要觀察的頻道環境</h2><p>用相同量級、分類與期間比較內容策略，避免被大型頻道的數字干擾。</p></div>
         <div className="control-grid">
           <label><span>期間</span><select value={days} onChange={(event) => setDays(Number(event.target.value))}><option value={7}>最近 7 天</option><option value={30}>最近 30 天</option><option value={90}>最近 90 天</option></select></label>
-          <label><span>比較群組</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">全體已收錄頻道</option><option value="relative">參考頻道的 0.5～2 倍</option><option value="tier">固定訂閱級距</option></select></label>
+          <label><span>比較群組</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">全體已收錄頻道</option><option value="relative">參考頻道的 0.5～2 倍</option><option value="tier">固定訂閱級距</option><option value="range">自訂訂閱範圍</option><option value="channels">指定頻道</option></select></label>
           {mode === "tier" && <label><span>訂閱級距</span><select value={tier} onChange={(event) => setTier(event.target.value)}>{Object.entries(TIERS).map(([value, item]) => <option value={value} key={value}>{item[2]}</option>)}</select></label>}
+          {mode === "range" && <div className="range-controls"><label><span>最低訂閱</span><input type="number" min={0} value={customMin} onChange={(event) => setCustomMin(Number(event.target.value))} /></label><label><span>最高訂閱</span><input type="number" min={customMin} value={customMax} onChange={(event) => setCustomMax(Number(event.target.value))} /></label></div>}
+          {mode === "channels" && <div className="channel-group-builder"><label><span>加入比較頻道（最多 5 個）</span><select value="" onChange={(event) => addSelectedChannel(event.target.value)}><option value="">選擇頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !selectedChannelIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)}</option>)}</select></label><div className="selected-channel-chips">{selectedChannels.map((channel) => <button type="button" onClick={() => setSelectedChannelIds((current) => current.filter((id) => id !== channel.channel_id))} key={channel.channel_id}>{channel.title}<span>×</span></button>)}</div><div className="save-group-row"><input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="比較組合名稱" /><button type="button" onClick={saveComparisonGroup} disabled={!groupName.trim() || selectedChannelIds.length === 0}>儲存</button>{savedGroups.length > 0 && <select value="" onChange={(event) => { const group = savedGroups.find((item) => item.name === event.target.value); if (group) setSelectedChannelIds(group.ids.slice(0, 5)); }}><option value="">載入已存組合…</option>{savedGroups.map((group) => <option value={group.name} key={group.name}>{group.name}</option>)}</select>}</div></div>}
           <label><span>頻道分類</span><select value={category} onChange={(event) => setCategory(event.target.value)}><option>全部</option>{summary?.categories.map((item) => <option value={item.category} key={item.category}>{item.category}（{item.channel_count}）</option>)}</select></label>
-          <label className="reference-control"><span>參考頻道（用於個別比較）</span><select value={referenceId} onChange={(event) => setReferenceId(event.target.value)}><option value="">不比較單一頻道</option>{summary?.channels.map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)} 訂閱</option>)}</select></label>
+          <label className="reference-control"><span>參考頻道（用於個別比較）</span><select value={referenceId} onChange={(event) => setReferenceId(event.target.value)}><option value="">不比較單一頻道</option>{summary?.owned_channel && !summary.channels.some((channel) => channel.channel_id === summary.owned_channel?.channel_id) && <option value={summary.owned_channel.channel_id}>我的頻道：{summary.owned_channel.title}｜{compact(summary.owned_channel.subscriber_count)} 訂閱</option>}{summary?.channels.map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)} 訂閱</option>)}</select></label>
+          <label className="graduated-toggle"><input type="checkbox" checked={includeGraduated} onChange={(event) => setIncludeGraduated(event.target.checked)} /><span>包含已確認畢業頻道</span></label>
         </div>
-        <div className="cohort-summary"><span>目前群組</span><strong>{cohortLabel}</strong><small>{exact(cohortRange[0])}～{cohortRange[1] >= 100000000 ? "不限上限" : exact(cohortRange[1])} 訂閱</small></div>
+        <div className="cohort-summary"><span>{summary?.owned_channel_id && referenceId === summary.owned_channel_id ? "以我的頻道為基準" : "目前群組"}</span><strong>{cohortLabel}</strong><small>{mode === "channels" ? "基準頻道不納入同級中位數" : `${exact(cohortRange[0])}～${cohortRange[1] >= 100000000 ? "不限上限" : exact(cohortRange[1])} 訂閱`}{includeGraduated ? " · 包含畢業頻道" : ""}</small></div>
       </section>
 
       {mode === "relative" && !reference && <section className="panel insight-placeholder"><strong>先選擇參考頻道</strong><p>系統會自動建立訂閱數為該頻道 0.5～2 倍的比較群組。</p></section>}
+      {mode === "channels" && selectedChannelIds.length === 0 && <section className="panel insight-placeholder"><strong>先加入比較頻道</strong><p>最多可指定五個頻道，基準頻道會另外顯示而不影響群組中位數。</p></section>}
       {loading && <section className="panel insight-placeholder">正在整理內容環境…</section>}
 
       {!loading && insights && (
@@ -267,18 +433,21 @@ export default function InsightsDashboard() {
           </section>
 
           <section className="panel content-landscape-panel">
-            <div className="panel-heading"><div><p className="section-kicker">CONTENT LANDSCAPE</p><h2>大家都在做什麼</h2></div><span>以近期已蒐集影片與直播計算</span></div>
-            <div className="content-landscape-grid">{insights.content_breakdown.length === 0 ? <div className="insight-placeholder embedded">目前期間內尚無內容資料。</div> : insights.content_breakdown.map((item) => {
+            <div className="panel-heading efficiency-heading"><div><p className="section-kicker">CONTENT LANDSCAPE</p><h2>大家都在做什麼</h2></div><div className="format-tabs landscape-tabs" role="group" aria-label="內容環境形式">{(["主要內容", "直播", "影片", "Shorts", "全部"] as const).map((format) => <button className={landscapeFormat === format ? "active" : ""} type="button" onClick={() => setLandscapeFormat(format)} aria-pressed={landscapeFormat === format} key={format}>{format === "主要內容" ? "直播＋一般影片" : format === "影片" ? "一般影片" : format}</button>)}</div></div>
+            <p className="efficiency-explainer">主題、影片形式與聯動屬性分開判斷；移動滑鼠時代表內容會跟隨游標，點一下可固定。現在顯示 {activeLandscape?.items ?? 0} 項{landscapeFormat === "主要內容" ? "非 Shorts 內容" : landscapeFormat}。</p>
+            <div className="content-landscape-grid">{landscapeItems.length === 0 ? <div className="insight-placeholder embedded">目前期間內尚無內容資料。</div> : landscapeItems.map((item) => {
               const strong = item.median_view_rate !== null && item.median_view_rate >= (insights.benchmarks.median_view_rate?.p75 ?? Infinity);
               const opportunity = strong && item.share < 15;
-              return <article className="content-type-card" key={item.content_type}><div className="content-type-heading"><strong>{item.content_type}</strong>{opportunity ? <span className="opportunity">低占比高表現</span> : strong ? <span>表現突出</span> : null}</div><div className="content-share-track"><i style={{ width: `${item.items / contentMax * 100}%` }} /></div><dl><div><dt>內容數</dt><dd>{item.items}（{item.share.toFixed(1)}%）</dd></div><div><dt>觀看中位數</dt><dd>{compact(item.median_views)}</dd></div><div><dt>觀看／訂閱</dt><dd>{percent(item.median_view_rate)}</dd></div><div><dt>直播同接中位數</dt><dd>{compact(item.median_peak_concurrent)}</dd></div></dl></article>;
+              const expanded = representativePopover?.item.content_type === item.content_type;
+              return <article className={`content-type-card${expanded ? " open" : ""}${item.is_attribute ? " attribute-card" : ""}`} key={`${item.content_type}-${item.is_attribute ? "attribute" : "topic"}`} onPointerEnter={(event) => handleCardPointer(event, item)} onPointerMove={(event) => handleCardPointer(event, item)} onPointerLeave={schedulePopoverClose} onFocus={(event) => handleCardFocus(event, item)} onBlur={schedulePopoverClose}><button className="content-card-trigger" type="button" aria-expanded={expanded} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); if (representativePopover?.locked && representativePopover.item.content_type === item.content_type) setRepresentativePopover(null); else openPopover(item, rect.right, rect.top + 30, true); }}><div className="content-type-heading"><strong>{item.content_type}</strong>{item.is_attribute ? <span className="attribute-label">附加標籤</span> : opportunity ? <span className="opportunity">低占比高表現</span> : strong ? <span>表現突出</span> : null}</div><p className="content-definition">{item.description}</p><div className="content-share-track"><i style={{ width: `${item.items / contentMax * 100}%` }} /></div><dl><div><dt>內容數</dt><dd>{item.items}（{item.share.toFixed(1)}%）</dd></div><div><dt>觀看中位數</dt><dd>{compact(item.median_views)}</dd></div><div><dt>觀看／訂閱</dt><dd>{percent(item.median_view_rate)}</dd></div><div><dt>直播同接中位數</dt><dd>{compact(item.median_peak_concurrent)}</dd></div></dl></button></article>;
             })}</div>
+            {representativePopover && <div className={`content-representatives floating${representativePopover.locked ? " locked" : ""}`} style={{ left: representativePopover.x, top: representativePopover.y }} role="dialog" aria-label={`${representativePopover.item.content_type}代表內容`} onPointerEnter={cancelPopoverClose} onPointerLeave={schedulePopoverClose}><div><strong>{representativePopover.item.content_type}代表內容</strong><span>每個頻道最多一項</span>{representativePopover.locked && <button type="button" onClick={() => setRepresentativePopover(null)} aria-label="關閉代表內容">×</button>}</div>{representativePopover.item.representative_videos.length === 0 ? <p>目前沒有足夠資料。</p> : representativePopover.item.representative_videos.map((video, index) => <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" key={video.video_id}><b>{index + 1}</b>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <i>V</i>}<span><strong>{video.title}</strong><small>{video.channel_title} · <em>{video.format_type}</em>{video.attributes.includes("聯動") ? " · 聯動" : ""} · {compact(video.view_count)} 觀看 · {percent(video.view_rate)}</small></span></a>)}</div>}
           </section>
 
           <section className="insight-two-column schedule-layout">
             <article className="panel schedule-panel">
               <div className="panel-heading"><div><p className="section-kicker">LIVE SCHEDULE</p><h2>直播時段熱圖</h2></div><span>台北時間 · 顏色越深代表開台越集中</span></div>
-              <div className="heatmap" role="img" aria-label="一週直播開台時段熱圖"><div className="heatmap-corner" />{BLOCKS.map((block) => <span className="heatmap-header" key={block}>{block}</span>)}{insights.schedule.map((row, day) => <div className="heatmap-row" key={DAYS[day]}><strong>{DAYS[day]}</strong>{row.map((cell, block) => <div className="heat-cell" key={block} style={{ backgroundColor: `rgba(31,158,116,${.08 + cell.count / heatMax * .82})` }} title={`${DAYS[day]} ${BLOCKS[block]}：${cell.count} 場，最高同接中位數 ${compact(cell.median_peak)}`}><span>{cell.count || ""}</span></div>)}</div>)}</div>
+              <div className="heatmap" role="img" aria-label="一週直播開台時段熱圖"><div className="heatmap-corner" />{BLOCKS.map((block) => <span className="heatmap-header" key={block}>{block}</span>)}{insights.schedule.map((row, day) => <div className="heatmap-row" key={DAYS[day]}><strong>{DAYS[day]}</strong>{row.map((cell, block) => <div className="heat-cell" key={block} style={{ backgroundColor: `color-mix(in srgb, var(--mint) ${8 + cell.count / heatMax * 82}%, transparent)` }} title={`${DAYS[day]} ${BLOCKS[block]}：${cell.count} 場，最高同接中位數 ${compact(cell.median_peak)}`}><span>{cell.count || ""}</span></div>)}</div>)}</div>
               <p className="panel-footnote">這表示同級頻道何時集中開台，不代表觀眾彼此重疊。</p>
             </article>
 
@@ -291,8 +460,9 @@ export default function InsightsDashboard() {
 
           <section className="insight-two-column leader-layout">
             <article className="panel top-content-panel">
-              <div className="panel-heading"><div><p className="section-kicker">CONTENT EXAMPLES</p><h2>同級高效率內容</h2></div><span>依觀看／訂閱比排序</span></div>
-              <div className="top-content-list">{insights.top_videos.length === 0 ? <div className="insight-placeholder embedded">目前沒有近期影片。</div> : insights.top_videos.map((video, index) => <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" className="top-content-row" key={video.video_id}><span className="rank">{index + 1}</span>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <span className="top-thumb-fallback">V</span>}<div><strong>{video.title}</strong><p>{video.channel_title} · {video.content_type} · {video.format_type}</p></div><div className="top-content-metric"><strong>{percent(video.view_rate)}</strong><span>{compact(video.view_count)} 觀看</span></div></a>)}</div>
+              <div className="panel-heading efficiency-heading"><div><p className="section-kicker">CONTENT EXAMPLES</p><h2>同級高效率內容</h2></div><div className="format-tabs" role="group" aria-label="高效率內容形式">{(["影片", "直播", "Shorts", "綜合"] as const).map((format) => <button className={contentFormat === format ? "active" : ""} type="button" onClick={() => setContentFormat(format)} aria-pressed={contentFormat === format} key={format}>{format === "影片" ? "一般影片" : format}</button>)}</div></div>
+              <p className="efficiency-explainer">{contentFormat === "直播" ? "直播依最高同接／訂閱比排序；沒有同接樣本的直播會排在後方。" : `${contentFormat === "綜合" ? "綜合內容" : contentFormat}依觀看／訂閱比排序。`} 每個頻道先取表現最好的一項，避免同一頻道占滿榜單。</p>
+              <div className="top-content-list">{efficientVideos.length === 0 ? <div className="insight-placeholder embedded">目前期間內沒有{contentFormat === "綜合" ? "近期內容" : contentFormat}資料。</div> : efficientVideos.map((video, index) => <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" className="top-content-row" key={video.video_id}><span className="rank">{index + 1}</span>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <span className="top-thumb-fallback">V</span>}<div><strong>{video.title}</strong><p>{video.channel_title} · {video.content_type} · {video.format_type}</p></div><div className="top-content-metric"><strong>{contentFormat === "直播" ? percent(video.ccv_rate) : percent(video.view_rate)}</strong><span>{contentFormat === "直播" ? `${compact(video.peak_concurrent)} 最高同接` : `${compact(video.view_count)} 觀看`}</span></div></a>)}</div>
             </article>
 
             <aside className="panel top-channel-panel">

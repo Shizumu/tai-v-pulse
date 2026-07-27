@@ -1,3 +1,5 @@
+param([switch]$NoOpen)
+
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $workDir = Join-Path $projectRoot 'work'
@@ -33,6 +35,8 @@ $webProcess = Start-Process -FilePath $nodeExe -ArgumentList @((Join-Path $proje
 
 @{ api = $apiProcess.Id; web = $webProcess.Id } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $workDir 'local-processes.json') -Encoding UTF8
 Start-Sleep -Seconds 3
-Start-Process 'http://localhost:3000'
+if (-not $NoOpen) {
+    Start-Process 'http://localhost:3000'
+}
 Write-Host '台V Pulse 已啟動：http://localhost:3000' -ForegroundColor Green
 Write-Host '要停止服務時，執行 stop-local.ps1。'
