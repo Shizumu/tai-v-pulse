@@ -1,6 +1,8 @@
 "use client";
+/* eslint-disable react-hooks/set-state-in-effect */
 
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import SiteHeader from "./site-header";
 
 const API_BASE = process.env.NEXT_PUBLIC_TRACKER_API ?? "http://127.0.0.1:8787";
 
@@ -13,6 +15,16 @@ type Channel = {
   view_count: number | null;
   video_count: number | null;
   category: string;
+  organization_name: string;
+  manual_tags: string[];
+  activity_status: "活動中" | "休止中" | "疑似已畢業" | "已確認畢業" | "狀態不明";
+  activity_status_source: "automatic" | "manual";
+  activity_status_confidence: string;
+  activity_status_reason: string;
+  activity_status_detected_at: string | null;
+  activity_status_reviewed_at: string | null;
+  activity_status_manual_lock: number;
+  last_activity_at: string | null;
   match_term: string | null;
   match_field: string | null;
   match_excerpt: string | null;
@@ -21,6 +33,7 @@ type Channel = {
 
 type LiveVideo = {
   video_id: string;
+  channel_id: string;
   title: string;
   channel_title: string;
   thumbnail_url: string | null;
@@ -111,9 +124,38 @@ type Summary = {
   quota_search: number;
   quota_general_limit: number;
   quota_search_limit: number;
+  quota_general_safe_limit: number;
+  quota_search_safe_limit: number;
+  search_quota_available: boolean;
+  quota_reset_at: string | null;
+  owned_channel_id: string | null;
+  discovery_progress: {
+    status: "idle" | "running" | "completed" | "error";
+    started_at: string | null;
+    completed_at: string | null;
+    current_term: string | null;
+    term_index: number;
+    total_terms: number;
+    pages_per_term: number;
+    current_page: number;
+    candidate_count: number;
+    examined_count: number;
+    eligible_count: number;
+    new_count: number;
+    refreshed_count: number;
+    below_threshold_count: number;
+    review_count: number;
+    excluded_count: number;
+    rejected_count: number;
+    message: string | null;
+    error: string | null;
+  };
   retention_days: number;
   settings: CollectionSettings;
   categories: { category: string; channel_count: number }[];
+  organizations: { organization_name: string; channel_count: number }[];
+  activity_statuses: { activity_status: string; channel_count: number }[];
+  activity_review_count: number;
   channels: Channel[];
   live_videos: LiveVideo[];
 };
@@ -142,9 +184,24 @@ const EMPTY_SUMMARY: Summary = {
   quota_search: 0,
   quota_general_limit: 10000,
   quota_search_limit: 100,
+  quota_general_safe_limit: 9000,
+  quota_search_safe_limit: 90,
+  search_quota_available: true,
+  quota_reset_at: null,
+  owned_channel_id: null,
+  discovery_progress: {
+    status: "idle", started_at: null, completed_at: null, current_term: null,
+    term_index: 0, total_terms: 0, pages_per_term: 2, current_page: 0, candidate_count: 0,
+    examined_count: 0, eligible_count: 0, new_count: 0, refreshed_count: 0,
+    below_threshold_count: 0, review_count: 0, excluded_count: 0,
+    rejected_count: 0, message: null, error: null,
+  },
   retention_days: 30,
   settings: DEFAULT_SETTINGS,
   categories: [],
+  organizations: [],
+  activity_statuses: [],
+  activity_review_count: 0,
   channels: [],
   live_videos: [],
 };
@@ -206,6 +263,8 @@ export default function Dashboard() {
   const [searchingSpecific, setSearchingSpecific] = useState(false);
   const [actingChannelId, setActingChannelId] = useState<string | null>(null);
   const [categoryFilter, setCategoryFilter] = useState("全部");
+  const [organizationFilter, setOrganizationFilter] = useState("全部");
+  const [activityFilter, setActivityFilter] = useState("全部");
   const [sortBy, setSortBy] = useState("subscribers");
   const [showSettings, setShowSettings] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<CollectionSettings>(DEFAULT_SETTINGS);
@@ -215,6 +274,9 @@ export default function Dashboard() {
   const [detail, setDetail] = useState<ChannelDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailCategory, setDetailCategory] = useState("");
+  const [detailOrganization, setDetailOrganization] = useState("");
+  const [detailTags, setDetailTags] = useState("");
+  const [detailActivityStatus, setDetailActivityStatus] = useState("活動中");
 
   const refresh = useCallback(async () => {
     try {
@@ -242,7 +304,6 @@ export default function Dashboard() {
       const response = await fetch(`${API_BASE}/api/discover`, { method: "POST" });
       const payload = (await response.json()) as { message?: string; error?: string };
       if (!response.ok) throw new Error(payload.error ?? "無法開始探索");
-      setMessage(payload.message ?? "已開始搜尋候選頻道");
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "操作失敗");
@@ -319,30 +380,45 @@ export default function Dashboard() {
     }
   };
 
-  const updateCategory = async (channelId: string, category: string) => {
+  const updateChannelMetadata = async (
+    channelId: string,
+    values: { category: string; organization_name: string; manual_tags: string[]; activity_status?: string },
+  ) => {
     setActingChannelId(channelId);
     setMessage(null);
     try {
       const response = await fetch(`${API_BASE}/api/channels/${encodeURIComponent(channelId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ category }),
+        body: JSON.stringify(values),
       });
-      const payload = (await response.json()) as { message?: string; error?: string };
-      if (!response.ok) throw new Error(payload.error ?? "無法儲存分類");
+      const payload = (await response.json()) as { message?: string; error?: string; channel?: Partial<Channel> };
+      if (!response.ok) throw new Error(payload.error ?? "無法儲存頻道資料");
+      const saved = {
+        category: values.category.trim() || "未分類",
+        organization_name: values.organization_name.trim(),
+        manual_tags: values.manual_tags,
+        ...(values.activity_status && values.activity_status !== "自動判斷"
+          ? { activity_status: values.activity_status as Channel["activity_status"], activity_status_source: "manual" as const, activity_status_manual_lock: 1 }
+          : {}),
+        ...(payload.channel ?? {}),
+      };
       setData((current) => ({
         ...current,
         channels: current.channels.map((channel) => channel.channel_id === channelId
-          ? { ...channel, category: category.trim() || "未分類" }
+          ? { ...channel, ...saved }
           : channel),
       }));
       setDetail((current) => current && current.channel.channel_id === channelId
-        ? { ...current, channel: { ...current.channel, category: category.trim() || "未分類" } }
+        ? { ...current, channel: { ...current.channel, ...saved } }
         : current);
-      setMessage(payload.message ?? "頻道分類已儲存");
+      setMessage(payload.message ?? "頻道資料已儲存");
+      if (payload.channel?.activity_status_source) {
+        setDetailActivityStatus(payload.channel.activity_status_source === "manual" ? payload.channel.activity_status! : "自動判斷");
+      }
       await refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "無法儲存分類");
+      setMessage(error instanceof Error ? error.message : "無法儲存頻道資料");
     } finally {
       setActingChannelId(null);
     }
@@ -393,6 +469,9 @@ export default function Dashboard() {
       if (!response.ok) throw new Error(payload.error ?? "無法載入頻道資料");
       setDetail(payload);
       setDetailCategory(payload.channel.category);
+      setDetailOrganization(payload.channel.organization_name ?? "");
+      setDetailTags((payload.channel.manual_tags ?? []).join("、"));
+      setDetailActivityStatus(payload.channel.activity_status_source === "manual" ? payload.channel.activity_status : "自動判斷");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "無法載入頻道資料");
     } finally {
@@ -410,22 +489,27 @@ export default function Dashboard() {
     const normalized = query.trim().toLocaleLowerCase("zh-TW");
     const channels = data.channels.filter((channel) => {
       if (categoryFilter !== "全部" && channel.category !== categoryFilter) return false;
+      if (organizationFilter !== "全部" && channel.organization_name !== organizationFilter) return false;
+      if (activityFilter === "待確認" && !(channel.activity_status_source === "automatic" && ["休止中", "疑似已畢業"].includes(channel.activity_status))) return false;
+      if (!["全部", "待確認"].includes(activityFilter) && channel.activity_status !== activityFilter) return false;
       if (!normalized) return true;
-      return `${channel.title} ${channel.handle ?? ""} ${channel.category} ${channel.match_excerpt ?? ""}`
+      return `${channel.title} ${channel.handle ?? ""} ${channel.category} ${channel.organization_name} ${channel.manual_tags.join(" ")} ${channel.match_excerpt ?? ""}`
         .toLocaleLowerCase("zh-TW")
         .includes(normalized);
     });
     return [...channels].sort((a, b) => {
       if (sortBy === "category") return a.category.localeCompare(b.category, "zh-Hant") || a.title.localeCompare(b.title, "zh-Hant");
+      if (sortBy === "organization") return (a.organization_name || "未設定").localeCompare(b.organization_name || "未設定", "zh-Hant") || a.title.localeCompare(b.title, "zh-Hant");
       if (sortBy === "views") return (b.view_count ?? -1) - (a.view_count ?? -1);
       if (sortBy === "videos") return (b.video_count ?? -1) - (a.video_count ?? -1);
       if (sortBy === "name") return a.title.localeCompare(b.title, "zh-Hant");
       if (sortBy === "updated") return new Date(b.updated_at ?? 0).getTime() - new Date(a.updated_at ?? 0).getTime();
       return (b.subscriber_count ?? -1) - (a.subscriber_count ?? -1);
     });
-  }, [categoryFilter, data.channels, query, sortBy]);
+  }, [activityFilter, categoryFilter, data.channels, organizationFilter, query, sortBy]);
 
-  const quotaPercent = Math.min(100, Math.round((data.quota_general / data.quota_general_limit) * 100));
+  const quotaPercent = Math.min(100, Math.round((data.quota_general / Math.max(1, data.quota_general_safe_limit)) * 100));
+  const searchQuotaPercent = Math.min(100, Math.round((data.quota_search / Math.max(1, data.quota_search_safe_limit)) * 100));
   const trendSnapshots = detail?.snapshots.slice(-40) ?? [];
   const trendValues = trendSnapshots.map((snapshot) => snapshot.subscriber_count ?? 0);
   const trendMin = trendValues.length ? Math.min(...trendValues) : 0;
@@ -434,10 +518,8 @@ export default function Dashboard() {
   if (selectedChannelId) {
     return (
       <main className="app-shell detail-shell">
-        <header className="detail-topbar">
-          <button className="button ghost back-button" type="button" onClick={() => { setSelectedChannelId(null); setDetail(null); setMessage(null); }}>← 返回頻道列表</button>
-          <div className="brand-block compact"><div className="brand-mark" aria-hidden="true">V</div><div><p className="eyebrow">CHANNEL INTELLIGENCE</p><h1>頻道詳細資料</h1></div></div>
-        </header>
+        <SiteHeader active="monitor" eyebrow="CHANNEL INTELLIGENCE" title="頻道詳細資料" connected={connected} compact />
+        <button className="button ghost back-button detail-back" type="button" onClick={() => { setSelectedChannelId(null); setDetail(null); setMessage(null); }}>← 返回頻道列表</button>
         {message && <section className="inline-message">{message}</section>}
         {detailLoading && <section className="panel detail-loading">正在整理頻道資料…</section>}
         {!detailLoading && !detail && <section className="panel detail-loading">找不到這個頻道，請返回列表重試。</section>}
@@ -446,17 +528,26 @@ export default function Dashboard() {
             <section className="panel detail-identity">
               <div className="detail-profile">
                 {detail.channel.thumbnail_url ? <img src={detail.channel.thumbnail_url} alt="" /> : <span className="detail-avatar">V</span>}
-                <div><p className="section-kicker">{detail.channel.category}</p><h2>{detail.channel.title}</h2><span>{detail.channel.handle ?? detail.channel.channel_id}</span></div>
+                <div><p className="section-kicker">{detail.channel.category}{detail.channel.organization_name ? ` · ${detail.channel.organization_name}` : ""}</p><h2>{detail.channel.title}</h2><span>{detail.channel.handle ?? detail.channel.channel_id}</span><div className="profile-status-row"><i className={`activity-badge ${detail.channel.activity_status_source === "automatic" ? "automatic" : "manual"}`}>{detail.channel.activity_status}{detail.channel.activity_status_source === "automatic" && ["休止中", "疑似已畢業"].includes(detail.channel.activity_status) ? " · 待確認" : ""}</i>{detail.channel.manual_tags.length > 0 && <div className="tag-row">{detail.channel.manual_tags.map((tag) => <i key={tag}>#{tag}</i>)}</div>}</div></div>
               </div>
               <div className="detail-actions">
                 <a className="button external-button" href={detail.channel.handle ? `https://www.youtube.com/${detail.channel.handle}` : `https://www.youtube.com/channel/${detail.channel.channel_id}`} target="_blank" rel="noreferrer">開啟 YouTube ↗</a>
               </div>
               <p className="detail-description">{detail.channel.description || "這個頻道沒有公開說明。"}</p>
-              <form className="detail-category-form" onSubmit={(event) => { event.preventDefault(); void updateCategory(detail.channel.channel_id, detailCategory); }}>
-                <label><span>自訂分類</span><input value={detailCategory} onChange={(event) => setDetailCategory(event.target.value)} list="detail-category-options" maxLength={40} /></label>
-                <datalist id="detail-category-options">{categoryOptions.map((category) => <option value={category} key={category} />)}</datalist>
-                <button className="button" type="submit" disabled={actingChannelId === detail.channel.channel_id}>{actingChannelId === detail.channel.channel_id ? "儲存中…" : "儲存分類"}</button>
+              <form className="detail-category-form detail-metadata-form" onSubmit={(event) => { event.preventDefault(); void updateChannelMetadata(detail.channel.channel_id, {
+                category: detailCategory,
+                organization_name: detailOrganization,
+                manual_tags: detailTags.split(/[,，、#＃\n]/).map((tag) => tag.trim()).filter(Boolean),
+                activity_status: detailActivityStatus,
+              }); }}>
+                <label><span>勢別分類</span><select value={detailCategory} onChange={(event) => setDetailCategory(event.target.value)}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select></label>
+                <label><span>活動狀態</span><select value={detailActivityStatus} onChange={(event) => setDetailActivityStatus(event.target.value)}><option>自動判斷</option><option>活動中</option><option>休止中</option><option>疑似已畢業</option><option>已確認畢業</option><option>狀態不明</option></select></label>
+                <label><span>所屬組織</span><input value={detailOrganization} onChange={(event) => setDetailOrganization(event.target.value)} list="organization-options" maxLength={80} placeholder="例如：子午計畫" /></label>
+                <datalist id="organization-options">{data.organizations.map((item) => <option value={item.organization_name} key={item.organization_name} />)}</datalist>
+                <label className="metadata-tags-field"><span>手動標籤</span><input value={detailTags} onChange={(event) => setDetailTags(event.target.value)} maxLength={400} placeholder="例如：歌勢、遊戲、雙語" /></label>
+                <button className="button" type="submit" disabled={actingChannelId === detail.channel.channel_id}>{actingChannelId === detail.channel.channel_id ? "儲存中…" : "儲存資料"}</button>
               </form>
+              <div className="activity-evidence"><strong>活動判定依據</strong><p>{detail.channel.activity_status_reason || "等待系統累積上片與直播紀錄。"}</p><span>最後活動：{detail.channel.last_activity_at ? ago(detail.channel.last_activity_at) : "尚無紀錄"} · {detail.channel.activity_status_source === "manual" ? "已由你確認" : `自動判定／${detail.channel.activity_status_confidence}`}</span></div>
             </section>
 
             <section className="detail-metrics">
@@ -487,6 +578,10 @@ export default function Dashboard() {
                 <dl className="rules-list">
                   <div><dt>收錄依據</dt><dd>{detail.channel.match_term ?? "待確認"}</dd></div>
                   <div><dt>命中欄位</dt><dd>{detail.channel.match_field ?? "—"}</dd></div>
+                  <div><dt>所屬組織</dt><dd>{detail.channel.organization_name || "未設定"}</dd></div>
+                  <div><dt>手動標籤</dt><dd>{detail.channel.manual_tags.length ? detail.channel.manual_tags.map((tag) => `#${tag}`).join(" ") : "未設定"}</dd></div>
+                  <div><dt>活動狀態</dt><dd>{detail.channel.activity_status}</dd></div>
+                  <div><dt>最後活動</dt><dd>{detail.channel.last_activity_at ? time(detail.channel.last_activity_at) : "尚無紀錄"}</dd></div>
                   <div><dt>國家代碼</dt><dd>{detail.channel.country ?? "未公開"}</dd></div>
                   <div><dt>首次收錄</dt><dd>{time(detail.channel.created_at)}</dd></div>
                   <div><dt>頻道統計更新</dt><dd>{ago(detail.channel.last_stats_at)}</dd></div>
@@ -523,32 +618,40 @@ export default function Dashboard() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <div className="brand-block"><div className="brand-mark" aria-hidden="true">V</div><div><p className="eyebrow">LOCAL VTUBER INTELLIGENCE</p><h1>台V Pulse</h1></div></div>
-        <div className="status-cluster">
-          <span className={`connection ${connected ? "online" : "offline"}`}><i />{connected ? "本機服務已連線" : "等待本機服務"}</span>
-          <a className="button insight-nav-button" href="/insights">內容環境</a>
+      <SiteHeader
+        active="monitor"
+        eyebrow="LOCAL VTUBER INTELLIGENCE"
+        title="台V Pulse"
+        connected={connected}
+        statusText={connected ? "本機服務已連線" : "等待本機服務"}
+        actions={<>
           <button className="button ghost" onClick={() => void refresh()} disabled={loading}>重新整理</button>
-          <button className="button primary" onClick={() => void runDiscovery()} disabled={!connected || Boolean(data.current_job)}>{data.current_job === "discover" ? "正在探索…" : "探索台 V 頻道"}</button>
-        </div>
-      </header>
+          <button className="button primary" onClick={() => void runDiscovery()} disabled={!connected || Boolean(data.current_job) || !data.search_quota_available}>{data.current_job === "discover" ? "正在探索…" : data.search_quota_available ? "探索台 V 頻道" : "搜尋配額已滿"}</button>
+        </>}
+      />
 
       {!connected && <section className="notice warning"><span className="notice-icon">!</span><div><strong>資料服務尚未啟動</strong><p>執行 start-local.ps1 後，本頁會自動連線。介面可以先預覽，但不會呼叫 YouTube。</p></div></section>}
       {connected && !data.api_key_configured && <section className="notice"><span className="notice-icon">i</span><div><strong>還差一把 API Key</strong><p>在 .env 填入 YOUTUBE_API_KEY；請不要把 Key 貼到聊天或公開檔案。</p></div></section>}
+      {connected && !data.search_quota_available && <section className="notice quota-warning"><span className="notice-icon">!</span><div><strong>今日搜尋配額已達安全上限（{data.quota_search}/{data.quota_search_safe_limit}）</strong><p>大範圍探索與僅輸入名稱的搜尋暫停，預計台北時間 {time(data.quota_reset_at)} 重置；仍可貼上頻道網址、@handle 或 Channel ID 手動新增。</p></div></section>}
       {(message || data.last_error) && <section className="inline-message">{message ?? data.last_error}</section>}
+      {data.discovery_progress.status !== "idle" && <section className={`panel discovery-progress ${data.discovery_progress.status}`}>
+        <div className="discovery-progress-copy"><p className="section-kicker">DISCOVERY STATUS</p><h2>{data.discovery_progress.status === "running" ? data.discovery_progress.message : data.discovery_progress.status === "completed" ? "候選頻道探索完成" : "候選頻道探索未完成"}</h2><p>{data.discovery_progress.status === "running" ? `搜尋字樣 ${data.discovery_progress.term_index}/${data.discovery_progress.total_terms}${data.discovery_progress.current_term ? ` · ${data.discovery_progress.current_term}` : ""}` : `${data.discovery_progress.completed_at ? time(data.discovery_progress.completed_at) : ""}${data.discovery_progress.error ? ` · ${data.discovery_progress.error}` : ""}`}</p></div>
+        <div className="discovery-stats"><span><strong>{data.discovery_progress.candidate_count}</strong>候選</span><span><strong>{data.discovery_progress.new_count}</strong>新收錄</span><span><strong>{data.discovery_progress.refreshed_count}</strong>已更新</span><span><strong>{data.discovery_progress.below_threshold_count}</strong>未達門檻</span><span><strong>{data.discovery_progress.excluded_count}</strong>黑名單</span></div>
+        {data.discovery_progress.status === "running" && <div className="discovery-track"><i style={{ width: `${data.discovery_progress.total_terms ? Math.min(100, ((Math.max(0, data.discovery_progress.term_index - 1) + Math.min(1, data.discovery_progress.current_page / Math.max(1, data.discovery_progress.pages_per_term))) / data.discovery_progress.total_terms) * 100) : 4}%` }} /></div>}
+      </section>}
 
       <section className="hero-grid">
         <article className="hero-card live-hero"><div className="hero-heading"><span className="live-dot" />現正直播</div><strong>{data.live_count}</strong><p>每 {data.settings.live_poll_seconds} 秒批次更新同接</p><div className="mini-bars" aria-hidden="true">{[18, 33, 23, 51, 39, 72, 57, 86, 64, 94, 78, 100].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}</div></article>
         <article className="metric-card"><span>已收錄頻道</span><strong>{number(data.eligible_channels)}</strong><p>自動驗證或手動指定</p></article>
         <article className="metric-card"><span>即將直播</span><strong>{number(data.upcoming_count)}</strong><p>由最新上傳與排程辨識</p></article>
         <article className="metric-card"><span>同接資料點</span><strong>{number(data.sample_count)}</strong><p>目前保留 {data.retention_days} 天</p></article>
-        <article className="metric-card quota-card"><span>今日一般配額</span><strong>{number(data.quota_general)} <small>/ {number(data.quota_general_limit)}</small></strong><div className="quota-track"><i style={{ width: `${quotaPercent}%` }} /></div><p>{quotaPercent}% 已使用 · 搜尋 {data.quota_search}/{data.quota_search_limit}</p></article>
+        <article className="metric-card quota-card"><span>今日 API 配額</span><strong>{number(data.quota_general)} <small>/ {number(data.quota_general_safe_limit)} 一般安全額</small></strong><div className="quota-track"><i style={{ width: `${quotaPercent}%` }} /></div><p>一般 {quotaPercent}% · 搜尋 {data.quota_search}/{data.quota_search_safe_limit}（{searchQuotaPercent}%）</p></article>
       </section>
 
       <section className="content-grid">
         <article className="panel live-panel">
           <div className="panel-heading"><div><p className="section-kicker">LIVE RADAR</p><h2>直播雷達</h2></div><span>{data.live_videos.length} 個項目</span></div>
-          <div className="live-list">{data.live_videos.length === 0 ? <div className="empty-state"><span>◌</span><strong>目前沒有已知直播</strong><p>完成首次頻道探索和上傳掃描後，直播會出現在這裡。</p></div> : data.live_videos.map((video) => <a className="live-row" key={video.video_id} href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer"><div className="thumb" style={video.thumbnail_url ? { backgroundImage: `url(${video.thumbnail_url})` } : undefined}><span>{video.live_state === "live" ? "LIVE" : "預定"}</span></div><div className="live-copy"><strong>{video.title}</strong><p>{video.channel_title}</p></div><div className="live-stat"><strong>{video.live_state === "live" ? number(video.current_concurrent) : time(video.scheduled_start)}</strong><span>{video.live_state === "live" ? "目前同接" : "預定開始"}</span></div></a>)}</div>
+          <div className="live-list">{data.live_videos.length === 0 ? <div className="empty-state"><span>◌</span><strong>目前沒有已知直播</strong><p>完成首次頻道探索和上傳掃描後，直播會出現在這裡。</p></div> : data.live_videos.map((video) => <article className="live-row" key={video.video_id}><a className="live-thumb-link" href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" aria-label={`開啟 ${video.title} 的 YouTube 頁面`}><div className="thumb" style={video.thumbnail_url ? { backgroundImage: `url(${video.thumbnail_url})` } : undefined}><span>{video.live_state === "live" ? "LIVE" : "預定"}</span></div></a><div className="live-copy"><a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer"><strong>{video.title}</strong></a><button type="button" onClick={() => void openChannel(video.channel_id)}>{video.channel_title} · 頻道資料 →</button></div><div className="live-stat"><strong>{video.live_state === "live" ? number(video.current_concurrent) : time(video.scheduled_start)}</strong><span>{video.live_state === "live" ? "目前同接" : "預定開始"}</span></div></article>)}</div>
         </article>
 
         <aside className="panel rules-panel">
@@ -583,7 +686,7 @@ export default function Dashboard() {
       )}
 
       <section className="panel specific-search-panel">
-        <div className="panel-heading specific-heading"><div><p className="section-kicker">DIRECT CHANNEL LOOKUP</p><h2>指定 VTuber 搜尋</h2></div><p>直接指定不要求自述字樣，但仍須公開訂閱數達 {fullNumber(data.settings.min_subscribers)}。</p></div>
+        <div className="panel-heading specific-heading"><div><p className="section-kicker">DIRECT CHANNEL LOOKUP</p><h2>指定 VTuber 搜尋</h2></div><p>{data.search_quota_available ? "直接指定不要求自述字樣" : "搜尋配額已滿時請使用網址、@handle 或 Channel ID"}，仍須公開訂閱數達 {fullNumber(data.settings.min_subscribers)}。</p></div>
         <form className="specific-form" onSubmit={(event) => void searchSpecific(event)}><label><span>名稱、@handle、Channel ID 或頻道網址</span><input value={specificQuery} onChange={(event) => setSpecificQuery(event.target.value)} placeholder="例如：杏仁ミル、@handle、UC..." aria-label="指定 VTuber 頻道" /></label><button className="button primary" type="submit" disabled={!connected || !specificQuery.trim() || searchingSpecific}>{searchingSpecific ? "搜尋中…" : "搜尋頻道"}</button></form>
         {candidates.length > 0 && <div className="candidate-list">{candidates.map((channel) => {
           const unavailable = channel.hidden_subscriber_count || !channel.meets_threshold;
@@ -592,20 +695,24 @@ export default function Dashboard() {
         })}</div>}
       </section>
 
+      {data.activity_review_count > 0 && <section className="notice activity-review-notice"><span className="notice-icon">?</span><div><strong>{data.activity_review_count} 個頻道需要確認活動狀態</strong><p>系統依頻道自述、最後上片／直播時間與平常發布節奏初判；請打開詳細頁確認是否真的休止或畢業。</p></div><button className="button" type="button" onClick={() => setActivityFilter("待確認")}>查看待確認</button></section>}
+
       <section className="panel channel-panel">
         <div className="panel-heading channel-heading">
           <div><p className="section-kicker">VERIFIED CHANNELS</p><h2>已確認頻道</h2></div>
           <div className="channel-controls">
             <label className="compact-select"><span>分類</span><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option>全部</option>{data.categories.map(({ category, channel_count }) => <option value={category} key={category}>{category}（{channel_count}）</option>)}</select></label>
-            <label className="compact-select"><span>排序</span><select value={sortBy} onChange={(event) => setSortBy(event.target.value)}><option value="subscribers">訂閱數</option><option value="views">總觀看</option><option value="videos">影片數</option><option value="category">分類</option><option value="name">名稱</option><option value="updated">最近更新</option></select></label>
-            <label className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜尋頻道、分類或證據" aria-label="搜尋頻道" /></label>
+            <label className="compact-select"><span>所屬</span><select value={organizationFilter} onChange={(event) => setOrganizationFilter(event.target.value)}><option>全部</option>{data.organizations.map(({ organization_name, channel_count }) => <option value={organization_name} key={organization_name}>{organization_name}（{channel_count}）</option>)}</select></label>
+            <label className="compact-select"><span>活動</span><select value={activityFilter} onChange={(event) => setActivityFilter(event.target.value)}><option>全部</option><option value="待確認">待確認（{data.activity_review_count}）</option>{data.activity_statuses.map(({ activity_status, channel_count }) => <option value={activity_status} key={activity_status}>{activity_status}（{channel_count}）</option>)}</select></label>
+            <label className="compact-select"><span>排序</span><select value={sortBy} onChange={(event) => setSortBy(event.target.value)}><option value="subscribers">訂閱數</option><option value="views">總觀看</option><option value="videos">影片數</option><option value="category">分類</option><option value="organization">所屬組織</option><option value="name">名稱</option><option value="updated">最近更新</option></select></label>
+            <label className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜尋頻道、組織、標籤或證據" aria-label="搜尋頻道" /></label>
           </div>
         </div>
-        <datalist id="channel-category-options">{categoryOptions.map((category) => <option value={category} key={category} />)}</datalist>
-        <div className="table-wrap"><table><thead><tr><th>頻道</th><th>分類</th><th>訂閱</th><th>總觀看</th><th>影片</th><th>收錄依據</th><th>更新</th><th>操作</th></tr></thead><tbody>
-          {visibleChannels.length === 0 ? <tr><td colSpan={8} className="table-empty">沒有符合目前篩選的頻道。</td></tr> : visibleChannels.map((channel) => <tr key={channel.channel_id}>
+        <div className="table-wrap"><table><thead><tr><th>頻道</th><th>分類</th><th>所屬／標籤</th><th>訂閱</th><th>總觀看</th><th>影片</th><th>收錄依據</th><th>更新</th><th>操作</th></tr></thead><tbody>
+          {visibleChannels.length === 0 ? <tr><td colSpan={9} className="table-empty">沒有符合目前篩選的頻道。</td></tr> : visibleChannels.map((channel) => <tr key={channel.channel_id}>
             <td><button className="channel-link" type="button" onClick={() => void openChannel(channel.channel_id)}><span className="channel-name">{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="avatar-fallback">V</span>}<span><strong>{channel.title}</strong><small>{channel.handle ?? channel.channel_id}</small></span></span><span className="open-detail">查看詳細資料 →</span></button></td>
-            <td><select className="category-select" value={channel.category} onChange={(event) => void updateCategory(channel.channel_id, event.target.value)} disabled={actingChannelId === channel.channel_id}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select></td>
+            <td><div className="category-status-cell"><select className="category-select" value={channel.category} onChange={(event) => void updateChannelMetadata(channel.channel_id, { category: event.target.value, organization_name: channel.organization_name, manual_tags: channel.manual_tags })} disabled={actingChannelId === channel.channel_id}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select><i className={`activity-badge ${channel.activity_status_source}`}>{channel.activity_status}{channel.activity_status_source === "automatic" && ["休止中", "疑似已畢業"].includes(channel.activity_status) ? "?" : ""}</i></div></td>
+            <td><div className="affiliation-cell"><strong>{channel.organization_name || "—"}</strong>{channel.manual_tags.length > 0 && <span>{channel.manual_tags.slice(0, 3).map((tag) => `#${tag}`).join(" ")}</span>}</div></td>
             <td>{number(channel.subscriber_count)}</td><td>{number(channel.view_count)}</td><td>{number(channel.video_count)}</td><td><span className="evidence">{channel.match_term ?? "待確認"}</span><small className="excerpt">{channel.match_excerpt ?? "—"}</small></td><td>{ago(channel.updated_at)}</td><td><button className="danger-button" type="button" onClick={() => void excludeChannel(channel)} disabled={actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中" : "排除"}</button></td>
           </tr>)}
         </tbody></table></div>
