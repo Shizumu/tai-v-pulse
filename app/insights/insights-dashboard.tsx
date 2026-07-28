@@ -2,6 +2,7 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FocusEvent, type PointerEvent as ReactPointerEvent } from "react";
+import LegalFooter from "../legal-footer";
 import SiteHeader from "../site-header";
 
 const API_BASE = process.env.NEXT_PUBLIC_TRACKER_API ?? "http://127.0.0.1:8787";
@@ -475,7 +476,7 @@ export default function InsightsDashboard() {
         </>
       )}
 
-      <footer><span>台V Pulse · 內容環境</span><span>所有分析都在你的電腦完成</span></footer>
+      <LegalFooter context="內容環境" note="所有分析都在你的電腦完成" />
     </main>
   );
 }
