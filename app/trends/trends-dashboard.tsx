@@ -2,6 +2,7 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import LegalFooter from "../legal-footer";
 import SiteHeader from "../site-header";
 
 const API_BASE = process.env.NEXT_PUBLIC_TRACKER_API ?? "http://127.0.0.1:8787";
@@ -11,6 +12,8 @@ type Channel = {
   title: string;
   thumbnail_url: string | null;
   subscriber_count: number | null;
+  view_count?: number | null;
+  video_count?: number | null;
   category: string;
 };
 
@@ -66,6 +69,7 @@ type RankedVideo = {
 type Trends = {
   generated_at: string;
   reference: TrendChannel | null;
+  comparison_channels: TrendChannel[];
   overview: {
     peer_channels: number;
     active_channels: number;
@@ -92,9 +96,9 @@ type Trends = {
   series: {
     channel_id: string;
     title: string;
-    points: { date: string; subscriber_count: number | null; view_count: number | null }[];
+    points: { date: string; subscriber_count: number | null; view_count: number | null; video_count: number | null }[];
   }[];
-  peer_series: { date: string; subscriber_count: number | null }[];
+  peer_series: { date: string; subscriber_count: number | null; view_count: number | null; video_count: number | null }[];
   readiness: {
     oldest_snapshot_at: string | null;
     collected_days: number;
@@ -113,6 +117,17 @@ const TIERS: Record<string, [number, number, string]> = {
 };
 
 const COLORS = ["#2ca981", "#ce6f93", "#4c8ecb", "#8b72ca", "#c18a2d"];
+
+type HistoryField = "subscriber_count" | "view_count" | "video_count";
+type ChartMetric = "subscribers" | "subscriber_growth" | "views" | "view_growth" | "videos";
+
+const CHART_METRICS: Record<ChartMetric, { label: string; field: HistoryField; growth: boolean; description: string }> = {
+  subscribers: { label: "訂閱總數", field: "subscriber_count", growth: false, description: "比較各頻道當下規模" },
+  subscriber_growth: { label: "訂閱成長", field: "subscriber_count", growth: true, description: "各頻道相對於圖表起點增加多少訂閱" },
+  views: { label: "累積觀看", field: "view_count", growth: false, description: "比較頻道公開累積觀看總數" },
+  view_growth: { label: "觀看成長", field: "view_count", growth: true, description: "各頻道相對於圖表起點增加多少公開觀看" },
+  videos: { label: "內容總數", field: "video_count", growth: false, description: "比較頻道公開影片與直播累積數量" },
+};
 
 function compact(value: number | null | undefined, digits = 1) {
   if (value === null || value === undefined) return "—";
@@ -138,8 +153,9 @@ function DeltaBadge({ delta, label, collectedDays }: { delta: Delta; label: stri
   return <button className={`delta-badge ${state}`} type="button" aria-label={`${label}${state === "up" ? "上升" : state === "down" ? "下降" : "持平"}`}><span>{arrow}</span><i><strong>與 {delta.period_days} 天前比較</strong><small>目前：{exact(delta.current)}</small><small>先前：{exact(delta.previous)}</small><small>變化：{delta.change > 0 ? "+" : ""}{exact(delta.change)}（{delta.percent_change !== null && delta.percent_change > 0 ? "+" : ""}{percent(delta.percent_change)}）</small>{delta.basis_at && <small>基準：{new Date(delta.basis_at).toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })}</small>}</i></button>;
 }
 
-function SubscriberChart({ series, peerSeries }: { series: Trends["series"]; peerSeries: Trends["peer_series"] }) {
+function ComparisonChart({ series, peerSeries, metric }: { series: Trends["series"]; peerSeries: Trends["peer_series"]; metric: ChartMetric }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const definition = CHART_METRICS[metric];
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -155,10 +171,23 @@ function SubscriberChart({ series, peerSeries }: { series: Trends["series"]; pee
       if (!context) return;
       context.scale(ratio, ratio);
       context.clearRect(0, 0, width, height);
+      const convert = <T extends Record<HistoryField, number | null>>(points: (T & { date: string })[]) => {
+        const first = points.find((point) => point[definition.field] !== null)?.[definition.field] ?? null;
+        return points.map((point) => ({
+          date: point.date,
+          value: point[definition.field] === null
+            ? null
+            : definition.growth && first !== null
+              ? Number(point[definition.field]) - Number(first)
+              : Number(point[definition.field]),
+        }));
+      };
+      const peerPoints = convert(peerSeries);
+      const channelSeries = series.map((row) => ({ ...row, values: convert(row.points) }));
       const dates = [...new Set([...peerSeries.map((point) => point.date), ...series.flatMap((row) => row.points.map((point) => point.date))])].sort();
       const values = [
-        ...peerSeries.map((point) => point.subscriber_count),
-        ...series.flatMap((row) => row.points.map((point) => point.subscriber_count)),
+        ...peerPoints.map((point) => point.value),
+        ...channelSeries.flatMap((row) => row.values.map((point) => point.value)),
       ].filter((value): value is number => value !== null);
       if (dates.length === 0 || values.length === 0) {
         context.fillStyle = "#6d7973";
@@ -180,18 +209,18 @@ function SubscriberChart({ series, peerSeries }: { series: Trends["series"]; pee
         context.fillStyle = "#6d7973"; context.font = "11px system-ui";
         context.fillText(compact(max - span * line / 4), 8, lineY + 4);
       }
-      const drawLine = (points: { date: string; subscriber_count: number | null }[], color: string, dashed = false) => {
+      const drawLine = (points: { date: string; value: number | null }[], color: string, dashed = false) => {
         context.strokeStyle = color; context.lineWidth = dashed ? 2 : 2.8; context.setLineDash(dashed ? [6, 5] : []);
         context.beginPath(); let started = false;
         for (const point of points) {
-          if (point.subscriber_count === null) continue;
-          if (!started) { context.moveTo(x(point.date), y(point.subscriber_count)); started = true; }
-          else context.lineTo(x(point.date), y(point.subscriber_count));
+          if (point.value === null) continue;
+          if (!started) { context.moveTo(x(point.date), y(point.value)); started = true; }
+          else context.lineTo(x(point.date), y(point.value));
         }
         context.stroke(); context.setLineDash([]);
       };
-      drawLine(peerSeries, "#8f9994", true);
-      series.forEach((row, index) => drawLine(row.points, COLORS[index % COLORS.length]));
+      drawLine(peerPoints, "#8f9994", true);
+      channelSeries.forEach((row, index) => drawLine(row.values, COLORS[index % COLORS.length]));
       context.fillStyle = "#6d7973"; context.font = "11px system-ui";
       context.fillText(dates[0], padding.left, height - 12);
       if (dates.length > 1) context.fillText(dates[dates.length - 1], width - padding.right - 72, height - 12);
@@ -200,8 +229,8 @@ function SubscriberChart({ series, peerSeries }: { series: Trends["series"]; pee
     const observer = new ResizeObserver(draw);
     if (canvas.parentElement) observer.observe(canvas.parentElement);
     return () => observer.disconnect();
-  }, [peerSeries, series]);
-  return <canvas ref={canvasRef} role="img" aria-label="頻道訂閱歷史折線圖" />;
+  }, [definition.field, definition.growth, peerSeries, series]);
+  return <canvas ref={canvasRef} role="img" aria-label={`頻道${definition.label}歷史折線圖`} />;
 }
 
 export default function TrendsDashboard() {
@@ -223,6 +252,7 @@ export default function TrendsDashboard() {
   const [includeGraduated, setIncludeGraduated] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [ranking, setRanking] = useState<"growth_30" | "growth_7" | "subscribers" | "median_views" | "stickiness" | "ccv_rate">("growth_30");
+  const [chartMetric, setChartMetric] = useState<ChartMetric>("subscribers");
   const [savedGroups, setSavedGroups] = useState<{ name: string; ids: string[] }[]>([]);
   const [groupName, setGroupName] = useState("");
   const ownedDefaultApplied = useRef(false);
@@ -364,9 +394,16 @@ export default function TrendsDashboard() {
       </section>
 
       <section className="panel trend-chart-panel">
-        <div className="panel-heading"><div><p className="section-kicker">SUBSCRIBER HISTORY</p><h2>訂閱趨勢比較</h2></div><span>實線為指定頻道 · 灰色虛線為同級中位數</span></div>
-        <div className="trend-chart"><SubscriberChart series={trends.series} peerSeries={trends.peer_series} /></div>
+        <div className="panel-heading"><div><p className="section-kicker">MULTI-METRIC HISTORY</p><h2>固定頻道趨勢比較</h2></div><span>實線為指定頻道 · 灰色虛線為同級中位數</span></div>
+        <div className="chart-metric-toolbar"><div className="format-tabs chart-metric-tabs">{(Object.keys(CHART_METRICS) as ChartMetric[]).map((key) => <button type="button" className={chartMetric === key ? "active" : ""} onClick={() => setChartMetric(key)} key={key}>{CHART_METRICS[key].label}</button>)}</div><span>{CHART_METRICS[chartMetric].description}</span></div>
+        <div className="trend-chart"><ComparisonChart series={trends.series} peerSeries={trends.peer_series} metric={chartMetric} /></div>
         <div className="chart-legend"><span><i className="peer" />同級中位數</span>{trends.series.map((row, index) => <span key={row.channel_id}><i style={{ background: COLORS[index % COLORS.length] }} />{row.title}</span>)}</div>
+      </section>
+
+      <section className="panel fixed-comparison-panel">
+        <div className="panel-heading"><div><p className="section-kicker">CHANNEL SCORECARD</p><h2>固定頻道指標比較</h2></div><span>同一批頻道一次比較規模、成長、產量、觀看與直播表現</span></div>
+        <div className="comparison-table-wrap"><table className="comparison-metric-table"><thead><tr><th>頻道</th><th>訂閱</th><th>30日訂閱變化</th><th>30日觀看變化</th><th>近30日內容</th><th>觀看中位數</th><th>公開黏著度</th><th>直播同接中位數</th><th>同接／訂閱</th></tr></thead><tbody>{trends.comparison_channels.map((row) => <tr className={row.is_reference ? "reference" : ""} key={row.channel_id}><td><strong>{row.title}</strong>{row.is_reference && <span>我的基準</span>}</td><td>{compact(row.subscriber_count)}</td><td>{row.subscriber_delta_30.ready ? <><b className={Number(row.subscriber_delta_30.change) > 0 ? "positive" : Number(row.subscriber_delta_30.change) < 0 ? "negative" : ""}>{Number(row.subscriber_delta_30.change) > 0 ? "+" : ""}{compact(row.subscriber_delta_30.change)}</b><small>{percent(row.subscriber_delta_30.percent_change)}</small></> : <small>資料累積中</small>}</td><td>{row.view_delta_30.ready ? <><b className={Number(row.view_delta_30.change) > 0 ? "positive" : Number(row.view_delta_30.change) < 0 ? "negative" : ""}>{Number(row.view_delta_30.change) > 0 ? "+" : ""}{compact(row.view_delta_30.change)}</b><small>{percent(row.view_delta_30.percent_change)}</small></> : <small>資料累積中</small>}</td><td>{exact(row.recent_items, 0)}</td><td>{compact(row.median_views)}</td><td>{percent(row.stickiness)}</td><td>{compact(row.median_peak_concurrent)}</td><td>{percent(row.ccv_rate)}</td></tr>)}</tbody></table></div>
+        {trends.comparison_channels.length < 2 && <p className="panel-footnote">在上方「固定比較線」再加入頻道，就能並排比較這些指標。</p>}
       </section>
 
       <section className="panel ranking-panel">
@@ -382,6 +419,6 @@ export default function TrendsDashboard() {
 
       {trends.private_metrics && Object.values(trends.private_metrics).some((value) => value !== null) && <section className="panel private-trend-panel"><div className="panel-heading"><div><p className="section-kicker">PRIVATE STUDIO OVERLAY</p><h2>我的 Studio 私人指標</h2></div><span>只顯示自己的資料，不與公開頻道硬比</span></div><div className="private-metric-strip"><div><span>觀看</span><strong>{compact(trends.private_metrics.views)}</strong></div><div><span>觀看時數</span><strong>{exact(trends.private_metrics.watch_time_hours)}</strong></div><div><span>曝光</span><strong>{compact(trends.private_metrics.impressions)}</strong></div><div><span>點閱率</span><strong>{percent(trends.private_metrics.impressions_ctr)}</strong></div><div><span>回訪觀眾</span><strong>{compact(trends.private_metrics.returning_viewers)}</strong></div></div></section>}
     </>}
-    <footer><span>台V Pulse · 趨勢圖表</span><span>圖表使用本機快照，不增加 YouTube API 配額</span></footer>
+    <LegalFooter context="趨勢圖表" note="圖表使用本機快照，不增加 YouTube API 配額" />
   </main>;
 }

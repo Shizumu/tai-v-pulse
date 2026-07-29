@@ -2,6 +2,7 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import LegalFooter from "./legal-footer";
 import SiteHeader from "./site-header";
 
 const API_BASE = process.env.NEXT_PUBLIC_TRACKER_API ?? "http://127.0.0.1:8787";
@@ -63,7 +64,14 @@ type CollectionSettings = {
   channel_refresh_hours: number;
   upload_scan_hours: number;
   retention_days: number;
+  creator_retention_days: number;
+  edition: "personal" | "public";
+  retention_options: number[];
+  creator_retention_options: number[];
   discovery_terms: string[];
+  hourly_live_scan_offsets: number[];
+  hourly_live_scan_timezone: "Asia/Taipei";
+  owned_channel_live_scan_priority: boolean;
 };
 
 type ChannelSnapshot = {
@@ -113,6 +121,10 @@ type Summary = {
   api_key_configured: boolean;
   collector_running: boolean;
   current_job: string | null;
+  current_job_started_at: string | null;
+  last_job: string | null;
+  last_job_finished_at: string | null;
+  last_job_status: "completed" | "error" | null;
   last_error: string | null;
   eligible_channels: number;
   review_channels: number;
@@ -129,8 +141,12 @@ type Summary = {
   search_quota_available: boolean;
   quota_reset_at: string | null;
   owned_channel_id: string | null;
+  manual_refresh_queue_count: number;
+  manual_refresh_queue_threshold: number;
+  manual_refresh_queue_failed: number;
   discovery_progress: {
     status: "idle" | "running" | "completed" | "error";
+    batch_id: number | null;
     started_at: string | null;
     completed_at: string | null;
     current_term: string | null;
@@ -166,13 +182,47 @@ const DEFAULT_SETTINGS: CollectionSettings = {
   channel_refresh_hours: 6,
   upload_scan_hours: 4,
   retention_days: 30,
+  creator_retention_days: 0,
+  edition: "public",
+  retention_options: [7, 14, 30],
+  creator_retention_options: [30, 180, 365, 730, 1095, 1825, 3650, 0],
   discovery_terms: ["台V", "台灣VTuber", "台灣 VTuber", "Taiwan VTuber"],
+  hourly_live_scan_offsets: [-5, 0, 5],
+  hourly_live_scan_timezone: "Asia/Taipei",
+  owned_channel_live_scan_priority: true,
 };
+
+const LIVE_POLL_OPTIONS = [30, 60, 90, 120, 300, 600, 900, 1800, 3600] as const;
+const CHANNEL_REFRESH_OPTIONS = [1, 3, 6, 12, 24, 48, 72, 168] as const;
+const UPLOAD_SCAN_OPTIONS = [1, 2, 4, 6, 12, 24, 48, 72, 168] as const;
+
+function secondsLabel(value: number) {
+  if (value < 60) return `${value} 秒`;
+  if (value % 3600 === 0) return `${value / 3600} 小時`;
+  return `${value / 60} 分鐘`;
+}
+
+function hoursLabel(value: number) {
+  if (value < 24) return `${value} 小時`;
+  return `${value / 24} 天`;
+}
+
+function retentionLabel(value: number) {
+  if (value === 0) return "永久保留（不自動清除）";
+  if (value === 30) return "1 個月";
+  if (value === 180) return "半年";
+  if (value % 365 === 0) return `${value / 365} 年`;
+  return `${value} 天`;
+}
 
 const EMPTY_SUMMARY: Summary = {
   api_key_configured: false,
   collector_running: false,
   current_job: null,
+  current_job_started_at: null,
+  last_job: null,
+  last_job_finished_at: null,
+  last_job_status: null,
   last_error: null,
   eligible_channels: 0,
   review_channels: 0,
@@ -189,8 +239,11 @@ const EMPTY_SUMMARY: Summary = {
   search_quota_available: true,
   quota_reset_at: null,
   owned_channel_id: null,
+  manual_refresh_queue_count: 0,
+  manual_refresh_queue_threshold: 50,
+  manual_refresh_queue_failed: 0,
   discovery_progress: {
-    status: "idle", started_at: null, completed_at: null, current_term: null,
+    status: "idle", batch_id: null, started_at: null, completed_at: null, current_term: null,
     term_index: 0, total_terms: 0, pages_per_term: 2, current_page: 0, candidate_count: 0,
     examined_count: 0, eligible_count: 0, new_count: 0, refreshed_count: 0,
     below_threshold_count: 0, review_count: 0, excluded_count: 0,
@@ -214,6 +267,11 @@ function number(value: number | null | undefined) {
 function fullNumber(value: number | null | undefined) {
   if (value === null || value === undefined) return "—";
   return new Intl.NumberFormat("zh-TW").format(value);
+}
+
+function liveScanOffset(value: number) {
+  if (value === 0) return "整點";
+  return value < 0 ? `整點前 ${Math.abs(value)} 分` : `整點後 ${value} 分`;
 }
 
 function time(value: string | null) {
@@ -270,6 +328,8 @@ export default function Dashboard() {
   const [settingsDraft, setSettingsDraft] = useState<CollectionSettings>(DEFAULT_SETTINGS);
   const [termsDraft, setTermsDraft] = useState(DEFAULT_SETTINGS.discovery_terms.join("\n"));
   const [savingSettings, setSavingSettings] = useState(false);
+  const [showRetentionWarning, setShowRetentionWarning] = useState(false);
+  const [retentionAcknowledged, setRetentionAcknowledged] = useState(false);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ChannelDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -277,6 +337,11 @@ export default function Dashboard() {
   const [detailOrganization, setDetailOrganization] = useState("");
   const [detailTags, setDetailTags] = useState("");
   const [detailActivityStatus, setDetailActivityStatus] = useState("活動中");
+  const [classificationChannel, setClassificationChannel] = useState<ChannelCandidate | null>(null);
+  const [classificationCategory, setClassificationCategory] = useState("未分類");
+  const [classificationOrganization, setClassificationOrganization] = useState("");
+  const [classificationTags, setClassificationTags] = useState("");
+  const [classificationActivity, setClassificationActivity] = useState("自動判斷");
 
   const refresh = useCallback(async () => {
     try {
@@ -343,12 +408,17 @@ export default function Dashboard() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ channel_id: channel.channel_id }),
       });
-      const payload = (await response.json()) as { message?: string; error?: string };
+      const payload = (await response.json()) as { message?: string; error?: string; channel?: { manual_refresh_queue_count?: number } };
       if (!response.ok) throw new Error(payload.error ?? "無法收錄頻道");
       setCandidates((current) => current.map((item) => item.channel_id === channel.channel_id
         ? { ...item, already_added: true, excluded: false }
         : item));
-      setMessage(payload.message ?? `已收錄 ${channel.title}`);
+      setClassificationChannel(channel);
+      setClassificationCategory("未分類");
+      setClassificationOrganization("");
+      setClassificationTags("");
+      setClassificationActivity("自動判斷");
+      setMessage(`${payload.message ?? `已收錄 ${channel.title}`}；待更新佇列 ${payload.channel?.manual_refresh_queue_count ?? data.manual_refresh_queue_count}/50`);
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "無法收錄頻道");
@@ -417,21 +487,49 @@ export default function Dashboard() {
         setDetailActivityStatus(payload.channel.activity_status_source === "manual" ? payload.channel.activity_status! : "自動判斷");
       }
       await refresh();
+      return true;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "無法儲存頻道資料");
+      return false;
     } finally {
       setActingChannelId(null);
+    }
+  };
+
+  const saveClassification = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!classificationChannel) return;
+    const saved = await updateChannelMetadata(classificationChannel.channel_id, {
+      category: classificationCategory,
+      organization_name: classificationOrganization,
+      manual_tags: classificationTags.split(/[、,，#\n]/).map((tag) => tag.trim()).filter(Boolean),
+      activity_status: classificationActivity,
+    });
+    if (saved) setClassificationChannel(null);
+  };
+
+  const refreshManualQueue = async () => {
+    setMessage(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/manual-refresh`, { method: "POST" });
+      const payload = (await response.json()) as { message?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法更新這一批頻道");
+      setMessage(payload.message ?? "已開始更新手動新增頻道");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "無法更新這一批頻道");
     }
   };
 
   const openSettings = () => {
     setSettingsDraft(data.settings);
     setTermsDraft(data.settings.discovery_terms.join("\n"));
+    setShowRetentionWarning(false);
+    setRetentionAcknowledged(false);
     setShowSettings(true);
   };
 
-  const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const persistSettings = async () => {
     setSavingSettings(true);
     setMessage(null);
     try {
@@ -455,6 +553,21 @@ export default function Dashboard() {
     } finally {
       setSavingSettings(false);
     }
+  };
+
+  const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const publicLongRetentionChanged = settingsDraft.edition === "personal"
+      && (settingsDraft.retention_days === 0 || settingsDraft.retention_days > 30)
+      && settingsDraft.retention_days !== data.settings.retention_days;
+    const creatorLongRetentionChanged = (settingsDraft.creator_retention_days === 0 || settingsDraft.creator_retention_days > 30)
+      && settingsDraft.creator_retention_days !== data.settings.creator_retention_days;
+    if (publicLongRetentionChanged || creatorLongRetentionChanged) {
+      setRetentionAcknowledged(false);
+      setShowRetentionWarning(true);
+      return;
+    }
+    await persistSettings();
   };
 
   const openChannel = async (channelId: string) => {
@@ -547,7 +660,7 @@ export default function Dashboard() {
                 <label className="metadata-tags-field"><span>手動標籤</span><input value={detailTags} onChange={(event) => setDetailTags(event.target.value)} maxLength={400} placeholder="例如：歌勢、遊戲、雙語" /></label>
                 <button className="button" type="submit" disabled={actingChannelId === detail.channel.channel_id}>{actingChannelId === detail.channel.channel_id ? "儲存中…" : "儲存資料"}</button>
               </form>
-              <div className="activity-evidence"><strong>活動判定依據</strong><p>{detail.channel.activity_status_reason || "等待系統累積上片與直播紀錄。"}</p><span>最後活動：{detail.channel.last_activity_at ? ago(detail.channel.last_activity_at) : "尚無紀錄"} · {detail.channel.activity_status_source === "manual" ? "已由你確認" : `自動判定／${detail.channel.activity_status_confidence}`}</span></div>
+              <div className="activity-evidence"><strong>活動判定依據</strong><p>{detail.channel.activity_status_reason || "等待系統累積上片與直播紀錄。"}</p><span>最後活動：{detail.channel.last_activity_at ? ago(detail.channel.last_activity_at) : "尚無紀錄"} · {detail.channel.activity_status_source === "manual" ? "已由你確認" : ["休止中", "疑似已畢業"].includes(detail.channel.activity_status) ? "系統規則初判／尚未人工確認" : "系統自動判斷"}</span></div>
             </section>
 
             <section className="detail-metrics">
@@ -611,7 +724,7 @@ export default function Dashboard() {
             </section>
           </>
         )}
-        <footer><span>台V Pulse · 頻道詳細資料</span><span>資料只保存在你的電腦</span></footer>
+        <LegalFooter context="頻道詳細資料" note="資料只保存在你的電腦" />
       </main>
     );
   }
@@ -635,7 +748,7 @@ export default function Dashboard() {
       {connected && !data.search_quota_available && <section className="notice quota-warning"><span className="notice-icon">!</span><div><strong>今日搜尋配額已達安全上限（{data.quota_search}/{data.quota_search_safe_limit}）</strong><p>大範圍探索與僅輸入名稱的搜尋暫停，預計台北時間 {time(data.quota_reset_at)} 重置；仍可貼上頻道網址、@handle 或 Channel ID 手動新增。</p></div></section>}
       {(message || data.last_error) && <section className="inline-message">{message ?? data.last_error}</section>}
       {data.discovery_progress.status !== "idle" && <section className={`panel discovery-progress ${data.discovery_progress.status}`}>
-        <div className="discovery-progress-copy"><p className="section-kicker">DISCOVERY STATUS</p><h2>{data.discovery_progress.status === "running" ? data.discovery_progress.message : data.discovery_progress.status === "completed" ? "候選頻道探索完成" : "候選頻道探索未完成"}</h2><p>{data.discovery_progress.status === "running" ? `搜尋字樣 ${data.discovery_progress.term_index}/${data.discovery_progress.total_terms}${data.discovery_progress.current_term ? ` · ${data.discovery_progress.current_term}` : ""}` : `${data.discovery_progress.completed_at ? time(data.discovery_progress.completed_at) : ""}${data.discovery_progress.error ? ` · ${data.discovery_progress.error}` : ""}`}</p></div>
+        <div className="discovery-progress-copy"><p className="section-kicker">DISCOVERY STATUS</p><h2>{data.discovery_progress.status === "running" ? data.discovery_progress.message : data.discovery_progress.status === "completed" ? "候選頻道探索完成" : "候選頻道探索未完成"}</h2><p>{data.discovery_progress.status === "running" ? `搜尋字樣 ${data.discovery_progress.term_index}/${data.discovery_progress.total_terms}${data.discovery_progress.current_term ? ` · ${data.discovery_progress.current_term}` : ""}` : `${data.discovery_progress.completed_at ? time(data.discovery_progress.completed_at) : ""}${data.discovery_progress.error ? ` · ${data.discovery_progress.error}` : ""}`}</p><a className="candidate-review-link" href="/candidates">查看候選審核與未收錄原因 →</a></div>
         <div className="discovery-stats"><span><strong>{data.discovery_progress.candidate_count}</strong>候選</span><span><strong>{data.discovery_progress.new_count}</strong>新收錄</span><span><strong>{data.discovery_progress.refreshed_count}</strong>已更新</span><span><strong>{data.discovery_progress.below_threshold_count}</strong>未達門檻</span><span><strong>{data.discovery_progress.excluded_count}</strong>黑名單</span></div>
         {data.discovery_progress.status === "running" && <div className="discovery-track"><i style={{ width: `${data.discovery_progress.total_terms ? Math.min(100, ((Math.max(0, data.discovery_progress.term_index - 1) + Math.min(1, data.discovery_progress.current_page / Math.max(1, data.discovery_progress.pages_per_term))) / data.discovery_progress.total_terms) * 100) : 4}%` }} /></div>}
       </section>}
@@ -644,7 +757,7 @@ export default function Dashboard() {
         <article className="hero-card live-hero"><div className="hero-heading"><span className="live-dot" />現正直播</div><strong>{data.live_count}</strong><p>每 {data.settings.live_poll_seconds} 秒批次更新同接</p><div className="mini-bars" aria-hidden="true">{[18, 33, 23, 51, 39, 72, 57, 86, 64, 94, 78, 100].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}</div></article>
         <article className="metric-card"><span>已收錄頻道</span><strong>{number(data.eligible_channels)}</strong><p>自動驗證或手動指定</p></article>
         <article className="metric-card"><span>即將直播</span><strong>{number(data.upcoming_count)}</strong><p>由最新上傳與排程辨識</p></article>
-        <article className="metric-card"><span>同接資料點</span><strong>{number(data.sample_count)}</strong><p>目前保留 {data.retention_days} 天</p></article>
+        <article className="metric-card"><span>同接資料點</span><strong>{number(data.sample_count)}</strong><p>公開快照保留 {retentionLabel(data.retention_days)}</p></article>
         <article className="metric-card quota-card"><span>今日 API 配額</span><strong>{number(data.quota_general)} <small>/ {number(data.quota_general_safe_limit)} 一般安全額</small></strong><div className="quota-track"><i style={{ width: `${quotaPercent}%` }} /></div><p>一般 {quotaPercent}% · 搜尋 {data.quota_search}/{data.quota_search_safe_limit}（{searchQuotaPercent}%）</p></article>
       </section>
 
@@ -660,11 +773,15 @@ export default function Dashboard() {
             <div><dt>自述字樣</dt><dd>{data.settings.discovery_terms.join("、")}</dd></div>
             <div><dt>最低訂閱</dt><dd>{fullNumber(data.settings.min_subscribers)}</dd></div>
             <div><dt>同接頻率</dt><dd>{data.settings.live_poll_seconds} 秒／批次 50 支</dd></div>
+            <div><dt>整點開台偵測</dt><dd>{data.settings.hourly_live_scan_offsets.map(liveScanOffset).join("、")}（台北時間）</dd></div>
             <div><dt>頻道更新</dt><dd>每 {data.settings.channel_refresh_hours} 小時</dd></div>
-            <div><dt>原始保留</dt><dd>{data.settings.retention_days} 天</dd></div>
+            <div><dt>公開快照保留</dt><dd>{retentionLabel(data.settings.retention_days)}{data.settings.edition === "personal" ? "（私人版）" : "（最長 30 天）"}</dd></div>
+            <div><dt>我的頻道資料</dt><dd>{retentionLabel(data.settings.creator_retention_days)}</dd></div>
+            <div><dt>執行模式</dt><dd>{data.settings.edition === "personal" ? "私人本機版" : "對外發布版"}</dd></div>
             <div><dt>手動排除</dt><dd>{data.excluded_channels} 個黑名單頻道</dd></div>
           </dl>
-          <div className="rule-note"><strong>變更套用於後續收錄</strong><p>提高門檻不會自動刪除已收錄頻道；你可以從頻道列表自行排除。</p></div>
+            <div className="rule-note"><strong>手動開台加強偵測已啟用</strong><p>每次整點前後會輕量檢查所有已收錄頻道的最新內容，「我的頻道」固定優先；發現直播後改由每 {data.settings.live_poll_seconds} 秒更新同接。一般配額接近安全線時，其他頻道會暫停這項加強掃描，但仍優先保留「我的頻道」。</p></div>
+            <div className="rule-note"><strong>{data.settings.edition === "personal" ? "私人版長期保存已開啟" : "公開資料與私人資料分開保存"}</strong><p>{data.settings.edition === "personal" ? "這是你本機專用的設定，不會寫入對外發布版；可自行選擇長期或永久保留公開快照。" : "對外發布版的 YouTube 公開 API 快照最長保留 30 天；較長期限只套用於使用者自行匯入或手動補充的資料。"}</p></div>
         </aside>
       </section>
 
@@ -672,21 +789,25 @@ export default function Dashboard() {
         <section className="panel settings-panel">
           <div className="panel-heading"><div><p className="section-kicker">RULE EDITOR</p><h2>編輯收錄與監控規則</h2></div><button className="text-button" type="button" onClick={() => setShowSettings(false)}>關閉</button></div>
           <form className="settings-form" onSubmit={(event) => void saveSettings(event)}>
-            <label className="terms-field"><span>大範圍探索字樣</span><textarea value={termsDraft} onChange={(event) => setTermsDraft(event.target.value)} rows={5} /><small>每行一組，最多 12 組。候選頻道也必須在名稱、說明或關鍵字中出現其中一組。</small></label>
+            <label className="terms-field"><span>大範圍探索字樣</span><textarea value={termsDraft} onChange={(event) => setTermsDraft(event.target.value)} rows={5} /><small>每行一組，最多 12 組。候選頻道也必須在名稱、說明或關鍵字中出現其中一組；台V、台 v、台灣 VTuber 等大小寫與空白差異會自動辨識，不必逐條重複。</small></label>
             <div className="settings-number-grid">
               <label><span>最低訂閱數</span><input type="number" min={1} max={10000000} value={settingsDraft.min_subscribers} onChange={(event) => setSettingsDraft({ ...settingsDraft, min_subscribers: Number(event.target.value) })} /></label>
-              <label><span>同接更新秒數</span><input type="number" min={30} max={3600} value={settingsDraft.live_poll_seconds} onChange={(event) => setSettingsDraft({ ...settingsDraft, live_poll_seconds: Number(event.target.value) })} /></label>
-              <label><span>頻道統計更新（小時）</span><input type="number" min={1} max={168} value={settingsDraft.channel_refresh_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, channel_refresh_hours: Number(event.target.value) })} /></label>
-              <label><span>上傳掃描（小時）</span><input type="number" min={1} max={168} value={settingsDraft.upload_scan_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, upload_scan_hours: Number(event.target.value) })} /></label>
-              <label><span>資料保留天數</span><input type="number" min={1} max={1095} value={settingsDraft.retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, retention_days: Number(event.target.value) })} /></label>
+              <label><span>同接更新頻率</span><select value={settingsDraft.live_poll_seconds} onChange={(event) => setSettingsDraft({ ...settingsDraft, live_poll_seconds: Number(event.target.value) })}>{LIVE_POLL_OPTIONS.map((value) => <option value={value} key={value}>每 {secondsLabel(value)}</option>)}</select></label>
+              <label><span>頻道統計更新</span><select value={settingsDraft.channel_refresh_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, channel_refresh_hours: Number(event.target.value) })}>{CHANNEL_REFRESH_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select></label>
+              <label><span>完整上傳掃描</span><select value={settingsDraft.upload_scan_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, upload_scan_hours: Number(event.target.value) })}>{UPLOAD_SCAN_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select><small>另於台北時間整點前 5 分、整點及整點後 5 分執行輕量開台偵測；所有已收錄頻道都會檢查，「我的頻道」優先。</small></label>
+              <label><span>公開 API 快照保留</span><select value={settingsDraft.retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, retention_days: Number(event.target.value) })}>{settingsDraft.retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>{settingsDraft.edition === "personal" ? "私人本機版已解除程式限制，可保留半年至永久；此選項不會出現在對外發布版。" : "對外發布版固定提供 7、14、30 天。"}</small></label>
+              <label><span>我的頻道匯入資料保留</span><select value={settingsDraft.creator_retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, creator_retention_days: Number(event.target.value) })}>{settingsDraft.creator_retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>只影響你自行匯入的 Studio 報表與手動補充資料；預設永久保存。</small></label>
             </div>
-            <div className="settings-footer"><p>同接最低可設 30 秒；頻率越高，日常 API 請求會越多。</p><button className="button primary" type="submit" disabled={savingSettings}>{savingSettings ? "儲存中…" : "儲存規則"}</button></div>
+            <div className="settings-footer"><p>同接頻率越高，API 請求越多；長期私人資料請定期備份並妥善保護。</p><button className="button primary" type="submit" disabled={savingSettings}>{savingSettings ? "儲存中…" : "儲存規則"}</button></div>
           </form>
         </section>
       )}
 
+      {showRetentionWarning && <div className="modal-backdrop" role="presentation"><section className="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="retention-warning-title"><p className="section-kicker">LOCAL DATA RETENTION</p><h2 id="retention-warning-title">確認私人版長期保存設定</h2><p>公開快照將保存 {retentionLabel(settingsDraft.retention_days)}；Studio／手動資料將保存 {retentionLabel(settingsDraft.creator_retention_days)}。</p><ul><li>這項設定只套用於你的私人本機版，不會帶進未來的對外發布版。</li><li>期限越長，資料庫容量、備份與隱私保護責任越高。</li><li>日後縮短期限時，排程清理的舊資料無法復原，請先備份。</li></ul><label className="consent-check"><input type="checkbox" checked={retentionAcknowledged} onChange={(event) => setRetentionAcknowledged(event.target.checked)} /><span>我了解並要在私人本機版使用這項長期保存設定</span></label><div className="dialog-actions"><button className="button ghost" type="button" onClick={() => setShowRetentionWarning(false)}>返回調整</button><button className="button primary" type="button" disabled={!retentionAcknowledged || savingSettings} onClick={() => { setShowRetentionWarning(false); void persistSettings(); }}>{savingSettings ? "儲存中…" : "確認並儲存"}</button></div></section></div>}
+
       <section className="panel specific-search-panel">
         <div className="panel-heading specific-heading"><div><p className="section-kicker">DIRECT CHANNEL LOOKUP</p><h2>指定 VTuber 搜尋</h2></div><p>{data.search_quota_available ? "直接指定不要求自述字樣" : "搜尋配額已滿時請使用網址、@handle 或 Channel ID"}，仍須公開訂閱數達 {fullNumber(data.settings.min_subscribers)}。</p></div>
+        <div className="manual-queue-strip"><div><strong>手動新增待更新：{data.manual_refresh_queue_count}／{data.manual_refresh_queue_threshold}</strong><span>滿 50 個會自動批次更新；分類、所屬與標籤只存本機，不消耗 YouTube 配額。{data.manual_refresh_queue_failed > 0 ? `目前有 ${data.manual_refresh_queue_failed} 個待重試。` : ""}</span></div><button className="button ghost" type="button" onClick={() => void refreshManualQueue()} disabled={!connected || data.manual_refresh_queue_count === 0 || Boolean(data.current_job)}>立即更新這一批</button></div>
         <form className="specific-form" onSubmit={(event) => void searchSpecific(event)}><label><span>名稱、@handle、Channel ID 或頻道網址</span><input value={specificQuery} onChange={(event) => setSpecificQuery(event.target.value)} placeholder="例如：杏仁ミル、@handle、UC..." aria-label="指定 VTuber 頻道" /></label><button className="button primary" type="submit" disabled={!connected || !specificQuery.trim() || searchingSpecific}>{searchingSpecific ? "搜尋中…" : "搜尋頻道"}</button></form>
         {candidates.length > 0 && <div className="candidate-list">{candidates.map((channel) => {
           const unavailable = channel.hidden_subscriber_count || !channel.meets_threshold;
@@ -694,6 +815,8 @@ export default function Dashboard() {
           return <article className="candidate-card" key={channel.channel_id}>{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="candidate-avatar">V</span>}<div className="candidate-copy"><div className="candidate-title"><strong>{channel.title}</strong><span>{status}</span></div><small>{channel.handle ?? channel.channel_id}</small><p>{channel.description || "這個頻道沒有公開說明。"}</p></div><button className="button candidate-action" type="button" onClick={() => void addCandidate(channel)} disabled={unavailable || channel.already_added || actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中…" : channel.already_added ? "已收錄" : channel.excluded ? "重新收錄" : "收錄"}</button></article>;
         })}</div>}
       </section>
+
+      {classificationChannel && <div className="modal-backdrop" role="presentation"><section className="confirmation-dialog classification-dialog" role="dialog" aria-modal="true" aria-labelledby="classification-title"><p className="section-kicker">CHANNEL CLASSIFICATION</p><h2 id="classification-title">設定 {classificationChannel.title} 的頻道資料</h2><p>這些欄位是本機分析用，不會寫回 YouTube，也不會消耗 API 配額。勢別與活動狀態分開保存，例如企業勢仍可同時標記為活動中或已確認畢業。</p><form onSubmit={(event) => void saveClassification(event)}><div className="classification-grid"><label><span>勢別分類</span><select value={classificationCategory} onChange={(event) => setClassificationCategory(event.target.value)}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select></label><label><span>活動狀態</span><select value={classificationActivity} onChange={(event) => setClassificationActivity(event.target.value)}><option>自動判斷</option><option>活動中</option><option>休止中</option><option>疑似已畢業</option><option>已確認畢業</option><option>狀態不明</option></select></label><label><span>所屬企業／團體</span><input value={classificationOrganization} onChange={(event) => setClassificationOrganization(event.target.value)} placeholder="例如：子午計畫" maxLength={80} /></label><label><span>自訂標籤</span><input value={classificationTags} onChange={(event) => setClassificationTags(event.target.value)} placeholder="例如：歌勢、遊戲、同期生" /></label></div><div className="dialog-actions"><button className="button ghost" type="button" onClick={() => setClassificationChannel(null)}>稍後分類</button><button className="button primary" type="submit" disabled={actingChannelId === classificationChannel.channel_id}>{actingChannelId === classificationChannel.channel_id ? "儲存中…" : "儲存分類"}</button></div></form></section></div>}
 
       {data.activity_review_count > 0 && <section className="notice activity-review-notice"><span className="notice-icon">?</span><div><strong>{data.activity_review_count} 個頻道需要確認活動狀態</strong><p>系統依頻道自述、最後上片／直播時間與平常發布節奏初判；請打開詳細頁確認是否真的休止或畢業。</p></div><button className="button" type="button" onClick={() => setActivityFilter("待確認")}>查看待確認</button></section>}
 
@@ -711,14 +834,14 @@ export default function Dashboard() {
         <div className="table-wrap"><table><thead><tr><th>頻道</th><th>分類</th><th>所屬／標籤</th><th>訂閱</th><th>總觀看</th><th>影片</th><th>收錄依據</th><th>更新</th><th>操作</th></tr></thead><tbody>
           {visibleChannels.length === 0 ? <tr><td colSpan={9} className="table-empty">沒有符合目前篩選的頻道。</td></tr> : visibleChannels.map((channel) => <tr key={channel.channel_id}>
             <td><button className="channel-link" type="button" onClick={() => void openChannel(channel.channel_id)}><span className="channel-name">{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="avatar-fallback">V</span>}<span><strong>{channel.title}</strong><small>{channel.handle ?? channel.channel_id}</small></span></span><span className="open-detail">查看詳細資料 →</span></button></td>
-            <td><div className="category-status-cell"><select className="category-select" value={channel.category} onChange={(event) => void updateChannelMetadata(channel.channel_id, { category: event.target.value, organization_name: channel.organization_name, manual_tags: channel.manual_tags })} disabled={actingChannelId === channel.channel_id}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select><i className={`activity-badge ${channel.activity_status_source}`}>{channel.activity_status}{channel.activity_status_source === "automatic" && ["休止中", "疑似已畢業"].includes(channel.activity_status) ? "?" : ""}</i></div></td>
+            <td><div className="category-status-cell"><select className="category-select" value={channel.category} onChange={(event) => void updateChannelMetadata(channel.channel_id, { category: event.target.value, organization_name: channel.organization_name, manual_tags: channel.manual_tags })} disabled={actingChannelId === channel.channel_id}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select><i className={`activity-badge ${channel.activity_status_source}`}>{channel.activity_status_source === "automatic" && ["休止中", "疑似已畢業"].includes(channel.activity_status) ? `系統初判：${channel.activity_status}` : channel.activity_status}</i></div></td>
             <td><div className="affiliation-cell"><strong>{channel.organization_name || "—"}</strong>{channel.manual_tags.length > 0 && <span>{channel.manual_tags.slice(0, 3).map((tag) => `#${tag}`).join(" ")}</span>}</div></td>
             <td>{number(channel.subscriber_count)}</td><td>{number(channel.view_count)}</td><td>{number(channel.video_count)}</td><td><span className="evidence">{channel.match_term ?? "待確認"}</span><small className="excerpt">{channel.match_excerpt ?? "—"}</small></td><td>{ago(channel.updated_at)}</td><td><button className="danger-button" type="button" onClick={() => void excludeChannel(channel)} disabled={actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中" : "排除"}</button></td>
           </tr>)}
         </tbody></table></div>
       </section>
 
-      <footer><span>台V Pulse · 僅在你的電腦運作</span><span>資料來源：YouTube Data API · 非 YouTube 官方產品</span></footer>
+      <LegalFooter context="僅在你的電腦運作" note="資料來源：YouTube Data API" />
     </main>
   );
 }

@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import html
 import io
 import json
+import locale
 import os
 import re
 import sqlite3
@@ -22,6 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
+from collector.oauth import GoogleOAuth, OAuthError, REQUIRED_SCOPES, oauth_error_guidance
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK_DIR = ROOT / "work"
@@ -31,12 +35,30 @@ WORK_DIR.mkdir(exist_ok=True)
 def load_env(path: Path) -> None:
     if not path.exists():
         return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    env_text: str | None = None
+    decoding_error: UnicodeDecodeError | None = None
+    for encoding in dict.fromkeys(("utf-8-sig", locale.getpreferredencoding(False), "cp950")):
+        try:
+            env_text = path.read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError as error:
+            decoding_error = error
+    if env_text is None:
+        assert decoding_error is not None
+        raise decoding_error
+    file_values: dict[str, str] = {}
+    for raw_line in env_text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        normalized_key = key.strip()
+        if normalized_key.startswith("export "):
+            normalized_key = normalized_key.removeprefix("export ").strip()
+        if normalized_key:
+            file_values[normalized_key] = value.strip().strip('"').strip("'")
+    for key, value in file_values.items():
+        os.environ.setdefault(key, value)
 
 
 load_env(ROOT / ".env")
@@ -58,7 +80,9 @@ class Config:
     live_poll_seconds = env_int("LIVE_POLL_SECONDS", 60, 30)
     channel_refresh_hours = env_int("CHANNEL_REFRESH_HOURS", 6, 1)
     upload_scan_hours = env_int("UPLOAD_SCAN_HOURS", 4, 1)
-    retention_days = env_int("RETENTION_DAYS", 30, 1)
+    edition = os.getenv("TAI_V_PULSE_EDITION", "public").strip().lower()
+    retention_days = env_int("RETENTION_DAYS", 30, 0)
+    creator_retention_days = env_int("CREATOR_RETENTION_DAYS", 0, 0)
     discovery_pages_per_term = min(5, env_int("DISCOVERY_PAGES_PER_TERM", 2, 1))
     quota_general_limit = env_int("QUOTA_GENERAL_LIMIT", 10000, 100)
     quota_search_limit = env_int("QUOTA_SEARCH_LIMIT", 100, 1)
@@ -69,6 +93,9 @@ UTC = timezone.utc
 PACIFIC = ZoneInfo("America/Los_Angeles")
 TAIPEI = ZoneInfo("Asia/Taipei")
 SEARCH_TERMS = ("台V", "台灣VTuber", "台灣 VTuber", "Taiwan VTuber")
+HOURLY_LIVE_SCAN_MINUTES = (55, 0, 5)
+HOURLY_LIVE_SCAN_OFFSETS = (-5, 0, 5)
+HOURLY_LIVE_SCAN_QUOTA_RESERVE = 1_000
 MATCHERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("台V", re.compile(r"台\s*[Vv](?:[Tt]uber)?(?![A-Za-z])")),
     ("台灣VTuber", re.compile(r"台灣\s*(?:[Vv](?:[Tt]uber)?|虛擬(?:[Yy]ou[Tt]uber|主播))", re.I)),
@@ -77,11 +104,17 @@ MATCHERS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 SETTING_LIMITS: dict[str, tuple[int, int]] = {
     "min_subscribers": (1, 10_000_000),
-    "live_poll_seconds": (30, 3_600),
-    "channel_refresh_hours": (1, 168),
-    "upload_scan_hours": (1, 168),
-    "retention_days": (1, 1_095),
 }
+
+SETTING_CHOICES: dict[str, tuple[int, ...]] = {
+    "live_poll_seconds": (30, 60, 90, 120, 300, 600, 900, 1_800, 3_600),
+    "channel_refresh_hours": (1, 3, 6, 12, 24, 48, 72, 168),
+    "upload_scan_hours": (1, 2, 4, 6, 12, 24, 48, 72, 168),
+}
+
+PUBLIC_RETENTION_CHOICES = (7, 14, 30)
+PERSONAL_RETENTION_CHOICES = (7, 14, 30, 180, 365, 730, 1_095, 1_825, 3_650, 0)
+CREATOR_RETENTION_CHOICES = (30, 180, 365, 730, 1_095, 1_825, 3_650, 0)
 
 CHANNEL_CATEGORIES = ("未分類", "個人勢", "企業勢", "團體勢", "其他")
 ACTIVITY_STATUSES = ("活動中", "休止中", "疑似已畢業", "已確認畢業", "狀態不明")
@@ -93,14 +126,14 @@ GRADUATION_PATTERN = re.compile(
 )
 HIATUS_PATTERN = re.compile(r"活動休止|休止中|暫停活動|暫停直播|無限期休止|on\s+hiatus", re.I)
 CREATOR_METRICS = (
-    "views", "watch_time_hours", "average_view_duration_seconds",
+    "views", "engaged_views", "watch_time_hours", "average_view_duration_seconds",
     "average_percentage_viewed", "impressions", "impressions_ctr",
     "subscribers_net", "subscribers_gained", "subscribers_lost", "likes",
     "comments", "shares", "unique_viewers", "returning_viewers",
     "estimated_revenue",
 )
 CREATOR_SUM_METRICS = {
-    "views", "watch_time_hours", "impressions", "subscribers_net",
+    "views", "engaged_views", "watch_time_hours", "impressions", "subscribers_net",
     "subscribers_gained", "subscribers_lost", "likes", "comments", "shares",
     "unique_viewers", "returning_viewers", "estimated_revenue",
 }
@@ -137,21 +170,32 @@ for canonical, aliases in {
     "event_date": ("date", "day", "日期", "日"),
     "video_id": ("video", "video id", "content", "內容", "影片id", "影片 ID"),
     "video_title": ("video title", "content title", "title", "影片標題", "內容標題", "標題"),
+    "published_at": ("video publish time", "video publish date", "影片發布時間", "影片發布日期"),
+    "duration_seconds": ("duration", "video duration", "時間長度", "影片長度"),
     "views": ("views", "view count", "觀看次數", "瀏覽次數"),
+    "engaged_views": ("engaged views", "互動觀看次數"),
     "watch_time_hours": ("watch time (hours)", "watch time hours", "觀看時間 (小時)", "觀看時間小時"),
     "average_view_duration_seconds": ("average view duration", "avg view duration", "平均觀看時間", "平均觀看時長"),
-    "average_percentage_viewed": ("average percentage viewed", "avg percentage viewed", "平均觀看百分比"),
+    "average_percentage_viewed": (
+        "average percentage viewed", "avg percentage viewed", "平均觀看百分比", "平均觀看比例 (%)",
+    ),
     "impressions": ("impressions", "曝光次數"),
     "impressions_ctr": ("impressions click-through rate", "impressions ctr", "曝光點閱率", "曝光點擊率"),
     "subscribers_net": ("subscribers", "net subscribers", "訂閱人數", "訂閱者"),
-    "subscribers_gained": ("subscribers gained", "gained subscribers", "獲得的訂閱者", "新增訂閱人數"),
-    "subscribers_lost": ("subscribers lost", "lost subscribers", "流失的訂閱者", "取消訂閱人數"),
+    "subscribers_gained": (
+        "subscribers gained", "gained subscribers", "獲得的訂閱者", "獲得的訂閱人數", "新增訂閱人數",
+    ),
+    "subscribers_lost": (
+        "subscribers lost", "lost subscribers", "流失的訂閱者", "流失的訂閱人數", "取消訂閱人數",
+    ),
     "likes": ("likes", "喜歡次數", "按讚數"),
-    "comments": ("comments", "留言", "留言數"),
+    "comments": ("comments", "留言", "留言數", "已新增留言"),
     "shares": ("shares", "分享", "分享次數"),
-    "unique_viewers": ("unique viewers", "不重複觀眾人數", "獨立觀眾"),
-    "returning_viewers": ("returning viewers", "回訪觀眾", "回訪觀眾人數"),
-    "estimated_revenue": ("estimated revenue", "your estimated revenue", "預估收益", "預估營利"),
+    "unique_viewers": ("unique viewers", "不重複觀眾人數", "非重複觀眾人數", "獨立觀眾"),
+    "returning_viewers": ("returning viewers", "回訪觀眾", "回訪的觀眾", "回訪觀眾人數"),
+    "estimated_revenue": (
+        "estimated revenue", "your estimated revenue", "預估收益", "預估收益 (TWD)", "預估營利",
+    ),
 }.items():
     for alias in aliases:
         HEADER_ALIASES[normalize_header(alias)] = canonical
@@ -195,7 +239,10 @@ def normalize_report_date(value: Any) -> str | None:
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
     if not text or text.casefold() in {"total", "總計", "合計"}:
         return None
-    for format_string in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%m/%d/%Y", "%d/%m/%Y"):
+    for format_string in (
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%m/%d/%Y", "%d/%m/%Y",
+        "%b %d, %Y", "%B %d, %Y",
+    ):
         try:
             return datetime.strptime(text, format_string).date().isoformat()
         except ValueError:
@@ -241,22 +288,36 @@ def parse_studio_csv(text: str, report_name: str) -> dict[str, Any]:
 
     headers, raw_rows, mapping = selected
     recognized_metrics = sorted({value for value in mapping.values() if value in CREATOR_METRICS})
+    recognized_dimensions = sorted({
+        value for value in mapping.values()
+        if value in {"event_date", "video_id", "video_title", "published_at", "duration_seconds"}
+    })
+    ignored_headers = [header for header in headers if not mapping.get(header)]
     parsed_rows: list[dict[str, Any]] = []
     for raw in raw_rows:
         dimensions: dict[str, str] = {}
         metrics: dict[str, float] = {}
         event_date: str | None = None
+        published_at: str | None = None
+        duration_seconds: float | None = None
         video_id: str | None = None
         video_title: str | None = None
+        row_kind = "detail"
         for header in headers:
             value = str(raw.get(header) or "").strip()
             canonical = mapping.get(header, "")
+            if value.casefold() in {"total", "總計", "合計"}:
+                row_kind = "total"
             if canonical == "event_date":
                 event_date = normalize_report_date(value)
             elif canonical == "video_id":
                 video_id = value[:100] or None
             elif canonical == "video_title":
                 video_title = value[:500] or None
+            elif canonical == "published_at":
+                published_at = normalize_report_date(value)
+            elif canonical == "duration_seconds":
+                duration_seconds = parse_average_duration(value)
             elif canonical in CREATOR_METRICS:
                 numeric = parse_average_duration(value) if canonical == "average_view_duration_seconds" else parse_number(value)
                 if numeric is not None:
@@ -265,10 +326,18 @@ def parse_studio_csv(text: str, report_name: str) -> dict[str, Any]:
                 dimensions[header[:120]] = value[:500]
         if not metrics:
             continue
+        if row_kind == "total":
+            video_id = None
+            video_title = None
+            published_at = None
+            duration_seconds = None
         identity = {
             "date": event_date,
+            "published_at": published_at,
+            "duration_seconds": duration_seconds,
             "video_id": video_id,
             "video_title": None if video_id else video_title,
+            "row_kind": row_kind,
             "dimensions": dimensions,
         }
         natural_key = hashlib.sha256(
@@ -280,8 +349,11 @@ def parse_studio_csv(text: str, report_name: str) -> dict[str, Any]:
         parsed_rows.append({
             "report_name": report_name[:240],
             "event_date": event_date,
+            "published_at": published_at,
+            "duration_seconds": duration_seconds,
             "video_id": video_id,
             "video_title": video_title,
+            "row_kind": row_kind,
             "dimensions": dimensions,
             "metrics": metrics,
             "natural_key": natural_key,
@@ -294,6 +366,8 @@ def parse_studio_csv(text: str, report_name: str) -> dict[str, Any]:
         "report_name": report_name,
         "headers": headers,
         "recognized_metrics": recognized_metrics,
+        "recognized_dimensions": recognized_dimensions,
+        "ignored_headers": ignored_headers,
         "rows": parsed_rows,
         "date_start": min(dates) if dates else None,
         "date_end": max(dates) if dates else None,
@@ -342,6 +416,17 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def hourly_live_scan_slot(moment: datetime | None = None) -> str | None:
+    current = moment or datetime.now(TAIPEI)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=TAIPEI)
+    else:
+        current = current.astimezone(TAIPEI)
+    if current.minute not in HOURLY_LIVE_SCAN_MINUTES:
+        return None
+    return current.strftime("%Y-%m-%dT%H:%M")
+
+
 def chunks(values: list[str], size: int = 50) -> Iterable[list[str]]:
     for index in range(0, len(values), size):
         yield values[index : index + size]
@@ -370,8 +455,15 @@ def evidence_for_terms(item: dict[str, Any], terms: Iterable[str]) -> tuple[str,
             label = str(raw_term).strip()
             if not label:
                 continue
-            if label.casefold().replace(" ", "") in {"台v", "台vtuber"}:
+            normalized_label = re.sub(
+                r"\s+", "", unicodedata.normalize("NFKC", label).casefold()
+            )
+            if normalized_label in {"台v", "台vtuber"}:
                 pattern = MATCHERS[0][1]
+            elif normalized_label in {"台灣v", "台灣vtuber", "台灣虛擬主播", "台灣虛擬youtuber"}:
+                pattern = MATCHERS[1][1]
+            elif normalized_label in {"taiwanv", "taiwanvtuber", "taiwanesev", "taiwanesevtuber"}:
+                pattern = MATCHERS[2][1]
             else:
                 escaped = re.escape(label).replace(r"\ ", r"\s*")
                 pattern = re.compile(escaped, re.I)
@@ -609,6 +701,61 @@ class Database:
                   excluded_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS discovery_batches (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  started_at TEXT NOT NULL,
+                  completed_at TEXT,
+                  status TEXT NOT NULL DEFAULT 'running',
+                  discovery_terms_json TEXT NOT NULL DEFAULT '[]',
+                  pages_per_term INTEGER NOT NULL DEFAULT 0,
+                  candidate_count INTEGER NOT NULL DEFAULT 0,
+                  examined_count INTEGER NOT NULL DEFAULT 0,
+                  eligible_count INTEGER NOT NULL DEFAULT 0,
+                  new_count INTEGER NOT NULL DEFAULT 0,
+                  refreshed_count INTEGER NOT NULL DEFAULT 0,
+                  below_threshold_count INTEGER NOT NULL DEFAULT 0,
+                  review_count INTEGER NOT NULL DEFAULT 0,
+                  excluded_count INTEGER NOT NULL DEFAULT 0,
+                  rejected_count INTEGER NOT NULL DEFAULT 0,
+                  error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS discovery_batches_started_idx
+                  ON discovery_batches(started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS discovery_candidates (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  batch_id INTEGER NOT NULL REFERENCES discovery_batches(id) ON DELETE CASCADE,
+                  channel_id TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  handle TEXT,
+                  description TEXT NOT NULL DEFAULT '',
+                  keywords TEXT NOT NULL DEFAULT '',
+                  country TEXT,
+                  thumbnail_url TEXT,
+                  subscriber_count INTEGER,
+                  view_count INTEGER,
+                  video_count INTEGER,
+                  hidden_subscriber_count INTEGER NOT NULL DEFAULT 0,
+                  uploads_playlist_id TEXT,
+                  search_terms_json TEXT NOT NULL DEFAULT '[]',
+                  match_term TEXT,
+                  match_field TEXT,
+                  match_excerpt TEXT,
+                  validation_status TEXT NOT NULL DEFAULT 'pending',
+                  unlisted_reason TEXT NOT NULL DEFAULT '等待規則驗證',
+                  handling_status TEXT NOT NULL DEFAULT 'pending',
+                  handling_note TEXT NOT NULL DEFAULT '',
+                  discovered_at TEXT NOT NULL,
+                  handled_at TEXT,
+                  UNIQUE(batch_id, channel_id)
+                );
+                CREATE INDEX IF NOT EXISTS discovery_candidates_batch_idx
+                  ON discovery_candidates(batch_id, discovered_at DESC);
+                CREATE INDEX IF NOT EXISTS discovery_candidates_channel_idx
+                  ON discovery_candidates(channel_id, discovered_at DESC);
+                CREATE INDEX IF NOT EXISTS discovery_candidates_status_idx
+                  ON discovery_candidates(validation_status, handling_status);
+
                 CREATE TABLE IF NOT EXISTS channel_snapshots (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
@@ -702,9 +849,13 @@ class Database:
                   channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
                   report_name TEXT NOT NULL,
                   event_date TEXT,
+                  published_at TEXT,
+                  duration_seconds REAL,
                   video_id TEXT,
                   video_title TEXT,
+                  row_kind TEXT NOT NULL DEFAULT 'detail',
                   views REAL,
+                  engaged_views REAL,
                   watch_time_hours REAL,
                   average_view_duration_seconds REAL,
                   average_percentage_viewed REAL,
@@ -745,6 +896,59 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS creator_manual_channel_idx
                   ON creator_manual_metrics(channel_id, metric_date DESC);
+
+                CREATE TABLE IF NOT EXISTS creator_workspace_channels (
+                  channel_id TEXT PRIMARY KEY REFERENCES channels(channel_id) ON DELETE CASCADE,
+                  added_at TEXT NOT NULL,
+                  display_order INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS creator_workspace_order_idx
+                  ON creator_workspace_channels(display_order, added_at);
+
+                CREATE TABLE IF NOT EXISTS creator_oauth_connections (
+                  channel_id TEXT PRIMARY KEY REFERENCES channels(channel_id) ON DELETE CASCADE,
+                  connected_at TEXT NOT NULL,
+                  last_sync_at TEXT,
+                  last_data_date TEXT,
+                  last_error TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS creator_oauth_summary_metrics (
+                  channel_id TEXT PRIMARY KEY REFERENCES channels(channel_id) ON DELETE CASCADE,
+                  date_start TEXT NOT NULL,
+                  date_end TEXT NOT NULL,
+                  metrics_json TEXT NOT NULL,
+                  synced_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS creator_oauth_daily_metrics (
+                  channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
+                  event_date TEXT NOT NULL,
+                  metrics_json TEXT NOT NULL,
+                  synced_at TEXT NOT NULL,
+                  PRIMARY KEY(channel_id,event_date)
+                );
+                CREATE INDEX IF NOT EXISTS creator_oauth_daily_channel_idx
+                  ON creator_oauth_daily_metrics(channel_id,event_date DESC);
+
+                CREATE TABLE IF NOT EXISTS creator_oauth_video_metrics (
+                  channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
+                  video_id TEXT NOT NULL,
+                  metrics_json TEXT NOT NULL,
+                  synced_at TEXT NOT NULL,
+                  PRIMARY KEY(channel_id,video_id)
+                );
+                CREATE INDEX IF NOT EXISTS creator_oauth_video_channel_idx
+                  ON creator_oauth_video_metrics(channel_id,synced_at DESC);
+
+                CREATE TABLE IF NOT EXISTS manual_refresh_queue (
+                  channel_id TEXT PRIMARY KEY REFERENCES channels(channel_id) ON DELETE CASCADE,
+                  queued_at TEXT NOT NULL,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  last_error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS manual_refresh_queue_time_idx
+                  ON manual_refresh_queue(queued_at);
                 """
             )
             channel_columns = {
@@ -784,6 +988,21 @@ class Database:
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS channels_activity_idx ON channels(activity_status, subscriber_count DESC)"
             )
+            creator_row_columns = {
+                row["name"] for row in self.connection.execute(
+                    "PRAGMA table_info(creator_analytics_rows)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "published_at": "TEXT",
+                "duration_seconds": "REAL",
+                "row_kind": "TEXT NOT NULL DEFAULT 'detail'",
+                "engaged_views": "REAL",
+            }.items():
+                if column not in creator_row_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE creator_analytics_rows ADD COLUMN {column} {definition}"
+                    )
             video_columns = {
                 row["name"] for row in self.connection.execute("PRAGMA table_info(videos)").fetchall()
             }
@@ -878,6 +1097,169 @@ class Database:
                 rows,
             )
             self.connection.commit()
+
+    def create_discovery_batch(self, terms: list[str], pages_per_term: int) -> int:
+        cursor = self.execute(
+            """INSERT INTO discovery_batches
+               (started_at,status,discovery_terms_json,pages_per_term)
+               VALUES (?,'running',?,?)""",
+            (utc_now(), json.dumps(terms, ensure_ascii=False), pages_per_term),
+        )
+        return int(cursor.lastrowid)
+
+    def update_discovery_batch(self, batch_id: int, values: dict[str, Any]) -> None:
+        allowed = {
+            "completed_at", "status", "candidate_count", "examined_count",
+            "eligible_count", "new_count", "refreshed_count", "below_threshold_count",
+            "review_count", "excluded_count", "rejected_count", "error",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ",".join(f"{key}=?" for key in updates)
+        self.execute(
+            f"UPDATE discovery_batches SET {assignments} WHERE id=?",
+            (*updates.values(), batch_id),
+        )
+
+    def upsert_discovery_candidate(self, candidate: dict[str, Any]) -> None:
+        now = str(candidate.get("discovered_at") or utc_now())
+        self.execute(
+            """INSERT INTO discovery_candidates (
+                 batch_id,channel_id,title,handle,description,keywords,country,thumbnail_url,
+                 subscriber_count,view_count,video_count,hidden_subscriber_count,
+                 uploads_playlist_id,search_terms_json,match_term,match_field,match_excerpt,
+                 validation_status,unlisted_reason,handling_status,handling_note,
+                 discovered_at,handled_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(batch_id,channel_id) DO UPDATE SET
+                 title=excluded.title,handle=excluded.handle,description=excluded.description,
+                 keywords=excluded.keywords,country=excluded.country,
+                 thumbnail_url=excluded.thumbnail_url,subscriber_count=excluded.subscriber_count,
+                 view_count=excluded.view_count,video_count=excluded.video_count,
+                 hidden_subscriber_count=excluded.hidden_subscriber_count,
+                 uploads_playlist_id=excluded.uploads_playlist_id,
+                 search_terms_json=excluded.search_terms_json,
+                 match_term=excluded.match_term,match_field=excluded.match_field,
+                 match_excerpt=excluded.match_excerpt,
+                 validation_status=excluded.validation_status,
+                 unlisted_reason=excluded.unlisted_reason,
+                 handling_status=CASE
+                   WHEN discovery_candidates.handling_status IN ('manual_approved','manual_excluded')
+                   THEN discovery_candidates.handling_status
+                   ELSE excluded.handling_status
+                 END,
+                 handling_note=CASE
+                   WHEN discovery_candidates.handling_status IN ('manual_approved','manual_excluded')
+                   THEN discovery_candidates.handling_note
+                   ELSE excluded.handling_note
+                 END,
+                 handled_at=CASE
+                   WHEN discovery_candidates.handling_status IN ('manual_approved','manual_excluded')
+                   THEN discovery_candidates.handled_at
+                   ELSE excluded.handled_at
+                 END""",
+            (
+                int(candidate["batch_id"]),
+                str(candidate["channel_id"]),
+                str(candidate.get("title") or candidate["channel_id"])[:300],
+                candidate.get("handle"),
+                str(candidate.get("description") or "")[:5000],
+                str(candidate.get("keywords") or "")[:3000],
+                candidate.get("country"),
+                candidate.get("thumbnail_url"),
+                candidate.get("subscriber_count"),
+                candidate.get("view_count"),
+                candidate.get("video_count"),
+                1 if candidate.get("hidden_subscriber_count") else 0,
+                candidate.get("uploads_playlist_id"),
+                json.dumps(candidate.get("search_terms") or [], ensure_ascii=False),
+                candidate.get("match_term"),
+                candidate.get("match_field"),
+                candidate.get("match_excerpt"),
+                str(candidate.get("validation_status") or "pending"),
+                str(candidate.get("unlisted_reason") or ""),
+                str(candidate.get("handling_status") or "pending"),
+                str(candidate.get("handling_note") or ""),
+                now,
+                candidate.get("handled_at"),
+            ),
+        )
+
+    def discovery_candidate(self, candidate_id: int) -> dict[str, Any] | None:
+        rows = self.rows(
+            "SELECT * FROM discovery_candidates WHERE id=?", (candidate_id,)
+        )
+        return rows[0] if rows else None
+
+    def update_candidate_handling(
+        self,
+        candidate_id: int,
+        status: str,
+        note: str,
+    ) -> None:
+        self.execute(
+            """UPDATE discovery_candidates
+               SET handling_status=?,handling_note=?,handled_at=?
+               WHERE id=?""",
+            (status, note[:500], utc_now(), candidate_id),
+        )
+
+    def add_workspace_channel(self, channel_id: str) -> None:
+        next_order = int(self.scalar(
+            "SELECT COALESCE(MAX(display_order),-1)+1 FROM creator_workspace_channels"
+        ) or 0)
+        self.execute(
+            """INSERT INTO creator_workspace_channels(channel_id,added_at,display_order)
+               VALUES (?,?,?) ON CONFLICT(channel_id) DO NOTHING""",
+            (channel_id, utc_now(), next_order),
+        )
+
+    def remove_workspace_channel(self, channel_id: str) -> bool:
+        cursor = self.execute(
+            "DELETE FROM creator_workspace_channels WHERE channel_id=?", (channel_id,)
+        )
+        return cursor.rowcount > 0
+
+    def workspace_channel_ids(self) -> list[str]:
+        return [row["channel_id"] for row in self.rows(
+            """SELECT channel_id FROM creator_workspace_channels
+               ORDER BY display_order,added_at,channel_id"""
+        )]
+
+    def enqueue_manual_refresh(self, channel_id: str) -> int:
+        self.execute(
+            """INSERT INTO manual_refresh_queue(channel_id,queued_at,attempts,last_error)
+               VALUES (?,?,0,'') ON CONFLICT(channel_id) DO UPDATE SET queued_at=excluded.queued_at""",
+            (channel_id, utc_now()),
+        )
+        return int(self.scalar("SELECT COUNT(*) FROM manual_refresh_queue") or 0)
+
+    def manual_refresh_queue(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.rows(
+            """SELECT channel_id,queued_at,attempts,last_error FROM manual_refresh_queue
+               ORDER BY queued_at,channel_id LIMIT ?""",
+            (limit,),
+        )
+
+    def complete_manual_refresh(self, channel_ids: Iterable[str]) -> None:
+        ids = list(dict.fromkeys(channel_ids))
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        self.execute(
+            f"DELETE FROM manual_refresh_queue WHERE channel_id IN ({placeholders})", tuple(ids)
+        )
+
+    def fail_manual_refresh(self, channel_ids: Iterable[str], error: str) -> None:
+        ids = list(dict.fromkeys(channel_ids))
+        if not ids:
+            return
+        self.executemany(
+            """UPDATE manual_refresh_queue SET attempts=attempts+1,last_error=?
+               WHERE channel_id=?""",
+            [(error[:300], channel_id) for channel_id in ids],
+        )
 
     def update_channel_metadata(
         self,
@@ -1016,18 +1398,20 @@ class Database:
                         (channel_id, row["natural_key"]),
                     )
                 metrics = row["metrics"]
+                metric_columns = ",".join(CREATOR_METRICS)
+                placeholders = ",".join(
+                    "?" for _ in range(9 + len(CREATOR_METRICS) + 5)
+                )
                 self.connection.execute(
-                    """INSERT INTO creator_analytics_rows (
-                         batch_id,channel_id,report_name,event_date,video_id,video_title,
-                         views,watch_time_hours,average_view_duration_seconds,
-                         average_percentage_viewed,impressions,impressions_ctr,subscribers_net,
-                         subscribers_gained,subscribers_lost,likes,comments,shares,
-                         unique_viewers,returning_viewers,estimated_revenue,dimensions_json,
-                         natural_key,row_hash,conflict_status,created_at
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    f"""INSERT INTO creator_analytics_rows (
+                          batch_id,channel_id,report_name,event_date,published_at,
+                          duration_seconds,row_kind,video_id,video_title,{metric_columns},
+                          dimensions_json,natural_key,row_hash,conflict_status,created_at
+                        ) VALUES ({placeholders})""",
                     (
                         batch_id, channel_id, row["report_name"], row["event_date"],
-                        row["video_id"], row["video_title"],
+                        row.get("published_at"), row.get("duration_seconds"),
+                        row.get("row_kind", "detail"), row["video_id"], row["video_title"],
                         *[metrics.get(metric) for metric in CREATOR_METRICS],
                         json.dumps(row["dimensions"], ensure_ascii=False), row["natural_key"],
                         row["row_hash"], conflict, now,
@@ -1189,6 +1573,18 @@ class Database:
         self.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
         return channel
 
+    def exclude_candidate_channel(self, channel_id: str, title: str) -> dict[str, Any]:
+        now = utc_now()
+        self.execute(
+            """INSERT INTO excluded_channels(channel_id,title,reason,excluded_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(channel_id) DO UPDATE SET
+                 title=excluded.title,reason=excluded.reason,excluded_at=excluded.excluded_at""",
+            (channel_id, title, "candidate-review", now),
+        )
+        self.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
+        return {"channel_id": channel_id, "title": title}
+
     def restore_excluded(self, channel_id: str) -> None:
         self.execute("DELETE FROM excluded_channels WHERE channel_id=?", (channel_id,))
 
@@ -1324,8 +1720,28 @@ class YouTubeClient:
 class TrackerService:
     def __init__(self, config: Config):
         self.config = config
+        self.edition = "personal" if getattr(config, "edition", "public") == "personal" else "public"
+        self.retention_choices = (
+            PERSONAL_RETENTION_CHOICES if self.edition == "personal" else PUBLIC_RETENTION_CHOICES
+        )
+        self.setting_choices = {
+            **SETTING_CHOICES,
+            "retention_days": self.retention_choices,
+            "creator_retention_days": CREATOR_RETENTION_CHOICES,
+        }
         self.database = Database(config.database_path)
+        legacy_owned = str(self.database.get_setting("owned_channel_id", "")).strip()
+        if legacy_owned and self.database.scalar(
+            "SELECT 1 FROM channels WHERE channel_id=?", (legacy_owned,)
+        ):
+            self.database.add_workspace_channel(legacy_owned)
         self.youtube = YouTubeClient(config, self.database)
+        oauth_directory = config.database_path.parent / "oauth"
+        self.oauth = GoogleOAuth(
+            oauth_directory,
+            f"http://{getattr(config, 'host', '127.0.0.1')}:{getattr(config, 'port', 8787)}/api/creator/oauth/callback",
+        )
+        self.channel_candidate_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self.run_lock = threading.Lock()
         self.state_lock = threading.RLock()
         defaults = {
@@ -1334,15 +1750,33 @@ class TrackerService:
             "channel_refresh_hours": getattr(config, "channel_refresh_hours", 6),
             "upload_scan_hours": getattr(config, "upload_scan_hours", 4),
             "retention_days": getattr(config, "retention_days", 30),
+            "creator_retention_days": getattr(config, "creator_retention_days", 0),
             "discovery_terms": list(SEARCH_TERMS),
         }
         self.runtime_settings = {
             key: self.database.get_setting(key, value) for key, value in defaults.items()
         }
+        # Normalize legacy free-form values to the fixed menus for the selected edition.
+        normalized_settings: dict[str, int] = {}
+        for key, choices in self.setting_choices.items():
+            value = int(self.runtime_settings[key])
+            if value in choices:
+                continue
+            fallback = int(defaults[key])
+            normalized_settings[key] = fallback if fallback in choices else choices[-1]
+            self.runtime_settings[key] = normalized_settings[key]
+        if normalized_settings:
+            self.database.set_settings(normalized_settings)
         self.current_job: str | None = None
+        self.current_job_started_at: str | None = None
+        self.last_job: str | None = None
+        self.last_job_finished_at: str | None = None
+        self.last_job_status: str | None = None
         self.last_error: str | None = None
+        self.discovery_batch_id: int | None = None
         self.discovery_progress: dict[str, Any] = {
             "status": "idle",
+            "batch_id": None,
             "started_at": None,
             "completed_at": None,
             "current_term": None,
@@ -1366,7 +1800,10 @@ class TrackerService:
         self.last_live_poll = 0.0
         self.last_upload_dispatch = 0.0
         self.last_channel_refresh = 0.0
+        self.last_manual_queue_dispatch = 0.0
         self.last_cleanup = 0.0
+        self.last_oauth_sync_check = 0.0
+        self.last_hourly_live_scan_slot: str | None = None
 
     def settings_payload(self) -> dict[str, Any]:
         with self.state_lock:
@@ -1376,7 +1813,14 @@ class TrackerService:
                 "channel_refresh_hours": int(self.runtime_settings["channel_refresh_hours"]),
                 "upload_scan_hours": int(self.runtime_settings["upload_scan_hours"]),
                 "retention_days": int(self.runtime_settings["retention_days"]),
+                "creator_retention_days": int(self.runtime_settings["creator_retention_days"]),
+                "edition": self.edition,
+                "retention_options": list(self.retention_choices),
+                "creator_retention_options": list(CREATOR_RETENTION_CHOICES),
                 "discovery_terms": list(self.runtime_settings["discovery_terms"]),
+                "hourly_live_scan_offsets": list(HOURLY_LIVE_SCAN_OFFSETS),
+                "hourly_live_scan_timezone": "Asia/Taipei",
+                "owned_channel_live_scan_priority": True,
             }
 
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1391,6 +1835,18 @@ class TrackerService:
                 raise ValueError(f"{key} 必須是整數") from error
             if value < minimum or value > maximum:
                 raise ValueError(f"{key} 必須介於 {minimum:,} 到 {maximum:,} 之間")
+            updated[key] = value
+
+        for key, choices in self.setting_choices.items():
+            if key not in payload:
+                continue
+            try:
+                value = int(payload[key])
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{key} 必須是整數") from error
+            if value not in choices:
+                allowed = "、".join(f"{choice:,}" for choice in choices)
+                raise ValueError(f"{key} 必須是下列其中一項：{allowed}")
             updated[key] = value
 
         if "discovery_terms" in payload:
@@ -1422,19 +1878,31 @@ class TrackerService:
 
     def _set_job(self, job: str | None) -> None:
         with self.state_lock:
+            if job:
+                self.current_job_started_at = utc_now()
+            elif self.current_job:
+                self.last_job = self.current_job
+                self.last_job_finished_at = utc_now()
+                self.last_job_status = "error" if self.last_error else "completed"
+                self.current_job_started_at = None
             self.current_job = job
 
     def _begin_discovery(self) -> None:
         terms = self.settings_payload()["discovery_terms"]
+        pages_per_term = getattr(self.config, "discovery_pages_per_term", 2)
+        self.discovery_batch_id = self.database.create_discovery_batch(
+            terms, pages_per_term
+        )
         with self.state_lock:
             self.discovery_progress = {
                 "status": "running",
+                "batch_id": self.discovery_batch_id,
                 "started_at": utc_now(),
                 "completed_at": None,
                 "current_term": terms[0] if terms else None,
                 "term_index": 0,
                 "total_terms": len(terms),
-                "pages_per_term": getattr(self.config, "discovery_pages_per_term", 2),
+                "pages_per_term": pages_per_term,
                 "current_page": 0,
                 "candidate_count": 0,
                 "examined_count": 0,
@@ -1452,36 +1920,55 @@ class TrackerService:
     def _update_discovery(self, **values: Any) -> None:
         with self.state_lock:
             self.discovery_progress.update(values)
+        if self.discovery_batch_id is not None:
+            self.database.update_discovery_batch(self.discovery_batch_id, values)
 
     def _finish_discovery(self, status: str = "completed", error: str | None = None) -> None:
+        completed_at = utc_now()
         with self.state_lock:
             self.discovery_progress.update({
                 "status": status,
-                "completed_at": utc_now(),
+                "completed_at": completed_at,
                 "current_term": None,
                 "current_page": 0,
                 "message": "探索完成" if status == "completed" else "探索未完成",
                 "error": error,
             })
+        if self.discovery_batch_id is not None:
+            self.database.update_discovery_batch(self.discovery_batch_id, {
+                **self.discovery_progress,
+                "completed_at": completed_at,
+                "status": status,
+                "error": error,
+            })
 
     def _record_error(self, error: Exception) -> None:
+        completed_at = utc_now()
         with self.state_lock:
             self.last_error = str(error)[:700]
             if self.current_job == "discover" or self.discovery_progress.get("status") == "running":
                 self.discovery_progress.update({
                     "status": "error",
-                    "completed_at": utc_now(),
+                    "completed_at": completed_at,
                     "message": "探索未完成",
                     "error": self.last_error,
                 })
+                if self.discovery_batch_id is not None:
+                    self.database.update_discovery_batch(self.discovery_batch_id, {
+                        **self.discovery_progress,
+                        "completed_at": completed_at,
+                        "status": "error",
+                        "error": self.last_error,
+                    })
 
     def launch_job(self, name: str, callback: Callable[[], None]) -> tuple[bool, str]:
-        if not self.config.api_key:
+        if not self.config.api_key and name != "oauth-analytics-sync":
             return False, "尚未設定 YOUTUBE_API_KEY"
         with self.state_lock:
             if self.current_job:
                 return False, f"目前正在執行：{self.current_job}"
             self.current_job = name
+            self.current_job_started_at = utc_now()
             self.last_error = None
         if name == "discover":
             self._begin_discovery()
@@ -1500,11 +1987,62 @@ class TrackerService:
         threading.Thread(target=runner, name=f"tracker-{name}", daemon=True).start()
         return True, "已開始搜尋候選頻道" if name == "discover" else "工作已開始"
 
+    def _save_discovery_candidate(
+        self,
+        channel_id: str,
+        search_terms: list[str],
+        item: dict[str, Any],
+        validation_status: str = "pending",
+        unlisted_reason: str = "等待規則驗證",
+        handling_status: str = "pending",
+        evidence: tuple[str, str, str] | None = None,
+    ) -> None:
+        if self.discovery_batch_id is None:
+            return
+        snippet = item.get("snippet", {})
+        statistics = item.get("statistics", {})
+        branding = item.get("brandingSettings", {}).get("channel", {})
+        uploads = item.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+        thumbnails = snippet.get("thumbnails", {})
+        thumbnail = (
+            thumbnails.get("medium") or thumbnails.get("high") or thumbnails.get("default") or {}
+        ).get("url")
+        match_term, match_field, match_excerpt = evidence or (None, None, None)
+        self.database.upsert_discovery_candidate({
+            "batch_id": self.discovery_batch_id,
+            "channel_id": channel_id,
+            "title": snippet.get("title") or snippet.get("channelTitle") or channel_id,
+            "handle": snippet.get("customUrl"),
+            "description": snippet.get("description", ""),
+            "keywords": branding.get("keywords", ""),
+            "country": snippet.get("country"),
+            "thumbnail_url": thumbnail,
+            "subscriber_count": (
+                int(statistics["subscriberCount"])
+                if statistics.get("subscriberCount") else None
+            ),
+            "view_count": (
+                int(statistics["viewCount"]) if statistics.get("viewCount") else None
+            ),
+            "video_count": (
+                int(statistics["videoCount"]) if statistics.get("videoCount") else None
+            ),
+            "hidden_subscriber_count": bool(statistics.get("hiddenSubscriberCount")),
+            "uploads_playlist_id": uploads,
+            "search_terms": search_terms,
+            "match_term": match_term,
+            "match_field": match_field,
+            "match_excerpt": match_excerpt,
+            "validation_status": validation_status,
+            "unlisted_reason": unlisted_reason,
+            "handling_status": handling_status,
+        })
+
     def discover_channels(self) -> None:
         settings = self.settings_payload()
         if self.discovery_progress.get("status") != "running":
             self._begin_discovery()
-        candidate_ids: set[str] = set()
+        search_hits: dict[str, dict[str, Any]] = {}
         for term_index, term in enumerate(settings["discovery_terms"], start=1):
             page_token: str | None = None
             for page_index in range(1, getattr(self.config, "discovery_pages_per_term", 2) + 1):
@@ -1522,47 +2060,100 @@ class TrackerService:
                 payload = self.youtube.get("search", params, bucket="search")
                 for result in payload.get("items", []):
                     channel_id = result.get("id", {}).get("channelId")
-                    if channel_id:
-                        candidate_ids.add(channel_id)
-                self._update_discovery(candidate_count=len(candidate_ids))
+                    if not channel_id:
+                        continue
+                    hit = search_hits.setdefault(channel_id, {
+                        "terms": [],
+                        "search_result": result,
+                    })
+                    if term not in hit["terms"]:
+                        hit["terms"].append(term)
+                    self._save_discovery_candidate(
+                        channel_id,
+                        hit["terms"],
+                        hit["search_result"],
+                    )
+                self._update_discovery(candidate_count=len(search_hits))
                 page_token = payload.get("nextPageToken")
                 if not page_token:
                     break
 
-        self._update_discovery(message=f"找到 {len(candidate_ids)} 個候選，正在核對頻道資料")
-        for group in chunks(sorted(candidate_ids)):
+        self._update_discovery(
+            message=f"找到 {len(search_hits)} 個候選，正在核對頻道資料"
+        )
+        validated_ids: set[str] = set()
+        for group in chunks(sorted(search_hits)):
             payload = self.youtube.get("channels", {
                 "part": "snippet,statistics,contentDetails,brandingSettings",
                 "id": ",".join(group), "maxResults": 50,
             })
             for item in payload.get("items", []):
+                channel_id = item["id"]
+                validated_ids.add(channel_id)
                 with self.state_lock:
                     examined = int(self.discovery_progress["examined_count"]) + 1
                 self._update_discovery(examined_count=examined)
-                if self.database.is_excluded(item["id"]):
+                search_terms = search_hits[channel_id]["terms"]
+                if self.database.is_excluded(channel_id):
                     with self.state_lock:
                         count = int(self.discovery_progress["excluded_count"]) + 1
                     self._update_discovery(excluded_count=count)
+                    self._save_discovery_candidate(
+                        channel_id,
+                        search_terms,
+                        item,
+                        validation_status="excluded",
+                        unlisted_reason="此頻道已在黑名單，不會由探索自動收錄",
+                        handling_status="manual_excluded",
+                    )
                     continue
                 evidence = evidence_for_terms(item, settings["discovery_terms"])
                 if not evidence:
                     with self.state_lock:
                         count = int(self.discovery_progress["rejected_count"]) + 1
                     self._update_discovery(rejected_count=count)
+                    self._save_discovery_candidate(
+                        channel_id,
+                        search_terms,
+                        item,
+                        validation_status="rejected",
+                        unlisted_reason="名稱、說明與頻道關鍵字未找到符合規則的台 V 自述",
+                    )
                     continue
                 statistics = item.get("statistics", {})
                 hidden = bool(statistics.get("hiddenSubscriberCount"))
-                subscribers = int(statistics["subscriberCount"]) if statistics.get("subscriberCount") else None
+                subscribers = (
+                    int(statistics["subscriberCount"])
+                    if statistics.get("subscriberCount") else None
+                )
                 if hidden or subscribers is None:
                     status = "review"
+                    reason = "公開訂閱數未顯示，無法自動確認是否達到收錄門檻"
+                    handling = "pending"
                 elif subscribers >= settings["min_subscribers"]:
                     status = "eligible"
+                    reason = ""
+                    handling = "auto_included"
                 else:
                     status = "below_threshold"
+                    reason = (
+                        f"公開訂閱數 {subscribers:,}，未達自動收錄門檻 "
+                        f"{settings['min_subscribers']:,}"
+                    )
+                    handling = "pending"
                 previous = self.database.rows(
-                    "SELECT discovery_status FROM channels WHERE channel_id=?", (item["id"],)
+                    "SELECT discovery_status FROM channels WHERE channel_id=?", (channel_id,)
                 )
                 self.database.upsert_channel(item, status=status, evidence=evidence)
+                self._save_discovery_candidate(
+                    channel_id,
+                    search_terms,
+                    item,
+                    validation_status=status,
+                    unlisted_reason=reason,
+                    handling_status=handling,
+                    evidence=evidence,
+                )
                 if status == "eligible":
                     with self.state_lock:
                         eligible = int(self.discovery_progress["eligible_count"]) + 1
@@ -1583,6 +2174,16 @@ class TrackerService:
                     with self.state_lock:
                         count = int(self.discovery_progress["review_count"]) + 1
                     self._update_discovery(review_count=count)
+
+        for channel_id in sorted(set(search_hits) - validated_ids):
+            hit = search_hits[channel_id]
+            self._save_discovery_candidate(
+                channel_id,
+                hit["terms"],
+                hit["search_result"],
+                validation_status="unavailable",
+                unlisted_reason="YouTube 頻道資料回應未包含此頻道，這次無法完成規則驗證",
+            )
         self.evaluate_activity_statuses()
         self._finish_discovery()
 
@@ -1616,6 +2217,7 @@ class TrackerService:
 
         candidates: list[dict[str, Any]] = []
         for item in payload.get("items", []):
+            self.channel_candidate_cache[item["id"]] = (time.monotonic(), item)
             snippet = item.get("snippet", {})
             statistics = item.get("statistics", {})
             thumbnails = snippet.get("thumbnails", {})
@@ -1640,10 +2242,14 @@ class TrackerService:
 
     def add_manual_channel(self, channel_id: str, allow_owned_exception: bool = False) -> dict[str, Any]:
         min_subscribers = self.settings_payload()["min_subscribers"]
-        payload = self.youtube.get("channels", {
-            "part": "snippet,statistics,contentDetails,brandingSettings", "id": channel_id,
-        })
-        items = payload.get("items", [])
+        cached = self.channel_candidate_cache.get(channel_id)
+        if cached and time.monotonic() - cached[0] <= 900:
+            items = [cached[1]]
+        else:
+            payload = self.youtube.get("channels", {
+                "part": "snippet,statistics,contentDetails,brandingSettings", "id": channel_id,
+            })
+            items = payload.get("items", [])
         if not items:
             raise ValueError("找不到指定的 YouTube 頻道")
         item = items[0]
@@ -1663,14 +2269,19 @@ class TrackerService:
         )
         self.database.upsert_channel(item, status=status, evidence=evidence)
         self.evaluate_activity_status(channel_id)
+        queue_count = self.database.enqueue_manual_refresh(channel_id)
+        if queue_count >= 50:
+            self.launch_job("manual-channel-refresh", self.refresh_manual_queue)
         return {
             "channel_id": channel_id,
             "title": snippet.get("title", channel_id),
             "discovery_status": status,
+            "manual_refresh_queue_count": queue_count,
         }
 
     def add_owned_channel(self, channel_id: str) -> dict[str, Any]:
         channel = self.add_manual_channel(channel_id, allow_owned_exception=True)
+        self.database.add_workspace_channel(channel_id)
         self.database.set_settings({"owned_channel_id": channel_id})
         return channel
 
@@ -1679,6 +2290,195 @@ class TrackerService:
         if not channel:
             raise ValueError("找不到要排除的頻道")
         return channel
+
+    def candidate_review(
+        self,
+        query: str = "",
+        batch_id: int | None = None,
+        validation_status: str = "all",
+        handling_status: str = "all",
+        sort: str = "discovered_at",
+        direction: str = "desc",
+    ) -> dict[str, Any]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if batch_id is not None:
+            conditions.append("dc.batch_id=?")
+            params.append(batch_id)
+        if validation_status != "all":
+            conditions.append("dc.validation_status=?")
+            params.append(validation_status)
+        if handling_status == "included":
+            conditions.append("c.discovery_status IN ('eligible','owned')")
+        elif handling_status == "excluded":
+            conditions.append("ex.channel_id IS NOT NULL")
+        elif handling_status in {"pending", "deferred"}:
+            conditions.append(
+                """ex.channel_id IS NULL
+                   AND (c.channel_id IS NULL OR c.discovery_status NOT IN ('eligible','owned'))"""
+            )
+            conditions.append("dc.handling_status=?")
+            params.append(handling_status)
+        if query.strip():
+            pattern = f"%{query.strip()[:120]}%"
+            conditions.append(
+                """(dc.title LIKE ? OR COALESCE(dc.handle,'') LIKE ?
+                    OR dc.channel_id LIKE ? OR dc.search_terms_json LIKE ?
+                    OR COALESCE(dc.match_excerpt,'') LIKE ?
+                    OR dc.unlisted_reason LIKE ?)"""
+            )
+            params.extend([pattern] * 6)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        sort_columns = {
+            "discovered_at": "dc.discovered_at",
+            "subscriber_count": "dc.subscriber_count",
+            "title": "dc.title COLLATE NOCASE",
+            "validation_status": "dc.validation_status",
+            "batch": "dc.batch_id",
+        }
+        order_column = sort_columns.get(sort, sort_columns["discovered_at"])
+        order_direction = "ASC" if direction.casefold() == "asc" else "DESC"
+        candidates = self.database.rows(
+            f"""SELECT dc.*,db.started_at AS batch_started_at,
+                       db.completed_at AS batch_completed_at,db.status AS batch_status,
+                       CASE
+                         WHEN ex.channel_id IS NOT NULL THEN 'excluded'
+                         WHEN c.discovery_status IN ('eligible','owned') THEN 'included'
+                         ELSE dc.handling_status
+                       END AS current_status
+                  FROM discovery_candidates dc
+                  JOIN discovery_batches db ON db.id=dc.batch_id
+                  LEFT JOIN channels c ON c.channel_id=dc.channel_id
+                  LEFT JOIN excluded_channels ex ON ex.channel_id=dc.channel_id
+                  {where}
+                  ORDER BY {order_column} {order_direction},dc.id DESC
+                  LIMIT 2000""",
+            tuple(params),
+        )
+        for candidate in candidates:
+            try:
+                candidate["search_terms"] = json.loads(
+                    candidate.pop("search_terms_json") or "[]"
+                )
+            except json.JSONDecodeError:
+                candidate["search_terms"] = []
+        batches = self.database.rows(
+            """SELECT id,started_at,completed_at,status,discovery_terms_json,
+                      pages_per_term,candidate_count,examined_count,eligible_count,
+                      new_count,refreshed_count,below_threshold_count,review_count,
+                      excluded_count,rejected_count,error
+                 FROM discovery_batches ORDER BY id DESC LIMIT 100"""
+        )
+        for batch in batches:
+            try:
+                batch["discovery_terms"] = json.loads(
+                    batch.pop("discovery_terms_json") or "[]"
+                )
+            except json.JSONDecodeError:
+                batch["discovery_terms"] = []
+        validation_counts = {
+            row["validation_status"]: int(row["count"])
+            for row in self.database.rows(
+                """SELECT validation_status,COUNT(*) AS count
+                     FROM discovery_candidates GROUP BY validation_status"""
+            )
+        }
+        return {
+            "candidates": candidates,
+            "batches": batches,
+            "validation_counts": validation_counts,
+            "result_count": len(candidates),
+            "quota_note": "此頁只讀取本機 SQLite；查看、搜尋、篩選與排序不會使用 YouTube Search API 配額。",
+        }
+
+    def review_candidate(self, candidate_id: int, action: str) -> dict[str, Any]:
+        candidate = self.database.discovery_candidate(candidate_id)
+        if not candidate:
+            raise ValueError("找不到這筆候選紀錄")
+        channel_id = str(candidate["channel_id"])
+        title = str(candidate["title"])
+        if action == "approve":
+            item = {
+                "id": channel_id,
+                "snippet": {
+                    "title": title,
+                    "customUrl": candidate.get("handle"),
+                    "description": candidate.get("description") or "",
+                    "country": candidate.get("country"),
+                    "thumbnails": {
+                        "default": {"url": candidate.get("thumbnail_url")}
+                    } if candidate.get("thumbnail_url") else {},
+                },
+                "statistics": {
+                    **(
+                        {"subscriberCount": str(candidate["subscriber_count"])}
+                        if candidate.get("subscriber_count") is not None else {}
+                    ),
+                    **(
+                        {"viewCount": str(candidate["view_count"])}
+                        if candidate.get("view_count") is not None else {}
+                    ),
+                    **(
+                        {"videoCount": str(candidate["video_count"])}
+                        if candidate.get("video_count") is not None else {}
+                    ),
+                    "hiddenSubscriberCount": bool(
+                        candidate.get("hidden_subscriber_count")
+                    ),
+                },
+                "contentDetails": {
+                    "relatedPlaylists": {
+                        "uploads": candidate.get("uploads_playlist_id")
+                    }
+                },
+                "brandingSettings": {
+                    "channel": {"keywords": candidate.get("keywords") or ""}
+                },
+            }
+            evidence = (
+                (
+                    str(candidate["match_term"]),
+                    str(candidate["match_field"]),
+                    str(candidate["match_excerpt"]),
+                )
+                if candidate.get("match_term")
+                else ("人工審核", "候選審核頁", f"人工確認收錄：{title}")
+            )
+            self.database.restore_excluded(channel_id)
+            self.database.upsert_channel(item, status="eligible", evidence=evidence)
+            self.database.update_candidate_handling(
+                candidate_id,
+                "manual_approved",
+                "已由使用者在候選審核頁確認收錄",
+            )
+            queue_count = self.database.enqueue_manual_refresh(channel_id)
+            return {
+                "message": f"已人工確認收錄 {title}",
+                "channel_id": channel_id,
+                "queue_count": queue_count,
+            }
+        if action == "exclude":
+            self.database.exclude_candidate_channel(channel_id, title)
+            self.database.update_candidate_handling(
+                candidate_id,
+                "manual_excluded",
+                "已由使用者在候選審核頁排除並加入黑名單",
+            )
+            return {
+                "message": f"已排除 {title}，後續探索不會自動加回",
+                "channel_id": channel_id,
+            }
+        if action == "defer":
+            self.database.update_candidate_handling(
+                candidate_id,
+                "deferred",
+                "已標記為稍後處理",
+            )
+            return {
+                "message": f"已將 {title} 標記為稍後處理",
+                "channel_id": channel_id,
+            }
+        raise ValueError("不支援的候選處理動作")
 
     def update_channel_metadata(self, channel_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         category = str(payload.get("category", "")).strip() or "未分類"
@@ -1868,12 +2668,87 @@ class TrackerService:
         )
         if not rows:
             raise ValueError("請先搜尋並加入自己的頻道")
+        self.database.add_workspace_channel(channel_id)
         self.database.set_settings({"owned_channel_id": channel_id})
         return rows[0]
 
     def owned_channel_id(self) -> str | None:
         value = self.database.get_setting("owned_channel_id", "")
         return str(value).strip() or None
+
+    def workspace_channel_ids(self) -> list[str]:
+        return self.database.workspace_channel_ids()
+
+    def remove_workspace_channel(self, channel_id: str) -> dict[str, Any]:
+        rows = self.database.rows(
+            "SELECT channel_id,title FROM channels WHERE channel_id=?", (channel_id,)
+        )
+        if not rows or not self.database.remove_workspace_channel(channel_id):
+            raise ValueError("這個頻道不在目前工作區")
+        remaining = self.workspace_channel_ids()
+        if self.owned_channel_id() == channel_id:
+            self.database.set_settings({"owned_channel_id": remaining[0] if remaining else ""})
+        return {"channel_id": channel_id, "title": rows[0]["title"], "remaining": len(remaining)}
+
+    def workspace_channels(self) -> list[dict[str, Any]]:
+        rows = self.database.rows(
+            """SELECT c.channel_id,c.title,c.handle,c.thumbnail_url,c.subscriber_count,
+                      c.view_count,c.video_count,c.category,c.organization_name,c.manual_tags,
+                      c.activity_status,c.last_stats_at,w.added_at,w.display_order
+               FROM creator_workspace_channels w
+               JOIN channels c ON c.channel_id=w.channel_id
+               ORDER BY w.display_order,w.added_at,c.title"""
+        )
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="seconds")
+        for row in rows:
+            snapshots = self.database.rows(
+                """SELECT captured_at,subscriber_count,view_count,video_count
+                   FROM channel_snapshots WHERE channel_id=? AND captured_at>=?
+                   ORDER BY captured_at ASC""",
+                (row["channel_id"], cutoff),
+            )
+            baseline_rows = self.database.rows(
+                """SELECT captured_at,subscriber_count,view_count,video_count
+                   FROM channel_snapshots WHERE channel_id=? AND captured_at<=?
+                   ORDER BY captured_at DESC LIMIT 1""",
+                (row["channel_id"], cutoff),
+            )
+            baseline = baseline_rows[0] if baseline_rows else None
+            for field in ("subscriber_count", "view_count", "video_count"):
+                current = row.get(field)
+                previous = baseline.get(field) if baseline else None
+                row[f"{field}_delta_30d"] = (
+                    int(current) - int(previous)
+                    if current is not None and previous is not None else None
+                )
+            row["snapshot_count_30d"] = len(snapshots)
+            row["month_ready"] = baseline is not None
+            row["recent_content_count_30d"] = int(self.database.scalar(
+                """SELECT COUNT(*) FROM videos WHERE channel_id=?
+                   AND datetime(COALESCE(published_at,actual_start,scheduled_start,updated_at))>=datetime(?)""",
+                (row["channel_id"], cutoff),
+            ) or 0)
+            row["peak_concurrent"] = self.database.scalar(
+                """SELECT MAX(cs.concurrent_viewers) FROM concurrency_samples cs
+                   JOIN videos v ON v.video_id=cs.video_id WHERE v.channel_id=?""",
+                (row["channel_id"],),
+            )
+            row["concurrency_sample_count"] = int(self.database.scalar(
+                """SELECT COUNT(*) FROM concurrency_samples cs
+                   JOIN videos v ON v.video_id=cs.video_id WHERE v.channel_id=?""",
+                (row["channel_id"],),
+            ) or 0)
+            row["manual_tags"] = parse_json_list(row.get("manual_tags"))
+        return rows
+
+    def creator_channel_id(self, payload: dict[str, Any] | None = None) -> str:
+        requested = str((payload or {}).get("channel_id", "")).strip()
+        channel_id = requested or self.owned_channel_id() or ""
+        if not channel_id:
+            raise ValueError("請先選擇管理頻道")
+        if channel_id not in self.workspace_channel_ids():
+            raise ValueError("這個頻道不在目前工作區")
+        return channel_id
 
     def preview_creator_import(self, payload: dict[str, Any]) -> dict[str, Any]:
         _, reports = decode_creator_upload(payload)
@@ -1882,6 +2757,16 @@ class TrackerService:
         metrics = sorted({
             metric for report in reports for metric in report["recognized_metrics"]
         })
+        dimensions = sorted({
+            dimension
+            for report in reports
+            for dimension in report.get("recognized_dimensions", [])
+        })
+        ignored_headers = sorted({
+            header
+            for report in reports
+            for header in report.get("ignored_headers", [])
+        })
         return {
             "filename": str(payload.get("filename", ""))[:240],
             "report_count": len(reports),
@@ -1889,18 +2774,21 @@ class TrackerService:
                 "report_name": report["report_name"],
                 "row_count": len(report["rows"]),
                 "recognized_metrics": report["recognized_metrics"],
+                "recognized_dimensions": report.get("recognized_dimensions", []),
+                "ignored_headers": report.get("ignored_headers", []),
             } for report in reports],
             "row_count": len(rows),
             "recognized_metrics": metrics,
+            "recognized_dimensions": dimensions,
+            "recognized_column_count": len(metrics) + len(dimensions),
+            "ignored_headers": ignored_headers,
             "date_start": min(dates) if dates else None,
             "date_end": max(dates) if dates else None,
             "sample_rows": rows[:3],
         }
 
     def import_creator_data(self, payload: dict[str, Any]) -> dict[str, Any]:
-        channel_id = self.owned_channel_id()
-        if not channel_id:
-            raise ValueError("請先選擇你的頻道")
+        channel_id = self.creator_channel_id(payload)
         raw, reports = decode_creator_upload(payload)
         file_hash = hashlib.sha256(raw).hexdigest()
         return self.database.creator_import_batch(
@@ -1908,9 +2796,7 @@ class TrackerService:
         )
 
     def add_creator_manual_metric(self, payload: dict[str, Any]) -> dict[str, Any]:
-        channel_id = self.owned_channel_id()
-        if not channel_id:
-            raise ValueError("請先選擇你的頻道")
+        channel_id = self.creator_channel_id(payload)
         metric_date = str(payload.get("metric_date", "")).strip()
         try:
             datetime.strptime(metric_date, "%Y-%m-%d")
@@ -1929,13 +2815,274 @@ class TrackerService:
             channel_id, metric_date, video_id, metric_name, metric_value, note
         )
 
-    def creator_dashboard(self) -> dict[str, Any]:
-        channel_id = self.owned_channel_id()
+    def creator_oauth_status(self) -> dict[str, Any]:
+        credential_status = self.oauth.status()
+        connections = self.database.rows(
+            """SELECT o.channel_id,o.connected_at,o.last_sync_at,o.last_data_date,o.last_error,
+                      c.title,c.thumbnail_url
+                 FROM creator_oauth_connections o
+                 JOIN channels c ON c.channel_id=o.channel_id
+                ORDER BY o.connected_at DESC LIMIT 1"""
+        )
+        connection = connections[0] if connections else None
+        raw_error = credential_status.get("credential_error") or (
+            connection["last_error"] if connection else ""
+        )
+        with self.state_lock:
+            syncing = self.current_job == "oauth-analytics-sync"
+            sync_started_at = self.current_job_started_at if syncing else None
+        return {
+            **credential_status,
+            "connected": bool(connection and credential_status["authorized"]),
+            "channel": ({
+                "channel_id": connection["channel_id"],
+                "title": connection["title"],
+                "thumbnail_url": connection["thumbnail_url"],
+            } if connection else None),
+            "connected_at": connection["connected_at"] if connection else None,
+            "last_sync_at": connection["last_sync_at"] if connection else None,
+            "last_data_date": connection["last_data_date"] if connection else None,
+            "syncing": syncing,
+            "sync_started_at": sync_started_at,
+            "last_error": raw_error,
+            "last_error_help": oauth_error_guidance(raw_error) if raw_error else None,
+            "required_scopes": list(REQUIRED_SCOPES),
+            "storage": "Windows DPAPI",
+        }
+
+    def configure_creator_oauth(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.oauth.status()["authorized"]:
+            raise ValueError("請先中斷目前頻道連線，再更換 OAuth 設定")
+        content = str(payload.get("content_base64", "")).strip()
+        try:
+            raw = base64.b64decode(content, validate=True)
+        except (ValueError, base64.binascii.Error) as error:
+            raise ValueError("OAuth JSON 內容不是有效的 Base64") from error
+        self.oauth.configure_client(raw)
+        return self.creator_oauth_status()
+
+    def creator_oauth_authorization_url(self) -> str:
+        return self.oauth.authorization_url()
+
+    def complete_creator_oauth(self, code: str, state: str) -> dict[str, Any]:
+        item = self.oauth.complete_authorization(code, state)
+        channel_id = str(item.get("id") or "").strip()
+        if not channel_id:
+            raise ValueError("Google 沒有回傳頻道 ID")
+        self.database.restore_excluded(channel_id)
+        self.database.upsert_channel(item, status="owned")
+        self.database.add_workspace_channel(channel_id)
+        self.database.set_settings({"owned_channel_id": channel_id})
+        now = utc_now()
+        self.database.execute(
+            """INSERT INTO creator_oauth_connections
+               (channel_id,connected_at,last_sync_at,last_data_date,last_error)
+               VALUES (?,?,NULL,NULL,'')
+               ON CONFLICT(channel_id) DO UPDATE SET connected_at=excluded.connected_at,
+                 last_error=''""",
+            (channel_id, now),
+        )
+        warning = ""
+        try:
+            self.sync_creator_oauth()
+        except Exception as error:
+            warning = str(error)
+        return {"channel_id": channel_id, "title": item.get("snippet", {}).get("title"), "warning": warning}
+
+    @staticmethod
+    def _analytics_rows(payload: dict[str, Any], dimension: str) -> dict[str, dict[str, float]]:
+        headers = [
+            str(header.get("name") or "")
+            for header in payload.get("columnHeaders", [])
+            if isinstance(header, dict)
+        ]
+        output: dict[str, dict[str, float]] = {}
+        for values in payload.get("rows") or []:
+            if not isinstance(values, list) or len(values) != len(headers):
+                continue
+            row = dict(zip(headers, values))
+            key = str(row.pop(dimension, "summary")) if dimension else "summary"
+            metrics: dict[str, float] = {}
+            for name, raw in row.items():
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                mapped = {
+                    "estimatedMinutesWatched": "watch_time_hours",
+                    "averageViewDuration": "average_view_duration_seconds",
+                    "averageViewPercentage": "average_percentage_viewed",
+                    "subscribersGained": "subscribers_gained",
+                    "subscribersLost": "subscribers_lost",
+                    "engagedViews": "engaged_views",
+                    "uniques": "unique_viewers",
+                }.get(name, name)
+                metrics[mapped] = value / 60 if name == "estimatedMinutesWatched" else value
+            gained = metrics.get("subscribers_gained")
+            lost = metrics.get("subscribers_lost")
+            if gained is not None or lost is not None:
+                metrics["subscribers_net"] = (gained or 0) - (lost or 0)
+            output[key] = metrics
+        return output
+
+    def _fetch_creator_analytics(
+        self, start_date: str, end_date: str, dimension: str = "",
+    ) -> dict[str, dict[str, float]]:
+        options: dict[str, Any] = {}
+        if dimension == "day":
+            options = {"dimensions": "day", "sort": "day"}
+        elif dimension == "video":
+            options = {"dimensions": "video", "sort": "-views", "max_results": 200}
+        core = self.oauth.analytics_report(
+            start_date,
+            end_date,
+            "views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,subscribersGained,subscribersLost",
+            **options,
+        )
+        merged = self._analytics_rows(core, dimension)
+        optional_metrics = ("engagedViews", "likes", "comments", "shares", "uniques")
+        try:
+            optional = self.oauth.analytics_report(
+                start_date, end_date, ",".join(optional_metrics), **options,
+            )
+            optional_results = [self._analytics_rows(optional, dimension)]
+        except OAuthError:
+            optional_results = []
+            for metric in optional_metrics:
+                try:
+                    result = self.oauth.analytics_report(start_date, end_date, metric, **options)
+                except OAuthError:
+                    continue
+                optional_results.append(self._analytics_rows(result, dimension))
+        for result in optional_results:
+            for key, metrics in result.items():
+                merged.setdefault(key, {}).update(metrics)
+        return merged
+
+    def sync_creator_oauth(self) -> dict[str, Any]:
+        connections = self.database.rows(
+            "SELECT channel_id FROM creator_oauth_connections ORDER BY connected_at DESC LIMIT 1"
+        )
+        if not connections or not self.oauth.status()["authorized"]:
+            raise ValueError("尚未連結 YouTube 頻道")
+        channel_id = str(connections[0]["channel_id"])
+        self.database.execute(
+            "UPDATE creator_oauth_connections SET last_error='' WHERE channel_id=?",
+            (channel_id,),
+        )
+        end = datetime.now(PACIFIC).date() - timedelta(days=1)
+        configured_retention = int(self.settings_payload()["creator_retention_days"])
+        history_days = min(365, configured_retention) if configured_retention > 0 else 365
+        start = end - timedelta(days=history_days - 1)
+        try:
+            summary = self._fetch_creator_analytics(start.isoformat(), end.isoformat())
+            daily = self._fetch_creator_analytics(start.isoformat(), end.isoformat(), "day")
+            videos = self._fetch_creator_analytics(start.isoformat(), end.isoformat(), "video")
+        except Exception as error:
+            self.database.execute(
+                "UPDATE creator_oauth_connections SET last_error=? WHERE channel_id=?",
+                (str(error)[:500], channel_id),
+            )
+            raise
+        synced_at = utc_now()
+        last_data_date = max(daily) if daily else None
+        with self.database.lock:
+            connection = self.database.connection
+            connection.execute("DELETE FROM creator_oauth_daily_metrics WHERE channel_id=?", (channel_id,))
+            connection.execute("DELETE FROM creator_oauth_video_metrics WHERE channel_id=?", (channel_id,))
+            connection.execute(
+                """INSERT INTO creator_oauth_summary_metrics
+                   (channel_id,date_start,date_end,metrics_json,synced_at) VALUES (?,?,?,?,?)
+                   ON CONFLICT(channel_id) DO UPDATE SET date_start=excluded.date_start,
+                     date_end=excluded.date_end,metrics_json=excluded.metrics_json,
+                     synced_at=excluded.synced_at""",
+                (channel_id, start.isoformat(), end.isoformat(),
+                 json.dumps(summary.get("summary", {}), ensure_ascii=False), synced_at),
+            )
+            connection.executemany(
+                """INSERT INTO creator_oauth_daily_metrics
+                   (channel_id,event_date,metrics_json,synced_at) VALUES (?,?,?,?)""",
+                [(channel_id, key, json.dumps(value, ensure_ascii=False), synced_at)
+                 for key, value in daily.items()],
+            )
+            connection.executemany(
+                """INSERT INTO creator_oauth_video_metrics
+                   (channel_id,video_id,metrics_json,synced_at) VALUES (?,?,?,?)""",
+                [(channel_id, key, json.dumps(value, ensure_ascii=False), synced_at)
+                 for key, value in videos.items()],
+            )
+            connection.execute(
+                """UPDATE creator_oauth_connections
+                   SET last_sync_at=?,last_data_date=?,last_error='' WHERE channel_id=?""",
+                (synced_at, last_data_date, channel_id),
+            )
+            connection.commit()
+        return {
+            "channel_id": channel_id,
+            "date_start": start.isoformat(),
+            "date_end": end.isoformat(),
+            "daily_rows": len(daily),
+            "video_rows": len(videos),
+            "synced_at": synced_at,
+        }
+
+    def disconnect_creator_oauth(self) -> dict[str, Any]:
+        warning = self.oauth.revoke_and_delete()
+        with self.database.lock:
+            connection = self.database.connection
+            connection.execute("DELETE FROM creator_oauth_summary_metrics")
+            connection.execute("DELETE FROM creator_oauth_daily_metrics")
+            connection.execute("DELETE FROM creator_oauth_video_metrics")
+            connection.execute("DELETE FROM creator_oauth_connections")
+            connection.commit()
+        return {"warning": warning}
+
+    def delete_creator_oauth_client(self) -> None:
+        self.oauth.delete_client()
+
+    def creator_oauth_data(self, channel_id: str | None) -> dict[str, Any]:
+        status = self.creator_oauth_status()
+        if not channel_id or not status["connected"] or status["channel"]["channel_id"] != channel_id:
+            return {"status": status, "summary": None, "daily": [], "videos": []}
+        summary_rows = self.database.rows(
+            "SELECT date_start,date_end,metrics_json,synced_at FROM creator_oauth_summary_metrics WHERE channel_id=?",
+            (channel_id,),
+        )
+        daily_rows = self.database.rows(
+            """SELECT event_date,metrics_json,synced_at FROM creator_oauth_daily_metrics
+               WHERE channel_id=? ORDER BY event_date DESC LIMIT 90""",
+            (channel_id,),
+        )
+        video_rows = self.database.rows(
+            """SELECT o.video_id,o.metrics_json,o.synced_at,v.title,v.thumbnail_url,v.published_at
+                 FROM creator_oauth_video_metrics o
+                 LEFT JOIN videos v ON v.video_id=o.video_id AND v.channel_id=o.channel_id
+                WHERE o.channel_id=? ORDER BY json_extract(o.metrics_json,'$.views') DESC LIMIT 50""",
+            (channel_id,),
+        )
+        summary = None
+        if summary_rows:
+            summary = summary_rows[0]
+            summary["metrics"] = json.loads(summary.pop("metrics_json"))
+        for row in daily_rows + video_rows:
+            row["metrics"] = json.loads(row.pop("metrics_json"))
+        return {"status": status, "summary": summary, "daily": daily_rows, "videos": video_rows}
+
+    def creator_dashboard(self, requested_channel_id: str | None = None) -> dict[str, Any]:
+        workspace_channels = self.workspace_channels()
+        workspace_ids = {row["channel_id"] for row in workspace_channels}
+        channel_id = (requested_channel_id or "").strip() or self.owned_channel_id()
+        if channel_id and channel_id not in workspace_ids:
+            channel_id = None
+        if not channel_id and workspace_channels:
+            channel_id = workspace_channels[0]["channel_id"]
         if not channel_id:
             return {
                 "owned_channel_id": None,
+                "workspace_channels": workspace_channels,
                 "channel": None,
                 "public": None,
+                "oauth": self.creator_oauth_data(None),
                 "imports": [],
                 "imported_overview": {},
                 "overview_sources": {},
@@ -1947,8 +3094,10 @@ class TrackerService:
         except ValueError:
             return {
                 "owned_channel_id": channel_id,
+                "workspace_channels": workspace_channels,
                 "channel": None,
                 "public": None,
+                "oauth": self.creator_oauth_data(None),
                 "imports": [],
                 "imported_overview": {},
                 "overview_sources": {},
@@ -1976,6 +3125,19 @@ class TrackerService:
             candidates = [row for row in analytics_rows if row.get(metric) is not None]
             if not candidates:
                 imported_overview[metric] = None
+                continue
+            total_rows = [row for row in candidates if row.get("row_kind") == "total"]
+            if total_rows:
+                latest_batch = max(int(row["batch_id"]) for row in total_rows)
+                chosen_total = max(
+                    (
+                        row for row in total_rows
+                        if int(row["batch_id"]) == latest_batch
+                    ),
+                    key=lambda row: int(row["id"]),
+                )
+                imported_overview[metric] = float(chosen_total[metric])
+                overview_sources[metric] = latest_batch
                 continue
             groups: dict[tuple[bool, bool, tuple[str, ...]], list[dict[str, Any]]] = defaultdict(list)
             for row in candidates:
@@ -2006,6 +3168,7 @@ class TrackerService:
         )
         return {
             "owned_channel_id": channel_id,
+            "workspace_channels": workspace_channels,
             "channel": detail["channel"],
             "public": {
                 "snapshots": detail["snapshots"],
@@ -2013,11 +3176,199 @@ class TrackerService:
                 "peak_concurrent": detail["peak_concurrent"],
                 "concurrency_sample_count": detail["concurrency_sample_count"],
             },
+            "oauth": self.creator_oauth_data(channel_id),
             "imports": imports,
             "imported_overview": imported_overview,
             "overview_sources": overview_sources,
             "recent_rows": recent_rows,
             "manual_metrics": manual_metrics,
+        }
+
+    def creator_analytics(
+        self,
+        requested_channel_id: str | None = None,
+        *,
+        query: str = "",
+        date_start: str = "",
+        date_end: str = "",
+        report_name: str = "all",
+        row_kind: str = "detail",
+        status: str = "all",
+        content_format: str = "all",
+        content_topic: str = "all",
+        sort: str = "date",
+        direction: str = "desc",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        workspace_ids = set(self.workspace_channel_ids())
+        channel_id = (requested_channel_id or "").strip() or self.owned_channel_id()
+        if not channel_id or channel_id not in workspace_ids:
+            return {
+                "channel_id": None,
+                "rows": [],
+                "result_count": 0,
+                "available_count": 0,
+                "page": 1,
+                "page_size": 50,
+                "page_count": 0,
+                "reports": [],
+                "content_formats": [],
+                "content_topics": [],
+            }
+
+        for label, value in (("開始日期", date_start), ("結束日期", date_end)):
+            if value:
+                try:
+                    datetime.strptime(value, "%Y-%m-%d")
+                except ValueError as error:
+                    raise ValueError(f"{label}必須是 YYYY-MM-DD") from error
+        if date_start and date_end and date_start > date_end:
+            raise ValueError("開始日期不可晚於結束日期")
+
+        allowed_row_kinds = {"all", "detail", "total"}
+        allowed_statuses = {"all", "normal", "conflict"}
+        allowed_sorts = {
+            "date": "display_date",
+            "content": "video_title",
+            "report_name": "report_name",
+            "content_format": "content_format",
+            "content_topic": "content_topic",
+            "views": "views",
+            "engaged_views": "engaged_views",
+            "watch_time_hours": "watch_time_hours",
+            "average_view_duration_seconds": "average_view_duration_seconds",
+            "average_percentage_viewed": "average_percentage_viewed",
+            "impressions": "impressions",
+            "impressions_ctr": "impressions_ctr",
+            "unique_viewers": "unique_viewers",
+            "returning_viewers": "returning_viewers",
+            "likes": "likes",
+            "comments": "comments",
+            "conflict_status": "conflict_status",
+        }
+        if row_kind not in allowed_row_kinds:
+            raise ValueError("不支援這個資料列類型")
+        if status not in allowed_statuses:
+            raise ValueError("不支援這個核對狀態")
+        if sort not in allowed_sorts:
+            raise ValueError("不支援這個排序欄位")
+        if direction not in {"asc", "desc"}:
+            raise ValueError("排序方向必須是 asc 或 desc")
+        if page < 1:
+            raise ValueError("頁碼必須大於 0")
+        if page_size not in {25, 50, 100}:
+            raise ValueError("每頁筆數只支援 25、50 或 100")
+
+        analytics_rows = self.database.rows(
+            """SELECT r.*,
+                      v.video_id AS matched_public_video_id,
+                      v.live_state AS public_live_state,
+                      v.duration_seconds AS public_duration_seconds,
+                      v.content_type AS public_content_type
+                 FROM creator_analytics_rows r
+                 LEFT JOIN videos v ON v.video_id=r.video_id AND v.channel_id=r.channel_id
+                WHERE r.channel_id=? AND r.id=(
+                  SELECT MAX(id) FROM creator_analytics_rows latest
+                   WHERE latest.channel_id=r.channel_id AND latest.natural_key=r.natural_key
+                )
+                ORDER BY r.id DESC""",
+            (channel_id,),
+        )
+
+        enriched_rows: list[dict[str, Any]] = []
+        for row in analytics_rows:
+            row["dimensions"] = json.loads(row.pop("dimensions_json") or "{}")
+            row["display_date"] = row.get("event_date") or row.get("published_at")
+            row["date_source"] = (
+                "資料日期" if row.get("event_date") else
+                "發布日" if row.get("published_at") else
+                "無日期"
+            )
+            matched_public_video_id = row.pop("matched_public_video_id", None)
+            public_live_state = row.pop("public_live_state", None)
+            public_duration_seconds = row.pop("public_duration_seconds", None)
+            public_content_type = row.pop("public_content_type", None)
+            title = str(row.get("video_title") or "")
+
+            if matched_public_video_id:
+                duration = public_duration_seconds if public_duration_seconds is not None else row.get("duration_seconds")
+                row["content_format"] = video_format(
+                    str(public_live_state or ""),
+                    int(duration) if duration is not None else None,
+                    title,
+                )
+                row["content_topic"] = str(public_content_type or classify_content_fields(title))
+                row["classification_source"] = "公開監測規則"
+            else:
+                duration = row.get("duration_seconds")
+                row["content_format"] = "Shorts" if duration is not None and float(duration) <= 60 else "未判斷"
+                inferred_topic = classify_content_fields(title)
+                row["content_topic"] = inferred_topic
+                row["classification_source"] = "匯入標題規則" if inferred_topic != "其他" else "未分類"
+            enriched_rows.append(row)
+
+        reports = sorted({str(row["report_name"]) for row in enriched_rows}, key=str.casefold)
+        content_formats = sorted({str(row["content_format"]) for row in enriched_rows}, key=str.casefold)
+        content_topics = sorted({str(row["content_topic"]) for row in enriched_rows}, key=str.casefold)
+        available_count = len(enriched_rows)
+
+        search_text = query.strip().casefold()
+        filtered_rows: list[dict[str, Any]] = []
+        for row in enriched_rows:
+            display_date = str(row.get("display_date") or "")
+            if search_text and search_text not in " ".join((
+                str(row.get("video_title") or ""),
+                str(row.get("video_id") or ""),
+                str(row.get("report_name") or ""),
+            )).casefold():
+                continue
+            if date_start and (not display_date or display_date < date_start):
+                continue
+            if date_end and (not display_date or display_date > date_end):
+                continue
+            if report_name != "all" and row.get("report_name") != report_name:
+                continue
+            if row_kind != "all" and row.get("row_kind") != row_kind:
+                continue
+            if status == "normal" and int(row.get("conflict_status") or 0) != 0:
+                continue
+            if status == "conflict" and int(row.get("conflict_status") or 0) == 0:
+                continue
+            if content_format != "all" and row.get("content_format") != content_format:
+                continue
+            if content_topic != "all" and row.get("content_topic") != content_topic:
+                continue
+            filtered_rows.append(row)
+
+        sort_key = allowed_sorts[sort]
+
+        def comparable(row: dict[str, Any]) -> Any:
+            value = row.get(sort_key)
+            if sort == "content":
+                value = value or row.get("video_id")
+            return value.casefold() if isinstance(value, str) else value
+
+        present_rows = [row for row in filtered_rows if comparable(row) is not None]
+        missing_rows = [row for row in filtered_rows if comparable(row) is None]
+        present_rows.sort(key=comparable, reverse=direction == "desc")
+        ordered_rows = present_rows + missing_rows
+
+        result_count = len(ordered_rows)
+        page_count = (result_count + page_size - 1) // page_size
+        resolved_page = min(page, page_count) if page_count else 1
+        offset = (resolved_page - 1) * page_size
+        return {
+            "channel_id": channel_id,
+            "rows": ordered_rows[offset:offset + page_size],
+            "result_count": result_count,
+            "available_count": available_count,
+            "page": resolved_page,
+            "page_size": page_size,
+            "page_count": page_count,
+            "reports": reports,
+            "content_formats": content_formats,
+            "content_topics": content_topics,
         }
 
     def delete_creator_import(self, batch_id: int) -> dict[str, Any]:
@@ -2581,6 +3932,18 @@ class TrackerService:
         cohort_metrics = [channel_metrics(channel) for channel in cohort]
         reference_metrics = channel_metrics(reference) if reference else None
         ranking_pool = [*cohort_metrics, *([reference_metrics] if reference_metrics else [])]
+        selected_series_ids = list(dict.fromkeys([
+            *([reference["channel_id"]] if reference else []), *comparison_ids,
+        ]))[:5]
+        metrics_lookup = {row["channel_id"]: row for row in ranking_pool}
+        for channel_id in selected_series_ids:
+            if channel_id not in metrics_lookup and channel_id in channel_lookup:
+                metrics_lookup[channel_id] = channel_metrics(channel_lookup[channel_id])
+        comparison_channels = [
+            metrics_lookup[channel_id]
+            for channel_id in selected_series_ids
+            if channel_id in metrics_lookup
+        ]
 
         def ranked(metric: str, limit: int = 50, reverse: bool = True) -> list[dict[str, Any]]:
             return sorted(
@@ -2643,11 +4006,8 @@ class TrackerService:
             })
         organizations.sort(key=lambda row: row["median_views_total"], reverse=True)
 
-        selected_series_ids = list(dict.fromkeys([
-            *([reference["channel_id"]] if reference else []), *comparison_ids,
-        ]))[:5]
         series_rows: list[dict[str, Any]] = []
-        peer_daily: dict[str, list[int]] = defaultdict(list)
+        peer_daily: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
         if selected_series_ids:
             for channel_id in selected_series_ids:
                 daily: dict[str, dict[str, Any]] = {}
@@ -2658,7 +4018,12 @@ class TrackerService:
                     "channel_id": channel_id,
                     "title": channel_lookup.get(channel_id, {}).get("title", channel_id),
                     "points": [
-                        {"date": date, "subscriber_count": row["subscriber_count"], "view_count": row["view_count"]}
+                        {
+                            "date": date,
+                            "subscriber_count": row["subscriber_count"],
+                            "view_count": row["view_count"],
+                            "video_count": row["video_count"],
+                        }
                         for date, row in sorted(daily.items())
                     ],
                 })
@@ -2668,10 +4033,16 @@ class TrackerService:
                 if row["captured_at"] >= series_cutoff:
                     daily[row["captured_at"][:10]] = row
             for date, row in daily.items():
-                if row["subscriber_count"] is not None:
-                    peer_daily[date].append(int(row["subscriber_count"]))
+                for field in ("subscriber_count", "view_count", "video_count"):
+                    if row[field] is not None:
+                        peer_daily[date][field].append(int(row[field]))
         peer_series = [
-            {"date": date, "subscriber_count": percentile(values, .5)}
+            {
+                "date": date,
+                "subscriber_count": percentile(values["subscriber_count"], .5),
+                "view_count": percentile(values["view_count"], .5),
+                "video_count": percentile(values["video_count"], .5),
+            }
             for date, values in sorted(peer_daily.items())
         ]
 
@@ -2693,6 +4064,7 @@ class TrackerService:
                 "format_type": format_type, "include_graduated": include_graduated,
             },
             "reference": reference_metrics,
+            "comparison_channels": comparison_channels,
             "overview": {
                 "peer_channels": len(cohort_metrics),
                 "active_channels": sum(1 for row in cohort_metrics if row["recent_items"] > 0),
@@ -2720,6 +4092,35 @@ class TrackerService:
             },
             "private_metrics": private_metrics,
         }
+
+    def refresh_manual_queue(self, limit: int = 50) -> dict[str, int]:
+        queued = self.database.manual_refresh_queue(limit)
+        ids = [row["channel_id"] for row in queued]
+        if not ids:
+            return {"requested": 0, "updated": 0, "failed": 0, "remaining": 0}
+        try:
+            payload = self.youtube.get("channels", {
+                "part": "snippet,statistics,contentDetails,brandingSettings",
+                "id": ",".join(ids),
+                "maxResults": len(ids),
+            })
+            returned: list[str] = []
+            for item in payload.get("items", []):
+                self.database.upsert_channel(item)
+                returned.append(item["id"])
+            missing = [channel_id for channel_id in ids if channel_id not in returned]
+            self.database.complete_manual_refresh(returned)
+            self.database.fail_manual_refresh(missing, "YouTube 未回傳此頻道")
+            self.evaluate_activity_statuses(returned)
+            return {
+                "requested": len(ids),
+                "updated": len(returned),
+                "failed": len(missing),
+                "remaining": int(self.database.scalar("SELECT COUNT(*) FROM manual_refresh_queue") or 0),
+            }
+        except Exception as error:
+            self.database.fail_manual_refresh(ids, str(error))
+            raise
 
     def refresh_channels(self) -> None:
         ids = [row["channel_id"] for row in self.database.rows(
@@ -2751,6 +4152,65 @@ class TrackerService:
             })
             for item in payload.get("items", []):
                 self.database.upsert_video(item)
+
+    def scan_hourly_live_candidates(self) -> dict[str, int | bool]:
+        owned_channel_id = self.owned_channel_id()
+        channels = self.database.rows(
+            """SELECT channel_id,uploads_playlist_id FROM channels
+               WHERE discovery_status IN ('eligible','owned') AND uploads_playlist_id IS NOT NULL
+               ORDER BY CASE WHEN channel_id=? THEN 0 ELSE 1 END,channel_id""",
+            (owned_channel_id,),
+        )
+        if not channels:
+            return {"channels": 0, "candidates": 0, "refreshed": 0, "quota_limited": False}
+
+        usage = self.youtube.usage("general")
+        safe_limit = self.youtube.safe_limit("general")
+        estimated_detail_calls = max(1, (len(channels) * 5 + 49) // 50)
+        scan_all = (
+            usage + len(channels) + estimated_detail_calls
+            <= max(0, safe_limit - HOURLY_LIVE_SCAN_QUOTA_RESERVE)
+        )
+        selected = channels if scan_all else [
+            channel for channel in channels if channel["channel_id"] == owned_channel_id
+        ]
+        if not selected or safe_limit - usage < 2:
+            return {"channels": 0, "candidates": 0, "refreshed": 0, "quota_limited": True}
+
+        candidate_ids: list[str] = []
+        for channel in selected:
+            payload = self.youtube.get("playlistItems", {
+                "part": "contentDetails,snippet",
+                "playlistId": channel["uploads_playlist_id"],
+                "maxResults": 5,
+            })
+            candidate_ids.extend(
+                item.get("contentDetails", {}).get("videoId")
+                for item in payload.get("items", [])
+                if item.get("contentDetails", {}).get("videoId")
+            )
+
+        unique_ids = list(dict.fromkeys(candidate_ids))
+        existing_states: dict[str, str] = {}
+        for group in chunks(unique_ids):
+            placeholders = ",".join("?" for _ in group)
+            for row in self.database.rows(
+                f"SELECT video_id,live_state FROM videos WHERE video_id IN ({placeholders})",
+                tuple(group),
+            ):
+                existing_states[row["video_id"]] = row["live_state"]
+        refresh_ids = [
+            video_id for video_id in unique_ids
+            if video_id not in existing_states or existing_states[video_id] in {"live", "upcoming"}
+        ]
+        if refresh_ids:
+            self.refresh_videos(refresh_ids)
+        return {
+            "channels": len(selected),
+            "candidates": len(unique_ids),
+            "refreshed": len(refresh_ids),
+            "quota_limited": not scan_all,
+        }
 
     def scan_due_uploads(self, limit: int = 10) -> None:
         upload_scan_hours = self.settings_payload()["upload_scan_hours"]
@@ -2792,11 +4252,34 @@ class TrackerService:
             self.refresh_videos(ids)
 
     def cleanup(self) -> None:
-        retention_days = self.settings_payload()["retention_days"]
-        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat(timespec="seconds")
-        self.database.execute("DELETE FROM concurrency_samples WHERE captured_at < ?", (cutoff,))
-        self.database.execute("DELETE FROM channel_snapshots WHERE captured_at < ?", (cutoff,))
-        self.database.execute("DELETE FROM video_snapshots WHERE captured_at < ?", (cutoff,))
+        settings = self.settings_payload()
+        retention_days = settings["retention_days"]
+        if retention_days > 0:
+            cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat(timespec="seconds")
+            self.database.execute("DELETE FROM concurrency_samples WHERE captured_at < ?", (cutoff,))
+            self.database.execute("DELETE FROM channel_snapshots WHERE captured_at < ?", (cutoff,))
+            self.database.execute("DELETE FROM video_snapshots WHERE captured_at < ?", (cutoff,))
+        creator_retention_days = settings["creator_retention_days"]
+        if creator_retention_days > 0:
+            creator_cutoff = (datetime.now(UTC) - timedelta(days=creator_retention_days)).date().isoformat()
+            self.database.execute(
+                "DELETE FROM creator_analytics_rows WHERE COALESCE(event_date, substr(created_at,1,10)) < ?",
+                (creator_cutoff,),
+            )
+            self.database.execute(
+                "DELETE FROM creator_manual_metrics WHERE metric_date < ?",
+                (creator_cutoff,),
+            )
+            self.database.execute(
+                "DELETE FROM creator_oauth_daily_metrics WHERE event_date < ?",
+                (creator_cutoff,),
+            )
+            self.database.execute(
+                """DELETE FROM creator_import_batches
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM creator_analytics_rows r WHERE r.batch_id=creator_import_batches.id
+                   )"""
+            )
 
     def _scheduled(self, name: str, callback: Callable[[], None]) -> None:
         if not self.run_lock.acquire(blocking=False):
@@ -2820,12 +4303,32 @@ class TrackerService:
                 if now - self.last_live_poll >= settings["live_poll_seconds"]:
                     self._scheduled("live-poll", self.poll_live)
                     self.last_live_poll = now
+                live_scan_slot = hourly_live_scan_slot()
+                if live_scan_slot and live_scan_slot != self.last_hourly_live_scan_slot:
+                    self.last_hourly_live_scan_slot = live_scan_slot
+                    self._scheduled("hourly-live-scan", self.scan_hourly_live_candidates)
                 if now - self.last_upload_dispatch >= 60:
                     self._scheduled("upload-scan", lambda: self.scan_due_uploads(limit=10))
                     self.last_upload_dispatch = now
                 if now - self.last_channel_refresh >= settings["channel_refresh_hours"] * 3600:
                     self._scheduled("channel-refresh", self.refresh_channels)
                     self.last_channel_refresh = now
+                queued = int(self.database.scalar("SELECT COUNT(*) FROM manual_refresh_queue") or 0)
+                if queued >= 50 and now - self.last_manual_queue_dispatch >= 60:
+                    self._scheduled("manual-channel-refresh", self.refresh_manual_queue)
+                    self.last_manual_queue_dispatch = now
+            if now - self.last_oauth_sync_check >= 300:
+                self.last_oauth_sync_check = now
+                try:
+                    needs_oauth_sync = bool(self.database.scalar(
+                        """SELECT 1 FROM creator_oauth_connections
+                           WHERE last_sync_at IS NULL
+                              OR datetime(last_sync_at)<=datetime('now','-24 hours') LIMIT 1"""
+                    ))
+                    if needs_oauth_sync and self.oauth.status()["authorized"]:
+                        self._scheduled("oauth-analytics-sync", self.sync_creator_oauth)
+                except Exception as error:
+                    self._record_error(error)
             if now - self.last_cleanup >= 86400:
                 self.cleanup()
                 self.last_cleanup = now
@@ -2854,6 +4357,10 @@ class TrackerService:
         )
         with self.state_lock:
             job = self.current_job
+            job_started_at = self.current_job_started_at
+            last_job = self.last_job
+            last_job_finished_at = self.last_job_finished_at
+            last_job_status = self.last_job_status
             error = self.last_error
             progress = dict(self.discovery_progress)
         search_usage = self.youtube.usage("search")
@@ -2867,10 +4374,20 @@ class TrackerService:
         ) if owned_channel_id else []
         if owned_rows:
             owned_rows[0]["manual_tags"] = parse_json_list(owned_rows[0].get("manual_tags"))
+        manual_queue_count = int(self.database.scalar(
+            "SELECT COUNT(*) FROM manual_refresh_queue"
+        ) or 0)
+        manual_queue_failed = int(self.database.scalar(
+            "SELECT COUNT(*) FROM manual_refresh_queue WHERE attempts>0"
+        ) or 0)
         return {
             "api_key_configured": bool(self.config.api_key),
             "collector_running": self.running,
             "current_job": job,
+            "current_job_started_at": job_started_at,
+            "last_job": last_job,
+            "last_job_finished_at": last_job_finished_at,
+            "last_job_status": last_job_status,
             "last_error": error,
             "eligible_channels": int(self.database.scalar(
                 "SELECT COUNT(*) FROM channels WHERE discovery_status='eligible'"
@@ -2898,6 +4415,9 @@ class TrackerService:
             "quota_reset_at": self.youtube.reset_at(),
             "owned_channel_id": owned_channel_id,
             "owned_channel": owned_rows[0] if owned_rows else None,
+            "manual_refresh_queue_count": manual_queue_count,
+            "manual_refresh_queue_threshold": 50,
+            "manual_refresh_queue_failed": manual_queue_failed,
             "discovery_progress": progress,
             "retention_days": settings["retention_days"],
             "settings": settings,
@@ -2926,6 +4446,7 @@ class TrackerService:
 
 class RequestHandler(BaseHTTPRequestHandler):
     service: TrackerService
+    trusted_origins = {"http://127.0.0.1:3000", "http://localhost:3000"}
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -2933,7 +4454,12 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _headers(self, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self.headers.get("Origin")
+        if origin in self.trusted_origins:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            if self.headers.get("Access-Control-Request-Private-Network") == "true":
+                self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Cache-Control", "no-store")
@@ -2954,16 +4480,134 @@ class RequestHandler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return {}
 
+    def _origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        return origin is None or origin in self.trusted_origins
+
+    def _reject_untrusted_origin(self) -> bool:
+        if self._origin_allowed():
+            return False
+        self._json({"error": "不允許其他網站存取台V Pulse 本機 API"}, 403)
+        return True
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _html(self, content: str, status: int = 200) -> None:
+        encoded = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    @staticmethod
+    def _oauth_help_html(raw_error: str) -> str:
+        guidance = oauth_error_guidance(raw_error)
+        steps = "".join(f"<li>{html.escape(step)}</li>" for step in guidance["steps"])
+        link = (
+            f"<p><a href='{html.escape(guidance['help_url'])}' target='_blank' rel='noreferrer'>"
+            f"{html.escape(guidance['help_label'])} ↗</a></p>"
+            if guidance.get("help_url") and guidance.get("help_label") else ""
+        )
+        return (
+            f"<h2>{html.escape(guidance['title'])}</h2>"
+            f"<p>{html.escape(guidance['message'])}</p><ol>{steps}</ol>{link}"
+            f"<details><summary>技術細節</summary><pre style='white-space:pre-wrap'>"
+            f"{html.escape(raw_error)}</pre></details>"
+        )
+
     def do_OPTIONS(self) -> None:
+        if self._reject_untrusted_origin():
+            return
         self._headers(204)
 
     def do_GET(self) -> None:
+        if self._reject_untrusted_origin():
+            return
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
-        if route == "/api/summary":
+        if route == "/api/creator/oauth/start":
+            try:
+                self._redirect(self.service.creator_oauth_authorization_url())
+            except (ValueError, OAuthError) as error:
+                self._json({"error": str(error)}, 400)
+        elif route == "/api/creator/oauth/callback":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                if query.get("error"):
+                    error_code = query.get("error", [""])[0]
+                    description = query.get("error_description", [""])[0]
+                    raise ValueError(f"{error_code}: {description}".strip(": "))
+                result = self.service.complete_creator_oauth(
+                    query.get("code", [""])[0], query.get("state", [""])[0]
+                )
+                warning = str(result.get("warning") or "")
+                detail = (
+                    "<p>已完成第一次 Analytics 同步。</p>" if not warning else
+                    "<p>頻道已連結，但第一次同步尚未完成。</p>" + self._oauth_help_html(warning)
+                )
+                self._html(
+                    "<!doctype html><meta charset='utf-8'><title>台V Pulse 已連結</title>"
+                    "<body style='font-family:system-ui;padding:32px;max-width:680px;margin:auto'>"
+                    "<h1>頻道已安全連結</h1>"
+                    f"{detail}<p>你可以關閉此分頁並回到台V Pulse。</p>"
+                    "<script>if(window.opener){window.opener.postMessage('tai-v-pulse-oauth-complete','http://127.0.0.1:3000')}</script>"
+                    "</body>"
+                )
+            except (ValueError, OAuthError) as error:
+                error_text = str(error)
+                self._html(
+                    "<!doctype html><meta charset='utf-8'><title>台V Pulse 連結失敗</title>"
+                    "<body style='font-family:system-ui;padding:32px;max-width:680px;margin:auto'>"
+                    f"<h1>連結未完成</h1>{self._oauth_help_html(error_text)}"
+                    "<p>請關閉此分頁，回到台V Pulse 後重新嘗試。</p></body>",
+                    400,
+                )
+        elif route == "/api/summary":
             self._json(self.service.summary())
+        elif route == "/api/candidates":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                raw_batch_id = query.get("batch_id", [""])[0]
+                batch_id = int(raw_batch_id) if raw_batch_id else None
+                self._json(self.service.candidate_review(
+                    query=query.get("query", [""])[0],
+                    batch_id=batch_id,
+                    validation_status=query.get("validation_status", ["all"])[0],
+                    handling_status=query.get("handling_status", ["all"])[0],
+                    sort=query.get("sort", ["discovered_at"])[0],
+                    direction=query.get("direction", ["desc"])[0],
+                ))
+            except (TypeError, ValueError) as error:
+                self._json({"error": str(error)}, 400)
         elif route == "/api/creator":
-            self._json(self.service.creator_dashboard())
+            query = urllib.parse.parse_qs(parsed.query)
+            self._json(self.service.creator_dashboard(query.get("channel_id", [None])[0]))
+        elif route == "/api/creator/analytics":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                self._json(self.service.creator_analytics(
+                    query.get("channel_id", [None])[0],
+                    query=query.get("query", [""])[0],
+                    date_start=query.get("date_start", [""])[0],
+                    date_end=query.get("date_end", [""])[0],
+                    report_name=query.get("report_name", ["all"])[0],
+                    row_kind=query.get("row_kind", ["detail"])[0],
+                    status=query.get("status", ["all"])[0],
+                    content_format=query.get("content_format", ["all"])[0],
+                    content_topic=query.get("content_topic", ["all"])[0],
+                    sort=query.get("sort", ["date"])[0],
+                    direction=query.get("direction", ["desc"])[0],
+                    page=int(query.get("page", ["1"])[0]),
+                    page_size=int(query.get("page_size", ["50"])[0]),
+                ))
+            except (TypeError, ValueError) as error:
+                self._json({"error": str(error)}, 400)
         elif route == "/api/insights":
             query = urllib.parse.parse_qs(parsed.query)
             try:
@@ -3009,6 +4653,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json({"error": "Not found"}, 404)
 
     def do_PATCH(self) -> None:
+        if self._reject_untrusted_origin():
+            return
         route = urllib.parse.urlparse(self.path).path
         body = self._body_json()
         try:
@@ -3018,7 +4664,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if route == "/api/creator":
                 channel = self.service.set_owned_channel(str(body.get("channel_id", "")).strip())
-                self._json({"message": f"已將 {channel['title']} 設為我的頻道", "channel": channel})
+                self._json({"message": f"已將 {channel['title']} 加入工作區並切換查看", "channel": channel})
+                return
+            candidate_prefix = "/api/candidates/"
+            if route.startswith(candidate_prefix):
+                candidate_id = int(route[len(candidate_prefix):])
+                result = self.service.review_candidate(
+                    candidate_id,
+                    str(body.get("action", "")).strip(),
+                )
+                self._json(result)
                 return
             prefix = "/api/channels/"
             if route.startswith(prefix):
@@ -3031,13 +4686,47 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json({"error": str(error)}, 400)
 
     def do_POST(self) -> None:
+        if self._reject_untrusted_origin():
+            return
         route = urllib.parse.urlparse(self.path).path
-        if route == "/api/discover":
+        if route == "/api/creator/oauth/client":
+            try:
+                self._json({
+                    "message": "OAuth 桌面應用程式設定已加密保存",
+                    "oauth": self.service.configure_creator_oauth(self._body_json()),
+                }, 201)
+            except (ValueError, OAuthError) as error:
+                self._json({"error": str(error)}, 400)
+        elif route == "/api/creator/oauth/sync":
+            try:
+                if not self.service.creator_oauth_status()["connected"]:
+                    raise ValueError("尚未連結 YouTube 頻道")
+                ok, message = self.service.launch_job(
+                    "oauth-analytics-sync", self.service.sync_creator_oauth
+                )
+                self._json({"message": message} if ok else {"error": message}, 202 if ok else 409)
+            except (ValueError, OAuthError) as error:
+                self._json({"error": str(error)}, 400)
+        elif route == "/api/discover":
             ok, message = self.service.launch_job("discover", self.service.discover_channels)
             self._json({"message": message} if ok else {"error": message}, 202 if ok else 409)
         elif route == "/api/scan":
             ok, message = self.service.launch_job("upload-scan", lambda: self.service.scan_due_uploads(50))
             self._json({"message": message} if ok else {"error": message}, 202 if ok else 409)
+        elif route == "/api/manual-refresh":
+            queued = int(self.service.database.scalar(
+                "SELECT COUNT(*) FROM manual_refresh_queue"
+            ) or 0)
+            if not queued:
+                self._json({"message": "目前沒有待更新的手動頻道", "queue_count": 0})
+            else:
+                ok, message = self.service.launch_job(
+                    "manual-channel-refresh", self.service.refresh_manual_queue
+                )
+                self._json(
+                    {"message": message, "queue_count": queued} if ok else {"error": message},
+                    202 if ok else 409,
+                )
         elif route == "/api/channel-search":
             body = self._body_json()
             try:
@@ -3081,7 +4770,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 with self.service.run_lock:
                     channel = self.service.add_owned_channel(channel_id)
                 self._json({
-                    "message": f"已加入並將 {channel['title']} 設為我的頻道",
+                    "message": f"已收錄 {channel['title']} 並加入工作區",
                     "channel": channel,
                 }, 201)
             except ValueError as error:
@@ -3107,7 +4796,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json({"error": "Not found"}, 404)
 
     def do_DELETE(self) -> None:
+        if self._reject_untrusted_origin():
+            return
         route = urllib.parse.urlparse(self.path).path
+        if route == "/api/creator/oauth":
+            try:
+                result = self.service.disconnect_creator_oauth()
+                self._json({
+                    "message": "已撤銷連線並刪除本機 OAuth 授權與同步資料",
+                    **result,
+                })
+            except (ValueError, OAuthError) as error:
+                self._json({"error": str(error)}, 400)
+            return
+        if route == "/api/creator/oauth/client":
+            try:
+                self.service.delete_creator_oauth_client()
+                self._json({"message": "已刪除本機 OAuth 用戶端設定"})
+            except (ValueError, OAuthError) as error:
+                self._json({"error": str(error)}, 400)
+            return
+        workspace_prefix = "/api/creator/channels/"
+        if route.startswith(workspace_prefix):
+            try:
+                channel_id = urllib.parse.unquote(route[len(workspace_prefix):]).strip()
+                channel = self.service.remove_workspace_channel(channel_id)
+                self._json({
+                    "message": f"已將 {channel['title']} 移出工作區；公開監測與私人資料均保留",
+                    "channel": channel,
+                })
+            except ValueError as error:
+                self._json({"error": str(error)}, 404)
+            return
         import_prefix = "/api/creator/imports/"
         if route.startswith(import_prefix):
             try:

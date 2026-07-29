@@ -1,0 +1,3 @@
+# PowerShell startup parser fixture: the last duplicate value must win.
+YOUTUBE_API_KEY=
+export YOUTUBE_API_KEY = "test-value"

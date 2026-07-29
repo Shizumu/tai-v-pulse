@@ -19,7 +19,7 @@ const NAV_ITEMS: { key: PageKey; href: string; label: string }[] = [
   { key: "monitor", href: "/", label: "監測首頁" },
   { key: "insights", href: "/insights", label: "內容環境" },
   { key: "trends", href: "/trends", label: "趨勢圖表" },
-  { key: "creator", href: "/creator", label: "我的頻道" },
+  { key: "creator", href: "/creator", label: "頻道工作區" },
 ];
 
 const THEMES = [
