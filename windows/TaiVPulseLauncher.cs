@@ -364,6 +364,7 @@ namespace TaiVPulse.Windows
             {
                 case "discover": return "探索台 V 頻道";
                 case "live-poll": return "更新直播同接資料";
+                case "hourly-live-scan": return "執行整點開台偵測";
                 case "upload-scan": return "掃描最新上傳";
                 case "channel-refresh": return "更新頻道公開數據";
                 case "manual-channel-refresh": return "更新手動新增頻道";
@@ -458,8 +459,17 @@ namespace TaiVPulse.Windows
                     process.Start();
                     process.BeginOutputReadLine();
                     process.BeginErrorReadLine();
-                    await Task.Run(delegate { process.WaitForExit(); });
-                    process.WaitForExit();
+                    await Task.Run(delegate
+                    {
+                        while (!process.WaitForExit(250)) { }
+                    });
+                    // Do not call the parameterless WaitForExit here. Long-running
+                    // Node/Python descendants can retain the redirected pipe handles,
+                    // which would leave the launcher busy until those services stop.
+                    await Task.Delay(150);
+                    try { process.CancelOutputRead(); } catch (InvalidOperationException) { }
+                    try { process.CancelErrorRead(); } catch (InvalidOperationException) { }
+                    lock (gate) { writer.Flush(); }
                     result.ExitCode = process.ExitCode;
                 }
                 catch (Exception ex)

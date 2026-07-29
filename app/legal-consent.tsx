@@ -27,7 +27,7 @@ export default function LegalConsent() {
         <h2 id="legal-consent-title">使用前請確認資料與授權聲明</h2>
         <p>台V Pulse 是在你的電腦執行的非官方工具。每位使用者必須使用自己的 API Key，並自行保護本機資料。</p>
         <ul>
-          <li>YouTube 公開 API 快照最多保留 30 天；長期保存選項只適用於你自行匯入或手動補充的私人資料。</li>
+          <li>YouTube 公開 API 快照最多保留 30 天；較長保存選項只適用於你經 OAuth 授權同步、自行匯入或手動補充的私人資料。</li>
           <li>系統顯示的休止或疑似畢業狀態只是規則初判，必須人工查證。</li>
           <li>程式採非商用授權；修改、分享或宣傳時必須一併保留授權條款及版權聲明。</li>
         </ul>

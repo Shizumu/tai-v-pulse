@@ -88,14 +88,62 @@ type AnalyticsRow = {
   batch_id: number;
   report_name: string;
   event_date: string | null;
+  published_at: string | null;
+  duration_seconds: number | null;
+  row_kind: string;
   video_id: string | null;
   video_title: string | null;
   views: number | null;
+  engaged_views: number | null;
   watch_time_hours: number | null;
+  average_view_duration_seconds: number | null;
+  average_percentage_viewed: number | null;
   impressions: number | null;
   impressions_ctr: number | null;
+  likes: number | null;
+  comments: number | null;
+  unique_viewers: number | null;
+  returning_viewers: number | null;
   conflict_status: number;
+  display_date: string | null;
+  date_source: string;
+  content_format: string;
+  content_topic: string;
+  classification_source: string;
 };
+
+type AnalyticsPayload = {
+  channel_id: string | null;
+  rows: AnalyticsRow[];
+  result_count: number;
+  available_count: number;
+  page: number;
+  page_size: number;
+  page_count: number;
+  reports: string[];
+  content_formats: string[];
+  content_topics: string[];
+  error?: string;
+};
+
+type AnalyticsSort =
+  | "date"
+  | "content"
+  | "report_name"
+  | "content_format"
+  | "content_topic"
+  | "views"
+  | "engaged_views"
+  | "watch_time_hours"
+  | "average_view_duration_seconds"
+  | "average_percentage_viewed"
+  | "impressions"
+  | "impressions_ctr"
+  | "unique_viewers"
+  | "returning_viewers"
+  | "likes"
+  | "comments"
+  | "conflict_status";
 
 type ManualMetric = {
   id: number;
@@ -104,6 +152,40 @@ type ManualMetric = {
   metric_name: string;
   metric_value: number;
   note: string;
+};
+
+type OAuthMetrics = Partial<Record<
+  "views" | "engaged_views" | "watch_time_hours" | "average_view_duration_seconds" |
+  "average_percentage_viewed" | "subscribers_net" | "subscribers_gained" |
+  "subscribers_lost" | "likes" | "comments" | "shares" | "unique_viewers",
+  number
+>>;
+
+type OAuthData = {
+  status: {
+    configured: boolean;
+    authorized: boolean;
+    connected: boolean;
+    channel: { channel_id: string; title: string; thumbnail_url: string | null } | null;
+    connected_at: string | null;
+    last_sync_at: string | null;
+    last_data_date: string | null;
+    last_error: string;
+    last_error_help: {
+      code: string;
+      title: string;
+      message: string;
+      steps: string[];
+      help_url: string | null;
+      help_label: string | null;
+    } | null;
+    syncing: boolean;
+    sync_started_at: string | null;
+    storage: string;
+  };
+  summary: { date_start: string; date_end: string; synced_at: string; metrics: OAuthMetrics } | null;
+  daily: { event_date: string; synced_at: string; metrics: OAuthMetrics }[];
+  videos: { video_id: string; title: string | null; thumbnail_url: string | null; published_at: string | null; synced_at: string; metrics: OAuthMetrics }[];
 };
 
 type CreatorData = {
@@ -116,6 +198,7 @@ type CreatorData = {
     snapshots: PublicSnapshot[];
     videos: PublicVideo[];
   };
+  oauth: OAuthData;
   imports: ImportBatch[];
   imported_overview: Record<string, number | null>;
   overview_sources: Record<string, number>;
@@ -128,6 +211,9 @@ type Preview = {
   report_count: number;
   row_count: number;
   recognized_metrics: string[];
+  recognized_dimensions: string[];
+  recognized_column_count: number;
+  ignored_headers: string[];
   date_start: string | null;
   date_end: string | null;
   reports: { report_name: string; row_count: number; recognized_metrics: string[] }[];
@@ -143,6 +229,7 @@ type PendingUpload = {
 
 const METRIC_LABELS: Record<string, string> = {
   views: "觀看次數",
+  engaged_views: "互動觀看次數",
   watch_time_hours: "觀看時間（小時）",
   average_view_duration_seconds: "平均觀看時間（秒）",
   average_percentage_viewed: "平均觀看百分比",
@@ -158,6 +245,49 @@ const METRIC_LABELS: Record<string, string> = {
   returning_viewers: "回訪觀眾",
   estimated_revenue: "預估收益",
 };
+
+const ANALYTICS_SORT_OPTIONS: { value: AnalyticsSort; label: string }[] = [
+  { value: "date", label: "資料日期／發布日" },
+  { value: "content", label: "內容標題" },
+  { value: "content_topic", label: "內容主題" },
+  { value: "content_format", label: "內容格式" },
+  { value: "report_name", label: "來源報表" },
+  { value: "views", label: "觀看" },
+  { value: "engaged_views", label: "互動觀看" },
+  { value: "watch_time_hours", label: "觀看時數" },
+  { value: "average_view_duration_seconds", label: "平均觀看" },
+  { value: "average_percentage_viewed", label: "觀看比例" },
+  { value: "impressions", label: "曝光" },
+  { value: "impressions_ctr", label: "點閱率" },
+  { value: "unique_viewers", label: "不重複觀眾" },
+  { value: "returning_viewers", label: "回訪觀眾" },
+  { value: "likes", label: "喜歡" },
+  { value: "comments", label: "留言" },
+  { value: "conflict_status", label: "核對狀態" },
+];
+
+function SortHeader({
+  field,
+  label,
+  sort,
+  direction,
+  onSort,
+}: {
+  field: AnalyticsSort;
+  label: string;
+  sort: AnalyticsSort;
+  direction: "asc" | "desc";
+  onSort: (field: AnalyticsSort) => void;
+}) {
+  const active = sort === field;
+  return (
+    <th aria-sort={active ? (direction === "asc" ? "ascending" : "descending") : "none"}>
+      <button className="analytics-sort-button" type="button" onClick={() => onSort(field)}>
+        {label}<span aria-hidden="true">{active ? (direction === "asc" ? "↑" : "↓") : "↕"}</span>
+      </button>
+    </th>
+  );
+}
 
 function compact(value: number | null | undefined, digits = 1) {
   if (value === null || value === undefined) return "—";
@@ -215,6 +345,25 @@ export default function CreatorDashboard() {
   const [classificationOrganization, setClassificationOrganization] = useState("");
   const [classificationTags, setClassificationTags] = useState("");
   const [classificationActivity, setClassificationActivity] = useState("自動判斷");
+  const [analytics, setAnalytics] = useState<AnalyticsPayload | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [analyticsError, setAnalyticsError] = useState<string | null>(null);
+  const [analyticsRevision, setAnalyticsRevision] = useState(0);
+  const [analyticsQueryDraft, setAnalyticsQueryDraft] = useState("");
+  const [analyticsQuery, setAnalyticsQuery] = useState("");
+  const [analyticsDateStart, setAnalyticsDateStart] = useState("");
+  const [analyticsDateEnd, setAnalyticsDateEnd] = useState("");
+  const [analyticsReport, setAnalyticsReport] = useState("all");
+  const [analyticsRowKind, setAnalyticsRowKind] = useState("detail");
+  const [analyticsStatus, setAnalyticsStatus] = useState("all");
+  const [analyticsFormat, setAnalyticsFormat] = useState("all");
+  const [analyticsTopic, setAnalyticsTopic] = useState("all");
+  const [analyticsSort, setAnalyticsSort] = useState<AnalyticsSort>("date");
+  const [analyticsDirection, setAnalyticsDirection] = useState<"asc" | "desc">("desc");
+  const [analyticsPage, setAnalyticsPage] = useState(1);
+  const [analyticsPageSize, setAnalyticsPageSize] = useState(50);
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthSyncing, setOauthSyncing] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -230,6 +379,7 @@ export default function CreatorDashboard() {
       setSummary(summaryPayload);
       setCreator(creatorPayload);
       setConnected(true);
+      setAnalyticsRevision((current) => current + 1);
     } catch (error) {
       setConnected(false);
       setMessage(error instanceof Error ? error.message : "無法載入頻道工作區");
@@ -243,6 +393,129 @@ export default function CreatorDashboard() {
     const timer = window.setInterval(() => void refresh(), 30000);
     return () => { window.clearTimeout(initial); window.clearInterval(timer); };
   }, [refresh]);
+
+  useEffect(() => {
+    if (!oauthSyncing) return;
+    let stopped = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/api/creator`, { cache: "no-store" });
+        if (!response.ok) throw new Error("本機資料服務沒有回應");
+        const payload = await response.json() as CreatorData;
+        if (stopped) return;
+        setCreator(payload);
+        if (payload.oauth.status.syncing) {
+          timer = window.setTimeout(() => void poll(), 2000);
+          return;
+        }
+        setOauthSyncing(false);
+        setAnalyticsRevision((current) => current + 1);
+        if (payload.oauth.status.last_error_help) {
+          setMessage(`${payload.oauth.status.last_error_help.title}：${payload.oauth.status.last_error_help.message}`);
+        } else if (payload.oauth.status.last_sync_at) {
+          setMessage(`YouTube Analytics 同步完成，資料更新至 ${payload.oauth.status.last_data_date ?? "目前可取得日期"}。`);
+        } else {
+          setMessage("同步工作已結束，但 Google 尚未回傳可用資料；請查看下方疑難排解。");
+        }
+      } catch (error) {
+        if (stopped) return;
+        setMessage(error instanceof Error ? error.message : "無法確認同步狀態");
+        timer = window.setTimeout(() => void poll(), 3000);
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 500);
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [oauthSyncing]);
+
+  useEffect(() => {
+    const receiveOAuthCompletion = (event: MessageEvent) => {
+      if (event.origin === API_BASE && event.data === "tai-v-pulse-oauth-complete") {
+        void refresh();
+      }
+    };
+    window.addEventListener("message", receiveOAuthCompletion);
+    return () => window.removeEventListener("message", receiveOAuthCompletion);
+  }, [refresh]);
+
+  useEffect(() => {
+    const channelId = creator?.owned_channel_id;
+    if (!channelId) {
+      return;
+    }
+    const controller = new AbortController();
+    const parameters = new URLSearchParams({
+      channel_id: channelId,
+      query: analyticsQuery,
+      date_start: analyticsDateStart,
+      date_end: analyticsDateEnd,
+      report_name: analyticsReport,
+      row_kind: analyticsRowKind,
+      status: analyticsStatus,
+      content_format: analyticsFormat,
+      content_topic: analyticsTopic,
+      sort: analyticsSort,
+      direction: analyticsDirection,
+      page: String(analyticsPage),
+      page_size: String(analyticsPageSize),
+    });
+    const request = window.setTimeout(() => {
+      setAnalyticsLoading(true);
+      setAnalyticsError(null);
+      void fetch(`${API_BASE}/api/creator/analytics?${parameters.toString()}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      }).then(async (response) => {
+        const payload = await response.json() as AnalyticsPayload;
+        if (!response.ok) throw new Error(payload.error ?? "無法讀取已解析內容資料");
+        setAnalytics(payload);
+        if (payload.page !== analyticsPage) setAnalyticsPage(payload.page);
+      }).catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setAnalyticsError(error instanceof Error ? error.message : "無法讀取已解析內容資料");
+      }).finally(() => {
+        if (!controller.signal.aborted) setAnalyticsLoading(false);
+      });
+    }, 0);
+    return () => {
+      window.clearTimeout(request);
+      controller.abort();
+    };
+  }, [
+    creator?.owned_channel_id,
+    analyticsQuery,
+    analyticsDateStart,
+    analyticsDateEnd,
+    analyticsReport,
+    analyticsRowKind,
+    analyticsStatus,
+    analyticsFormat,
+    analyticsTopic,
+    analyticsSort,
+    analyticsDirection,
+    analyticsPage,
+    analyticsPageSize,
+    analyticsRevision,
+  ]);
+
+  const changeAnalyticsSort = (field: AnalyticsSort) => {
+    setAnalyticsPage(1);
+    if (analyticsSort === field) {
+      setAnalyticsDirection((current) => current === "asc" ? "desc" : "asc");
+      return;
+    }
+    setAnalyticsSort(field);
+    setAnalyticsDirection("desc");
+  };
+
+  const searchAnalytics = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAnalyticsPage(1);
+    setAnalyticsQuery(analyticsQueryDraft.trim());
+  };
 
   const confirmChannelChange = () => pending.length === 0 || window.confirm(
     "目前有尚未匯入的檔案預覽。切換頻道會清除這些待匯入檔案，確定繼續嗎？",
@@ -503,13 +776,99 @@ export default function CreatorDashboard() {
     if (response.ok) await refresh();
   };
 
+  const configureOAuth = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (file.size > 128 * 1024) {
+      setMessage("OAuth JSON 不可超過 128 KB");
+      return;
+    }
+    setOauthBusy(true);
+    setMessage(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/oauth/client`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content_base64: await filePayload(file) }),
+      });
+      const payload = await response.json() as { message?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法保存 OAuth 設定");
+      setMessage(payload.message ?? "OAuth 設定已保存");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "無法保存 OAuth 設定");
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const connectOAuth = () => {
+    window.open(`${API_BASE}/api/creator/oauth/start`, "_blank", "popup,width=720,height=760");
+    setMessage("已開啟 Google 授權頁；完成後這裡會自動更新，或可按右上角「更新資料」。");
+  };
+
+  const syncOAuth = async () => {
+    setOauthSyncing(true);
+    setMessage(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/oauth/sync`, { method: "POST" });
+      const payload = await response.json() as { message?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法啟動 Analytics 同步");
+      setMessage("正在背景同步 YouTube Analytics；完成或失敗後會自動顯示結果。");
+    } catch (error) {
+      setOauthSyncing(false);
+      setMessage(error instanceof Error ? error.message : "無法啟動 Analytics 同步");
+    }
+  };
+
+  const disconnectOAuth = async () => {
+    if (!window.confirm("中斷 YouTube 連線嗎？\n\n台V Pulse 會向 Google 撤銷授權，並刪除本機 token 與直接同步的 Analytics 資料；公開監測與 Studio 匯入不受影響。")) return;
+    setOauthBusy(true);
+    setMessage(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/oauth`, { method: "DELETE" });
+      const payload = await response.json() as { message?: string; warning?: string | null; error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法中斷連線");
+      setMessage(payload.warning ? `${payload.message}；${payload.warning}` : payload.message ?? "已中斷連線");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "無法中斷連線");
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const deleteOAuthClient = async () => {
+    if (!window.confirm("刪除這台電腦上的 OAuth 用戶端設定嗎？")) return;
+    setOauthBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/creator/oauth/client`, { method: "DELETE" });
+      const payload = await response.json() as { message?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法刪除 OAuth 設定");
+      setMessage(payload.message ?? "OAuth 設定已刪除");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "無法刪除 OAuth 設定");
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
   const overviewCards = useMemo(() => [
     ["views", "匯入期間觀看", (value: number) => compact(value)],
+    ["engaged_views", "互動觀看", (value: number) => compact(value)],
     ["watch_time_hours", "觀看時間", (value: number) => `${exact(value, 1)} 小時`],
     ["impressions", "曝光次數", (value: number) => compact(value)],
     ["impressions_ctr", "曝光點閱率", (value: number) => `${exact(value, 2)}%`],
     ["subscribers_net", "訂閱淨變化", (value: number) => exact(value)],
     ["average_view_duration_seconds", "平均觀看時間", (value: number) => `${exact(value)} 秒`],
+    ["average_percentage_viewed", "平均觀看比例", (value: number) => `${exact(value, 2)}%`],
+    ["unique_viewers", "不重複觀眾", (value: number) => compact(value)],
+    ["returning_viewers", "回訪觀眾", (value: number) => compact(value)],
+    ["likes", "喜歡次數", (value: number) => compact(value)],
+    ["comments", "留言數", (value: number) => compact(value)],
+    ["shares", "分享次數", (value: number) => compact(value)],
   ] as const, []);
 
   const workspaceIds = useMemo(
@@ -552,10 +911,21 @@ export default function CreatorDashboard() {
       {message && <section className="inline-message">{message}</section>}
       {loading && <section className="panel creator-placeholder">正在整理你的頻道資料…</section>}
 
+      {!loading && creator && <section className="panel oauth-connect-panel">
+        <div className="panel-heading"><div><p className="section-kicker">DIRECT READ-ONLY CONNECTION</p><h2>直接連結我的 YouTube 頻道</h2></div><span>{oauthSyncing || creator.oauth.status.syncing ? "同步中…" : creator.oauth.status.connected ? "已連線 · 每日自動同步" : creator.oauth.status.configured ? "等待 Google 授權" : "尚未設定"}</span></div>
+        <div className="oauth-security-note"><strong>只讀取，不代替你操作頻道</strong><p>只申請 YouTube 帳戶唯讀與 Analytics 唯讀權限；不能上傳、刪除、修改影片，也不讀取收益。OAuth 設定與 token 只在這台 Windows 電腦以 DPAPI 加密保存。</p></div>
+        {!creator.oauth.status.configured && <div className="oauth-setup-grid"><div><strong>1. 建立自己的桌面應用程式 OAuth</strong><p>在 Google Cloud 啟用 YouTube Data API v3 與 YouTube Analytics API，建立「桌面應用程式」OAuth 用戶端，再下載 JSON。</p><a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">開啟 Google Cloud 憑證頁 ↗</a></div><label className="oauth-file-button"><span>2. 匯入 OAuth JSON</span><input type="file" accept=".json,application/json" onChange={(event) => void configureOAuth(event)} disabled={oauthBusy} /><strong>{oauthBusy ? "加密保存中…" : "選擇 JSON 檔"}</strong></label></div>}
+        {creator.oauth.status.configured && !creator.oauth.status.connected && <div className="oauth-actions"><div><strong>OAuth 設定已加密保存</strong><p>下一步會在 Google 官方頁面登入並確認兩項唯讀權限。完成後 Google 將導回本機服務。</p></div><button className="button primary" type="button" onClick={connectOAuth} disabled={oauthBusy}>連結我的 YouTube 頻道</button><button className="button ghost" type="button" onClick={() => void deleteOAuthClient()} disabled={oauthBusy}>刪除設定</button></div>}
+        {creator.oauth.status.connected && <div className="oauth-connected-row"><div className="oauth-channel"><span className="state-badge">已連線</span><div><strong>{creator.oauth.status.channel?.title}</strong><p>{oauthSyncing || creator.oauth.status.syncing ? `同步開始：${dateTime(creator.oauth.status.sync_started_at)}` : `最近同步：${dateTime(creator.oauth.status.last_sync_at)} · 資料到 ${creator.oauth.status.last_data_date ?? "尚未取得"}`}</p></div></div><div className="oauth-action-buttons"><button className="button primary" type="button" onClick={() => void syncOAuth()} disabled={oauthBusy || oauthSyncing || creator.oauth.status.syncing}>{oauthSyncing || creator.oauth.status.syncing ? "同步中…" : "立即同步"}</button><button className="danger-button" type="button" onClick={() => void disconnectOAuth()} disabled={oauthBusy || oauthSyncing || creator.oauth.status.syncing}>中斷並刪除同步資料</button></div></div>}
+        {creator.oauth.status.last_error_help && <section className="oauth-error" role="status"><strong>{creator.oauth.status.last_error_help.title}</strong><p>{creator.oauth.status.last_error_help.message}</p><ol>{creator.oauth.status.last_error_help.steps.map((step) => <li key={step}>{step}</li>)}</ol>{creator.oauth.status.last_error_help.help_url && creator.oauth.status.last_error_help.help_label && <a href={creator.oauth.status.last_error_help.help_url} target="_blank" rel="noreferrer">{creator.oauth.status.last_error_help.help_label} ↗</a>}<details><summary>查看 Google 技術細節</summary><code>{creator.oauth.status.last_error}</code></details></section>}
+        <details className="oauth-troubleshooting"><summary><span><strong>連線或同步遇到問題？</strong><small>403、API 未啟用、七天後失效、沒資料與按鈕狀態</small></span><i>查看解法</i></summary><div className="oauth-troubleshooting-grid"><article><strong>403：應用程式未完成驗證</strong><p>在建立 OAuth JSON 的同一個專案，進入 Google Auth Platform「目標對象」，把目前登入的完整 Google 帳號加入測試使用者。專案擁有者也不一定會自動加入。</p><a href="https://console.cloud.google.com/auth/audience" target="_blank" rel="noreferrer">設定測試使用者 ↗</a></article><article><strong>Analytics API 尚未啟用</strong><p>OAuth 成功不代表 Analytics API 已啟用。確認同一專案同時啟用 YouTube Data API v3 與 YouTube Analytics API，等待 1～5 分鐘再同步。</p><a href="https://console.cloud.google.com/apis/library/youtubeanalytics.googleapis.com" target="_blank" rel="noreferrer">啟用 Analytics API ↗</a></article><article><strong>七天後突然失效</strong><p>Google OAuth 若仍是「測試」發布狀態，refresh token 通常七天後失效。重新連線可暫時恢復；長期每日同步需將發布狀態改為正式環境。</p></article><article><strong>已連線但沒有資料</strong><p>先等待目前同步完成；Google 尚未產生可用報表列、頻道較新或期間沒有活動時可能仍顯示「—」。這不是 0，也不會用猜測值補上。</p></article><article><strong>匯入了錯誤專案的 JSON</strong><p>先中斷連線，再刪除 OAuth 設定，改匯入已啟用兩個 YouTube API 的正確桌面應用程式 JSON。不要編輯 JSON 或把它傳給別人。</p></article><article><strong>按立即同步像沒反應</strong><p>按下後會持續顯示「同步中…」並每兩秒確認狀態；完成後顯示資料日期，失敗則顯示繁中原因、操作步驟與可展開的技術原文。</p></article></div></details>
+        <p className="panel-footnote">若 Google OAuth 同意畫面仍為「測試」狀態，refresh token 通常會在 7 天後失效；個人使用請在 Google Cloud 將應用程式發布到正式環境。不要把下載的 OAuth JSON 分享或放進 Git。</p>
+      </section>}
+
       {!loading && summary && (creator?.workspace_channels.length ?? 0) === 0 && <section className="panel creator-onboarding">
-        <div className="onboarding-heading"><p className="section-kicker">START HERE</p><h2>先把要管理的頻道接上公開監測資料</h2><p>個人可以只加入自己的頻道；企業 STAFF 可以加入多位藝人。工作區直接連結監測首頁的同一筆公開紀錄，再分頻道保存 Studio Analytics。</p></div>
-        <ol><li><strong>1</strong><span>加入一個或多個管理頻道</span></li><li><strong>2</strong><span>立即沿用公開監測與歷史快照</span></li><li><strong>3</strong><span>切換藝人後匯入各自 Studio 資料</span></li></ol>
-        <div className="data-flow"><span>公開監測資料</span><b>＋</b><span>分頻道 Studio 匯入</span><b>→</b><strong>團隊比較與個別分析</strong></div>
+        <div className="onboarding-heading"><p className="section-kicker">START HERE</p><h2>先連結自己的頻道，或加入團隊管理頻道</h2><p>個人可用上方 OAuth 唯讀連線自動辨識自己的頻道；企業 STAFF 仍可加入多位藝人。工作區沿用監測首頁同一筆公開紀錄，私人來源各自分開保存。</p></div>
+        <ol><li><strong>1</strong><span>連結自己或加入管理頻道</span></li><li><strong>2</strong><span>立即沿用公開監測與歷史快照</span></li><li><strong>3</strong><span>每日同步自己的私人 Analytics</span></li></ol>
+        <div className="data-flow"><span>公開監測資料</span><b>＋</b><span>OAuth 私人 Analytics</span><b>→</b><strong>團隊比較與個別分析</strong></div>
       </section>}
 
       {!loading && creator && creator.workspace_channels.length > 0 && <section className="panel workspace-overview-panel">
@@ -593,7 +963,7 @@ export default function CreatorDashboard() {
 
         <section className="panel public-monitor-panel">
           <div className="panel-heading"><div><p className="section-kicker">PUBLIC MONITOR SYNC</p><h2>已自動沿用監測首頁資料</h2></div><span>{creator.public?.snapshots.length ?? 0} 個頻道快照 · {creator.public?.videos.length ?? 0} 筆內容</span></div>
-          <div className="public-source-note"><strong>不另存一份副本</strong><p>這裡直接讀取監測首頁的同一筆頻道、影片與同接紀錄；監測更新後，工作區會同步顯示。下方「私人摘要」仍只顯示 Studio 匯入資料。</p></div>
+          <div className="public-source-note"><strong>不另存一份副本</strong><p>這裡直接讀取監測首頁的同一筆頻道、影片與同接紀錄；監測更新後，工作區會同步顯示。私人 Analytics 會另以 OAuth、Studio 匯入或手動補值標示來源。</p></div>
           <div className="public-delta-grid"><article><span>快照期間訂閱</span><strong>{publicDelta ? signed(publicDelta.subscribers) : "資料累積中"}</strong><small>{publicDelta ? `${dateTime(publicDelta.start)} 起` : "至少需要兩個快照"}</small></article><article><span>快照期間觀看</span><strong>{publicDelta ? signed(publicDelta.views) : "資料累積中"}</strong><small>公開觀看累積差</small></article><article><span>快照期間內容</span><strong>{publicDelta ? signed(publicDelta.videos) : "資料累積中"}</strong><small>公開影片數差</small></article></div>
           <div className="table-wrap public-snapshot-table"><table><thead><tr><th>監測時間</th><th>訂閱</th><th>總觀看</th><th>影片數</th></tr></thead><tbody>{(creator.public?.snapshots ?? []).length === 0 ? <tr><td colSpan={4} className="table-empty">目前只有最新頻道統計，後續監測會逐步累積歷史。</td></tr> : (creator.public?.snapshots ?? []).slice(-12).reverse().map((snapshot) => <tr key={snapshot.captured_at}><td>{dateTime(snapshot.captured_at)}</td><td>{exact(snapshot.subscriber_count)}</td><td>{exact(snapshot.view_count)}</td><td>{exact(snapshot.video_count)}</td></tr>)}</tbody></table></div>
         </section>
@@ -603,13 +973,26 @@ export default function CreatorDashboard() {
           <div className="public-content-grid">{(creator.public?.videos ?? []).length === 0 ? <div className="table-empty">尚未掃描到影片或直播；完成最新上傳掃描後會自動出現。</div> : (creator.public?.videos ?? []).slice(0, 8).map((video) => <article key={video.video_id}>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <span className="content-thumb-fallback">V</span>}<div><strong>{video.title}</strong><p>{video.live_state === "completed" ? "直播存檔" : video.live_state === "live" ? "直播中" : video.live_state === "upcoming" ? "預定直播" : "影片"} · {compact(video.view_count)} 觀看{video.peak_concurrent === null ? "" : ` · 最高同接 ${exact(video.peak_concurrent)}`}</p></div><a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer">開啟 ↗</a></article>)}</div>
         </section>
 
+        {creator.oauth.status.connected && creator.oauth.status.channel?.channel_id === creator.channel.channel_id && <section className="panel oauth-analytics-panel">
+          <div className="panel-heading"><div><p className="section-kicker">PRIVATE ANALYTICS SYNC</p><h2>Google 唯讀同步摘要</h2></div><span>{creator.oauth.summary ? `${creator.oauth.summary.date_start}～${creator.oauth.summary.date_end}` : "資料累積中"}</span></div>
+          <p className="analytics-classification-note">這區只顯示 OAuth 直接取得的私人 Analytics，與公開監測、Studio 匯入及手動補值分開保存。最多同步最近 365 天，並受「私人資料保存」設定限制；Google 尚未提供或不相容的欄位顯示「—」。</p>
+          <div className="creator-private-grid oauth-summary-grid">{overviewCards.filter(([key]) => !["impressions", "impressions_ctr", "returning_viewers"].includes(key)).map(([key, label, formatter]) => <article key={key}><span>{label}</span><strong>{creator.oauth.summary?.metrics[key as keyof OAuthMetrics] === undefined ? "—" : formatter(creator.oauth.summary.metrics[key as keyof OAuthMetrics]!)}</strong><p>Google Analytics API 唯讀同步</p></article>)}</div>
+          <div className="oauth-data-columns">
+            <article><div className="panel-heading"><div><h3>最近每日資料</h3></div><span>最新 14 天</span></div><div className="table-wrap"><table><thead><tr><th>日期</th><th>觀看</th><th>觀看時數</th><th>訂閱淨變化</th><th>不重複觀眾</th></tr></thead><tbody>{creator.oauth.daily.length === 0 ? <tr><td colSpan={5} className="table-empty">尚未取得每日 Analytics。</td></tr> : creator.oauth.daily.slice(0, 14).map((row) => <tr key={row.event_date}><td>{row.event_date}</td><td>{exact(row.metrics.views)}</td><td>{exact(row.metrics.watch_time_hours, 1)}</td><td>{signed(row.metrics.subscribers_net)}</td><td>{exact(row.metrics.unique_viewers)}</td></tr>)}</tbody></table></div></article>
+            <article><div className="panel-heading"><div><h3>期間觀看最高內容</h3></div><span>前 10 筆</span></div><div className="table-wrap"><table><thead><tr><th>內容</th><th>觀看</th><th>觀看時數</th><th>訂閱淨變化</th></tr></thead><tbody>{creator.oauth.videos.length === 0 ? <tr><td colSpan={4} className="table-empty">尚未取得內容 Analytics。</td></tr> : creator.oauth.videos.slice(0, 10).map((row) => <tr key={row.video_id}><td><strong>{row.title ?? row.video_id}</strong>{row.title && <small className="table-subline">{row.video_id}</small>}</td><td>{exact(row.metrics.views)}</td><td>{exact(row.metrics.watch_time_hours, 1)}</td><td>{signed(row.metrics.subscribers_net)}</td></tr>)}</tbody></table></div></article>
+          </div>
+        </section>}
+
+        <details className="creator-advanced-tools">
+          <summary><span><strong>進階備援：Studio 匯入與手動補值</strong><small>直接連線未包含的報表欄位，或 OAuth 暫時不可用時再使用</small></span><i>展開</i></summary>
         <section className="creator-two-column">
           <article className="panel creator-import-panel">
             <div className="panel-heading"><div><p className="section-kicker">YOUTUBE STUDIO IMPORT</p><h2>匯入私人 Analytics</h2></div><span>目前歸入：{creator.channel.title}</span></div>
-            <div className="import-dropzone"><input type="file" accept=".csv,.tsv,.zip,text/csv,text/tab-separated-values,application/zip" multiple onChange={(event) => void prepareFiles(event)} disabled={preparing || importing} /><strong>{preparing ? "正在檢查報表…" : "選擇 YouTube Studio 匯出檔"}</strong><p>先預覽欄位與列數，確認後才寫入。原始檔不會保存，只留下解析後數值與來源批次。</p></div>
-            {pending.length > 0 && <div className="upload-preview-list">{pending.map((item) => <article className={item.error ? "invalid" : ""} key={item.filename}><div><strong>{item.filename}</strong><span>{(item.size / 1024).toFixed(1)} KB</span></div>{item.error ? <p>{item.error}</p> : item.preview && <p>{item.preview.report_count} 份報表 · {item.preview.row_count} 列 · {item.preview.recognized_metrics.map((metric) => METRIC_LABELS[metric] ?? metric).join("、")} · {item.preview.date_start ?? "無日期"}～{item.preview.date_end ?? "無日期"}</p>}</article>)}</div>}
+            <div className="import-dropzone"><input type="file" accept=".csv,.tsv,.zip,text/csv,text/tab-separated-values,application/zip" multiple onChange={(event) => void prepareFiles(event)} disabled={preparing || importing} /><strong>{preparing ? "正在檢查報表…" : "選擇 YouTube Studio 匯出檔"}</strong><p>可匯入 CSV、TSV，或內含 CSV／TSV 的 ZIP；目前不支援 XLSX。先預覽欄位與列數，確認後才寫入。</p></div>
+            {pending.length > 0 && <div className="upload-preview-list">{pending.map((item) => <article className={item.error ? "invalid" : ""} key={item.filename}><div><strong>{item.filename}</strong><span>{(item.size / 1024).toFixed(1)} KB</span></div>{item.error ? <p>{item.error}</p> : item.preview && <><p>{item.preview.report_count} 份報表 · {item.preview.row_count} 列 · 已使用 {item.preview.recognized_column_count} 個欄位（{item.preview.recognized_metrics.map((metric) => METRIC_LABELS[metric] ?? metric).join("、")}） · {item.preview.date_start ? `${item.preview.date_start}～${item.preview.date_end}` : "內容報表未含每日日期欄"}</p>{item.preview.ignored_headers.length > 0 && <small className="ignored-columns-note">尚未納入摘要的欄位：{item.preview.ignored_headers.slice(0, 8).join("、")}{item.preview.ignored_headers.length > 8 ? `，另 ${item.preview.ignored_headers.length - 8} 欄` : ""}</small>}</>}</article>)}</div>}
             {pending.some((item) => item.preview) && <div className="import-actions"><button className="button ghost" type="button" onClick={() => setPending([])} disabled={importing}>取消</button><button className="button primary" type="button" onClick={() => void importFiles()} disabled={importing}>{importing ? "匯入中…" : "確認匯入"}</button></div>}
-            <p className="panel-footnote">YouTube Studio「進階模式」可匯出目前報表；單次介面匯出最多 500 列。若下載為 ZIP，可以直接上傳。<a href="https://support.google.com/youtube/answer/9717005?hl=zh-Hant" target="_blank" rel="noreferrer">查看官方說明 ↗</a></p>
+            <div className="import-support-note"><strong>可解析的資料</strong><p>日期、影片 ID、影片標題、發布時間、長度，以及觀看、互動觀看、觀看時數、平均觀看、觀看比例、曝光、點閱率、訂閱增減、喜歡、留言、分享、不重複觀眾、回訪觀眾與預估收益。實際結果以匯出檔包含的欄位為準。</p><small>每個檔案上限 8 MB；ZIP 最多解析 20 份 CSV／TSV。原始檔不會保存，只留下解析後數值、來源批次與檔案雜湊。</small></div>
+            <p className="panel-footnote">YouTube Studio「進階模式」可匯出目前報表；單次介面匯出最多 500 列。XLSX 內的圖表或額外工作表目前不會匯入。<a href="https://support.google.com/youtube/answer/9717005?hl=zh-Hant" target="_blank" rel="noreferrer">查看官方說明 ↗</a></p>
           </article>
 
           <aside className="panel creator-privacy-panel">
@@ -638,14 +1021,50 @@ export default function CreatorDashboard() {
         </section>
 
         <section className="panel recent-private-panel">
-          <div className="panel-heading"><div><p className="section-kicker">RECENT PRIVATE ROWS</p><h2>最近解析資料</h2></div><span>{creator.recent_rows.length} 列預覽</span></div>
-          <div className="table-wrap"><table><thead><tr><th>日期／內容</th><th>報表</th><th>觀看</th><th>觀看時數</th><th>曝光</th><th>點閱率</th><th>狀態</th></tr></thead><tbody>{creator.recent_rows.length === 0 ? <tr><td colSpan={7} className="table-empty">匯入後可在這裡核對解析結果。</td></tr> : creator.recent_rows.slice(0, 40).map((row) => <tr key={row.id}><td><strong>{row.event_date ?? "總計／無日期"}</strong><small className="table-subline">{row.video_title ?? row.video_id ?? "整體報表"}</small></td><td>{row.report_name}</td><td>{exact(row.views)}</td><td>{exact(row.watch_time_hours, 1)}</td><td>{exact(row.impressions)}</td><td>{row.impressions_ctr === null ? "—" : `${exact(row.impressions_ctr, 2)}%`}</td><td>{row.conflict_status ? <span className="conflict-badge">待核對</span> : <span className="state-badge">正常</span>}</td></tr>)}</tbody></table></div>
+          <div className="panel-heading"><div><p className="section-kicker">PARSED PRIVATE CONTENT</p><h2>已解析內容資料</h2></div><span>{analyticsLoading ? "背景更新中…" : analytics ? `${analytics.result_count} / ${analytics.available_count} 筆` : "讀取中…"}</span></div>
+          <div className="analytics-filter-grid">
+            <form className="analytics-query" onSubmit={searchAnalytics}><label><span>搜尋內容或遊戲名稱</span><input value={analyticsQueryDraft} onChange={(event) => setAnalyticsQueryDraft(event.target.value)} placeholder="影片標題、影片 ID 或報表名稱" /></label><button className="button ghost" type="submit">搜尋</button></form>
+            <label><span>開始日期</span><input type="date" value={analyticsDateStart} onChange={(event) => { setAnalyticsPage(1); setAnalyticsDateStart(event.target.value); }} /></label>
+            <label><span>結束日期</span><input type="date" value={analyticsDateEnd} onChange={(event) => { setAnalyticsPage(1); setAnalyticsDateEnd(event.target.value); }} /></label>
+            <label><span>來源報表</span><select value={analyticsReport} onChange={(event) => { setAnalyticsPage(1); setAnalyticsReport(event.target.value); }}><option value="all">全部報表</option>{(analytics?.reports ?? []).map((report) => <option value={report} key={report}>{report}</option>)}</select></label>
+            <label><span>資料列</span><select value={analyticsRowKind} onChange={(event) => { setAnalyticsPage(1); setAnalyticsRowKind(event.target.value); }}><option value="detail">內容明細</option><option value="total">報表總計</option><option value="all">全部</option></select></label>
+            <label><span>內容格式</span><select value={analyticsFormat} onChange={(event) => { setAnalyticsPage(1); setAnalyticsFormat(event.target.value); }}><option value="all">全部格式</option>{(analytics?.content_formats ?? []).map((format) => <option value={format} key={format}>{format}</option>)}</select></label>
+            <label><span>內容主題</span><select value={analyticsTopic} onChange={(event) => { setAnalyticsPage(1); setAnalyticsTopic(event.target.value); }}><option value="all">全部主題</option>{(analytics?.content_topics ?? []).map((topic) => <option value={topic} key={topic}>{topic}</option>)}</select></label>
+            <label><span>核對狀態</span><select value={analyticsStatus} onChange={(event) => { setAnalyticsPage(1); setAnalyticsStatus(event.target.value); }}><option value="all">全部狀態</option><option value="normal">正常</option><option value="conflict">待核對</option></select></label>
+            <label><span>排序欄位</span><select value={analyticsSort} onChange={(event) => { setAnalyticsPage(1); setAnalyticsSort(event.target.value as AnalyticsSort); }}>{ANALYTICS_SORT_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>
+            <label><span>方向</span><select value={analyticsDirection} onChange={(event) => { setAnalyticsPage(1); setAnalyticsDirection(event.target.value as "asc" | "desc"); }}><option value="desc">新到舊／大到小</option><option value="asc">舊到新／小到大</option></select></label>
+            <label><span>每頁</span><select value={analyticsPageSize} onChange={(event) => { setAnalyticsPage(1); setAnalyticsPageSize(Number(event.target.value)); }}><option value={25}>25 筆</option><option value={50}>50 筆</option><option value={100}>100 筆</option></select></label>
+            <button className="button ghost analytics-clear" type="button" onClick={() => { setAnalyticsQueryDraft(""); setAnalyticsQuery(""); setAnalyticsDateStart(""); setAnalyticsDateEnd(""); setAnalyticsReport("all"); setAnalyticsRowKind("detail"); setAnalyticsStatus("all"); setAnalyticsFormat("all"); setAnalyticsTopic("all"); setAnalyticsSort("date"); setAnalyticsDirection("desc"); setAnalyticsPage(1); }}>清除篩選</button>
+          </div>
+          <p className="analytics-classification-note">日期可能來自每日資料日期或影片發布日，列內會標示來源。內容主題是台V Pulse 的可檢查規則分類，不是 YouTube Analytics 官方分類；特定遊戲請用標題搜尋，無足夠證據時顯示「未分類／未判斷」。缺值不當成 0，排序時固定放在最後。</p>
+          {analyticsError && <p className="inline-message" role="status">{analyticsError}</p>}
+          <div className="table-wrap analytics-table-wrap"><table className="analytics-table"><thead><tr>
+            <SortHeader field="date" label="資料日期／發布日" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="content" label="內容" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="content_topic" label="內容主題" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="content_format" label="內容格式" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="report_name" label="報表" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="views" label="觀看" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="engaged_views" label="互動觀看" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="watch_time_hours" label="觀看時數" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="average_view_duration_seconds" label="平均觀看" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="average_percentage_viewed" label="觀看比例" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="impressions" label="曝光" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="impressions_ctr" label="點閱率" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="unique_viewers" label="不重複觀眾" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="returning_viewers" label="回訪觀眾" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="likes" label="喜歡" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="comments" label="留言" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+            <SortHeader field="conflict_status" label="狀態" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
+          </tr></thead><tbody>{!analytics || analytics.rows.length === 0 ? <tr><td colSpan={17} className="table-empty">{analyticsLoading ? "正在讀取解析資料…" : "目前沒有符合篩選條件的資料。"}</td></tr> : analytics.rows.map((row) => <tr key={row.id}><td><strong>{row.display_date ?? (row.row_kind === "total" ? "報表總計" : "無日期")}</strong><small className="table-subline">{row.date_source}</small></td><td><strong>{row.video_title ?? row.video_id ?? "整體報表"}</strong>{row.video_title && row.video_id && <small className="table-subline">{row.video_id}</small>}</td><td><strong>{row.content_topic}</strong><small className="table-subline">{row.classification_source}</small></td><td>{row.content_format}</td><td>{row.report_name}</td><td>{exact(row.views)}</td><td>{exact(row.engaged_views)}</td><td>{exact(row.watch_time_hours, 1)}</td><td>{row.average_view_duration_seconds === null ? "—" : `${exact(row.average_view_duration_seconds)} 秒`}</td><td>{row.average_percentage_viewed === null ? "—" : `${exact(row.average_percentage_viewed, 2)}%`}</td><td>{exact(row.impressions)}</td><td>{row.impressions_ctr === null ? "—" : `${exact(row.impressions_ctr, 2)}%`}</td><td>{exact(row.unique_viewers)}</td><td>{exact(row.returning_viewers)}</td><td>{exact(row.likes)}</td><td>{exact(row.comments)}</td><td>{row.conflict_status ? <span className="conflict-badge">待核對</span> : <span className="state-badge">正常</span>}</td></tr>)}</tbody></table></div>
+          <div className="analytics-pagination"><span>{analytics?.result_count ? `第 ${analytics.page} / ${analytics.page_count} 頁` : "0 筆結果"}</span><div><button className="button ghost" type="button" onClick={() => setAnalyticsPage((current) => Math.max(1, current - 1))} disabled={!analytics || analytics.page <= 1 || analyticsLoading}>上一頁</button><button className="button ghost" type="button" onClick={() => setAnalyticsPage((current) => Math.min(analytics?.page_count ?? current, current + 1))} disabled={!analytics || analytics.page >= analytics.page_count || analyticsLoading}>下一頁</button></div></div>
         </section>
 
         <section className="panel manual-history-panel">
           <div className="panel-heading"><div><p className="section-kicker">MANUAL HISTORY</p><h2>手動補充紀錄</h2></div><span>{creator.manual_metrics.length} 筆</span></div>
           <div className="table-wrap"><table><thead><tr><th>日期</th><th>指標</th><th>數值</th><th>影片</th><th>備註</th><th>操作</th></tr></thead><tbody>{creator.manual_metrics.length === 0 ? <tr><td colSpan={6} className="table-empty">目前沒有手動補充資料。</td></tr> : creator.manual_metrics.map((item) => <tr key={item.id}><td>{item.metric_date}</td><td>{METRIC_LABELS[item.metric_name] ?? item.metric_name}</td><td>{exact(item.metric_value, 2)}</td><td>{item.video_id || "整體"}</td><td>{item.note || "—"}</td><td><button className="danger-button" type="button" onClick={() => void removeManual(item)}>刪除</button></td></tr>)}</tbody></table></div>
         </section>
+        </details>
       </>}
 
       {classificationChannel && <div className="modal-backdrop" role="presentation"><section className="confirmation-dialog classification-dialog" role="dialog" aria-modal="true" aria-labelledby="creator-classification-title"><p className="section-kicker">CHANNEL CLASSIFICATION</p><h2 id="creator-classification-title">設定 {classificationChannel.title} 的頻道資料</h2><p>新頻道已加入工作區。先補上勢別、所屬與標籤，之後團隊比較就能正確分組；這些本機欄位不會寫回 YouTube。</p><form onSubmit={(event) => void saveChannelClassification(event)}><div className="classification-grid"><label><span>勢別分類</span><select value={classificationCategory} onChange={(event) => setClassificationCategory(event.target.value)}><option>未分類</option><option>個人勢</option><option>企業勢</option><option>團體勢</option><option>其他</option></select></label><label><span>活動狀態</span><select value={classificationActivity} onChange={(event) => setClassificationActivity(event.target.value)}><option>自動判斷</option><option>活動中</option><option>休止中</option><option>疑似已畢業</option><option>已確認畢業</option><option>狀態不明</option></select></label><label><span>所屬企業／團體</span><input value={classificationOrganization} onChange={(event) => setClassificationOrganization(event.target.value)} placeholder="例如：子午計畫" maxLength={80} /></label><label><span>自訂標籤</span><input value={classificationTags} onChange={(event) => setClassificationTags(event.target.value)} placeholder="例如：歌勢、遊戲、同期生" /></label></div><div className="dialog-actions"><button className="button ghost" type="button" onClick={() => setClassificationChannel(null)}>稍後分類</button><button className="button primary" type="submit" disabled={addingChannelId === classificationChannel.channel_id}>{addingChannelId === classificationChannel.channel_id ? "儲存中…" : "儲存分類"}</button></div></form></section></div>}

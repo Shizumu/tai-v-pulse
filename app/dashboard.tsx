@@ -69,6 +69,9 @@ type CollectionSettings = {
   retention_options: number[];
   creator_retention_options: number[];
   discovery_terms: string[];
+  hourly_live_scan_offsets: number[];
+  hourly_live_scan_timezone: "Asia/Taipei";
+  owned_channel_live_scan_priority: boolean;
 };
 
 type ChannelSnapshot = {
@@ -143,6 +146,7 @@ type Summary = {
   manual_refresh_queue_failed: number;
   discovery_progress: {
     status: "idle" | "running" | "completed" | "error";
+    batch_id: number | null;
     started_at: string | null;
     completed_at: string | null;
     current_term: string | null;
@@ -183,6 +187,9 @@ const DEFAULT_SETTINGS: CollectionSettings = {
   retention_options: [7, 14, 30],
   creator_retention_options: [30, 180, 365, 730, 1095, 1825, 3650, 0],
   discovery_terms: ["台V", "台灣VTuber", "台灣 VTuber", "Taiwan VTuber"],
+  hourly_live_scan_offsets: [-5, 0, 5],
+  hourly_live_scan_timezone: "Asia/Taipei",
+  owned_channel_live_scan_priority: true,
 };
 
 const LIVE_POLL_OPTIONS = [30, 60, 90, 120, 300, 600, 900, 1800, 3600] as const;
@@ -236,7 +243,7 @@ const EMPTY_SUMMARY: Summary = {
   manual_refresh_queue_threshold: 50,
   manual_refresh_queue_failed: 0,
   discovery_progress: {
-    status: "idle", started_at: null, completed_at: null, current_term: null,
+    status: "idle", batch_id: null, started_at: null, completed_at: null, current_term: null,
     term_index: 0, total_terms: 0, pages_per_term: 2, current_page: 0, candidate_count: 0,
     examined_count: 0, eligible_count: 0, new_count: 0, refreshed_count: 0,
     below_threshold_count: 0, review_count: 0, excluded_count: 0,
@@ -260,6 +267,11 @@ function number(value: number | null | undefined) {
 function fullNumber(value: number | null | undefined) {
   if (value === null || value === undefined) return "—";
   return new Intl.NumberFormat("zh-TW").format(value);
+}
+
+function liveScanOffset(value: number) {
+  if (value === 0) return "整點";
+  return value < 0 ? `整點前 ${Math.abs(value)} 分` : `整點後 ${value} 分`;
 }
 
 function time(value: string | null) {
@@ -736,7 +748,7 @@ export default function Dashboard() {
       {connected && !data.search_quota_available && <section className="notice quota-warning"><span className="notice-icon">!</span><div><strong>今日搜尋配額已達安全上限（{data.quota_search}/{data.quota_search_safe_limit}）</strong><p>大範圍探索與僅輸入名稱的搜尋暫停，預計台北時間 {time(data.quota_reset_at)} 重置；仍可貼上頻道網址、@handle 或 Channel ID 手動新增。</p></div></section>}
       {(message || data.last_error) && <section className="inline-message">{message ?? data.last_error}</section>}
       {data.discovery_progress.status !== "idle" && <section className={`panel discovery-progress ${data.discovery_progress.status}`}>
-        <div className="discovery-progress-copy"><p className="section-kicker">DISCOVERY STATUS</p><h2>{data.discovery_progress.status === "running" ? data.discovery_progress.message : data.discovery_progress.status === "completed" ? "候選頻道探索完成" : "候選頻道探索未完成"}</h2><p>{data.discovery_progress.status === "running" ? `搜尋字樣 ${data.discovery_progress.term_index}/${data.discovery_progress.total_terms}${data.discovery_progress.current_term ? ` · ${data.discovery_progress.current_term}` : ""}` : `${data.discovery_progress.completed_at ? time(data.discovery_progress.completed_at) : ""}${data.discovery_progress.error ? ` · ${data.discovery_progress.error}` : ""}`}</p></div>
+        <div className="discovery-progress-copy"><p className="section-kicker">DISCOVERY STATUS</p><h2>{data.discovery_progress.status === "running" ? data.discovery_progress.message : data.discovery_progress.status === "completed" ? "候選頻道探索完成" : "候選頻道探索未完成"}</h2><p>{data.discovery_progress.status === "running" ? `搜尋字樣 ${data.discovery_progress.term_index}/${data.discovery_progress.total_terms}${data.discovery_progress.current_term ? ` · ${data.discovery_progress.current_term}` : ""}` : `${data.discovery_progress.completed_at ? time(data.discovery_progress.completed_at) : ""}${data.discovery_progress.error ? ` · ${data.discovery_progress.error}` : ""}`}</p><a className="candidate-review-link" href="/candidates">查看候選審核與未收錄原因 →</a></div>
         <div className="discovery-stats"><span><strong>{data.discovery_progress.candidate_count}</strong>候選</span><span><strong>{data.discovery_progress.new_count}</strong>新收錄</span><span><strong>{data.discovery_progress.refreshed_count}</strong>已更新</span><span><strong>{data.discovery_progress.below_threshold_count}</strong>未達門檻</span><span><strong>{data.discovery_progress.excluded_count}</strong>黑名單</span></div>
         {data.discovery_progress.status === "running" && <div className="discovery-track"><i style={{ width: `${data.discovery_progress.total_terms ? Math.min(100, ((Math.max(0, data.discovery_progress.term_index - 1) + Math.min(1, data.discovery_progress.current_page / Math.max(1, data.discovery_progress.pages_per_term))) / data.discovery_progress.total_terms) * 100) : 4}%` }} /></div>}
       </section>}
@@ -761,12 +773,14 @@ export default function Dashboard() {
             <div><dt>自述字樣</dt><dd>{data.settings.discovery_terms.join("、")}</dd></div>
             <div><dt>最低訂閱</dt><dd>{fullNumber(data.settings.min_subscribers)}</dd></div>
             <div><dt>同接頻率</dt><dd>{data.settings.live_poll_seconds} 秒／批次 50 支</dd></div>
+            <div><dt>整點開台偵測</dt><dd>{data.settings.hourly_live_scan_offsets.map(liveScanOffset).join("、")}（台北時間）</dd></div>
             <div><dt>頻道更新</dt><dd>每 {data.settings.channel_refresh_hours} 小時</dd></div>
             <div><dt>公開快照保留</dt><dd>{retentionLabel(data.settings.retention_days)}{data.settings.edition === "personal" ? "（私人版）" : "（最長 30 天）"}</dd></div>
             <div><dt>我的頻道資料</dt><dd>{retentionLabel(data.settings.creator_retention_days)}</dd></div>
             <div><dt>執行模式</dt><dd>{data.settings.edition === "personal" ? "私人本機版" : "對外發布版"}</dd></div>
             <div><dt>手動排除</dt><dd>{data.excluded_channels} 個黑名單頻道</dd></div>
           </dl>
+            <div className="rule-note"><strong>手動開台加強偵測已啟用</strong><p>每次整點前後會輕量檢查所有已收錄頻道的最新內容，「我的頻道」固定優先；發現直播後改由每 {data.settings.live_poll_seconds} 秒更新同接。一般配額接近安全線時，其他頻道會暫停這項加強掃描，但仍優先保留「我的頻道」。</p></div>
             <div className="rule-note"><strong>{data.settings.edition === "personal" ? "私人版長期保存已開啟" : "公開資料與私人資料分開保存"}</strong><p>{data.settings.edition === "personal" ? "這是你本機專用的設定，不會寫入對外發布版；可自行選擇長期或永久保留公開快照。" : "對外發布版的 YouTube 公開 API 快照最長保留 30 天；較長期限只套用於使用者自行匯入或手動補充的資料。"}</p></div>
         </aside>
       </section>
@@ -775,12 +789,12 @@ export default function Dashboard() {
         <section className="panel settings-panel">
           <div className="panel-heading"><div><p className="section-kicker">RULE EDITOR</p><h2>編輯收錄與監控規則</h2></div><button className="text-button" type="button" onClick={() => setShowSettings(false)}>關閉</button></div>
           <form className="settings-form" onSubmit={(event) => void saveSettings(event)}>
-            <label className="terms-field"><span>大範圍探索字樣</span><textarea value={termsDraft} onChange={(event) => setTermsDraft(event.target.value)} rows={5} /><small>每行一組，最多 12 組。候選頻道也必須在名稱、說明或關鍵字中出現其中一組。</small></label>
+            <label className="terms-field"><span>大範圍探索字樣</span><textarea value={termsDraft} onChange={(event) => setTermsDraft(event.target.value)} rows={5} /><small>每行一組，最多 12 組。候選頻道也必須在名稱、說明或關鍵字中出現其中一組；台V、台 v、台灣 VTuber 等大小寫與空白差異會自動辨識，不必逐條重複。</small></label>
             <div className="settings-number-grid">
               <label><span>最低訂閱數</span><input type="number" min={1} max={10000000} value={settingsDraft.min_subscribers} onChange={(event) => setSettingsDraft({ ...settingsDraft, min_subscribers: Number(event.target.value) })} /></label>
               <label><span>同接更新頻率</span><select value={settingsDraft.live_poll_seconds} onChange={(event) => setSettingsDraft({ ...settingsDraft, live_poll_seconds: Number(event.target.value) })}>{LIVE_POLL_OPTIONS.map((value) => <option value={value} key={value}>每 {secondsLabel(value)}</option>)}</select></label>
               <label><span>頻道統計更新</span><select value={settingsDraft.channel_refresh_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, channel_refresh_hours: Number(event.target.value) })}>{CHANNEL_REFRESH_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select></label>
-              <label><span>最新上傳掃描</span><select value={settingsDraft.upload_scan_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, upload_scan_hours: Number(event.target.value) })}>{UPLOAD_SCAN_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select></label>
+              <label><span>完整上傳掃描</span><select value={settingsDraft.upload_scan_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, upload_scan_hours: Number(event.target.value) })}>{UPLOAD_SCAN_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select><small>另於台北時間整點前 5 分、整點及整點後 5 分執行輕量開台偵測；所有已收錄頻道都會檢查，「我的頻道」優先。</small></label>
               <label><span>公開 API 快照保留</span><select value={settingsDraft.retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, retention_days: Number(event.target.value) })}>{settingsDraft.retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>{settingsDraft.edition === "personal" ? "私人本機版已解除程式限制，可保留半年至永久；此選項不會出現在對外發布版。" : "對外發布版固定提供 7、14、30 天。"}</small></label>
               <label><span>我的頻道匯入資料保留</span><select value={settingsDraft.creator_retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, creator_retention_days: Number(event.target.value) })}>{settingsDraft.creator_retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>只影響你自行匯入的 Studio 報表與手動補充資料；預設永久保存。</small></label>
             </div>

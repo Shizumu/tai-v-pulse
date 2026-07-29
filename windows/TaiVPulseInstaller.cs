@@ -147,9 +147,12 @@ namespace TaiVPulse.WindowsInstaller
                 string launcher = Path.Combine(options.InstallDirectory, "TaiVPulse.exe");
                 if (!File.Exists(launcher))
                     throw new InstallException("TVP-I001", 11, "安裝內容缺少 TaiVPulse.exe，請重新下載安裝程式。");
+                string shortcutIcon = Path.Combine(options.InstallDirectory, "TaiVPulse-" + Version + ".ico");
+                if (!File.Exists(shortcutIcon))
+                    throw new InstallException("TVP-I001", 11, "安裝內容缺少最新版捷徑圖示，請重新下載安裝程式。");
 
-                if (!options.NoShortcuts) CreateShortcuts(launcher);
-                if (!options.NoRegister) RegisterUninstaller(launcher);
+                if (!options.NoShortcuts) CreateShortcuts(launcher, shortcutIcon);
+                if (!options.NoRegister) RegisterUninstaller(launcher, shortcutIcon);
                 Log("安裝完成。");
 
                 if (!options.NoLaunch) Process.Start(launcher);
@@ -274,7 +277,7 @@ namespace TaiVPulse.WindowsInstaller
             return removedFiles;
         }
 
-        private void CreateShortcuts(string launcher)
+        private void CreateShortcuts(string launcher, string shortcutIcon)
         {
             try
             {
@@ -283,10 +286,11 @@ namespace TaiVPulse.WindowsInstaller
                 string startFolder = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.Programs), "台V Pulse");
                 Directory.CreateDirectory(startFolder);
-                CreateShortcut(desktopShortcut, launcher, "啟動台V Pulse");
-                CreateShortcut(Path.Combine(startFolder, "台V Pulse.lnk"), launcher, "啟動台V Pulse");
+                CreateShortcut(desktopShortcut, launcher, "啟動台V Pulse", shortcutIcon);
+                CreateShortcut(Path.Combine(startFolder, "台V Pulse.lnk"), launcher, "啟動台V Pulse", shortcutIcon);
                 CreateShortcut(Path.Combine(startFolder, "解除安裝台V Pulse.lnk"), "powershell.exe", "解除安裝台V Pulse",
-                    "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(options.InstallDirectory, "uninstall.ps1") + "\"");
+                    "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(options.InstallDirectory, "uninstall.ps1") + "\"",
+                    shortcutIcon);
             }
             catch (Exception ex)
             {
@@ -294,7 +298,7 @@ namespace TaiVPulse.WindowsInstaller
             }
         }
 
-        private void CreateShortcut(string shortcutPath, string target, string description, string arguments)
+        private void CreateShortcut(string shortcutPath, string target, string description, string arguments, string iconPath)
         {
             Type shellType = Type.GetTypeFromProgID("WScript.Shell");
             object shell = Activator.CreateInstance(shellType);
@@ -304,18 +308,18 @@ namespace TaiVPulse.WindowsInstaller
             shortcutType.InvokeMember("Arguments", BindingFlags.SetProperty, null, shortcut, new object[] { arguments ?? "" });
             shortcutType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, shortcut, new object[] { options.InstallDirectory });
             shortcutType.InvokeMember("Description", BindingFlags.SetProperty, null, shortcut, new object[] { description });
-            shortcutType.InvokeMember("IconLocation", BindingFlags.SetProperty, null, shortcut, new object[] { Path.Combine(options.InstallDirectory, "TaiVPulse.exe") + ",0" });
+            shortcutType.InvokeMember("IconLocation", BindingFlags.SetProperty, null, shortcut, new object[] { iconPath + ",0" });
             shortcutType.InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
             Marshal.FinalReleaseComObject(shortcut);
             Marshal.FinalReleaseComObject(shell);
         }
 
-        private void CreateShortcut(string shortcutPath, string target, string description)
+        private void CreateShortcut(string shortcutPath, string target, string description, string iconPath)
         {
-            CreateShortcut(shortcutPath, target, description, "");
+            CreateShortcut(shortcutPath, target, description, "", iconPath);
         }
 
-        private void RegisterUninstaller(string launcher)
+        private void RegisterUninstaller(string launcher, string shortcutIcon)
         {
             try
             {
@@ -325,7 +329,7 @@ namespace TaiVPulse.WindowsInstaller
                     key.SetValue("DisplayName", "台V Pulse");
                     key.SetValue("DisplayVersion", Version);
                     key.SetValue("Publisher", "台V Pulse");
-                    key.SetValue("DisplayIcon", launcher);
+                    key.SetValue("DisplayIcon", shortcutIcon + ",0");
                     key.SetValue("InstallLocation", options.InstallDirectory);
                     key.SetValue("NoModify", 1, RegistryValueKind.DWord);
                     key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
