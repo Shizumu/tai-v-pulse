@@ -10,6 +10,7 @@ import locale
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import unicodedata
@@ -25,6 +26,12 @@ from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from collector.oauth import GoogleOAuth, OAuthError, REQUIRED_SCOPES, oauth_error_guidance
+from collector.public_transfer import (
+    MAX_PACKAGE_BYTES,
+    export_package as export_public_package,
+    import_package as import_public_package,
+    preview_package as preview_public_package,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,8 +100,11 @@ UTC = timezone.utc
 PACIFIC = ZoneInfo("America/Los_Angeles")
 TAIPEI = ZoneInfo("Asia/Taipei")
 SEARCH_TERMS = ("台V", "台灣VTuber", "台灣 VTuber", "Taiwan VTuber")
-HOURLY_LIVE_SCAN_MINUTES = (55, 0, 5)
-HOURLY_LIVE_SCAN_OFFSETS = (-5, 0, 5)
+ENHANCED_LIVE_SCAN_HOURS = (0, 1, 8, 12, 15, 18, 19, 20, 21, 22, 23)
+ENHANCED_LIVE_SCAN_MINUTE = 5
+ENHANCED_LIVE_SCAN_TIMES = tuple(
+    f"{hour:02d}:{ENHANCED_LIVE_SCAN_MINUTE:02d}" for hour in ENHANCED_LIVE_SCAN_HOURS
+)
 HOURLY_LIVE_SCAN_QUOTA_RESERVE = 1_000
 MATCHERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("台V", re.compile(r"台\s*[Vv](?:[Tt]uber)?(?![A-Za-z])")),
@@ -422,7 +432,7 @@ def hourly_live_scan_slot(moment: datetime | None = None) -> str | None:
         current = current.replace(tzinfo=TAIPEI)
     else:
         current = current.astimezone(TAIPEI)
-    if current.minute not in HOURLY_LIVE_SCAN_MINUTES:
+    if current.hour not in ENHANCED_LIVE_SCAN_HOURS or current.minute != ENHANCED_LIVE_SCAN_MINUTE:
         return None
     return current.strftime("%Y-%m-%dT%H:%M")
 
@@ -508,6 +518,37 @@ CONTENT_PATTERNS: dict[str, re.Pattern[str]] = {
     "雜談": re.compile(r"雜談|杂谈|聊天|閒聊|闲聊|zatsudan|雑談|free\s*talk", re.I),
     "遊戲": re.compile(r"遊戲|游戏|實況|实况|gameplay|gaming|プレイ", re.I),
 }
+MIXED_SONG_CHAT_PATTERN = re.compile(
+    r"歌\s*[雜杂聊]|[雜杂]\s*歌|歌回.{0,10}(?:雜談|杂谈|聊天|閒聊|闲聊)|"
+    r"(?:雜談|杂谈|聊天|閒聊|闲聊).{0,10}歌回",
+    re.I,
+)
+MORNING_CHAT_PATTERN = re.compile(r"早安台|朝活|早安配信|おはよう配信|おはよう(?:雑談|直播)", re.I)
+CONTENT_TOPIC_ORDER = ("紀念／重大活動", "ASMR", "歌回", "音樂作品", "雜談", "遊戲", "其他")
+CONTENT_ATTRIBUTES = {"聯動"}
+SYSTEM_GAME_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Minecraft", ("minecraft", "麥塊", "當個創世神")),
+    ("Palworld", ("palworld", "幻獸帕魯", "幻兽帕鲁")),
+    ("Apex Legends", ("apex legends", "apex英雄", "apex")),
+    ("VALORANT", ("valorant", "瓦羅蘭特", "无畏契约", "無畏契約")),
+    ("英雄聯盟", ("league of legends", "英雄聯盟", "英雄联盟", "lol")),
+    ("原神", ("genshin impact", "genshin", "原神")),
+    ("崩壞：星穹鐵道", ("honkai star rail", "星穹鐵道", "星穹铁道", "星鐵", "星铁")),
+    ("鳴潮", ("wuthering waves", "鳴潮", "鸣潮")),
+    ("絕區零", ("zenless zone zero", "絕區零", "绝区零", "zzz")),
+    ("Grand Theft Auto V", ("grand theft auto v", "gta v", "gta5", "gta 5")),
+    ("魔物獵人", ("monster hunter", "魔物獵人", "魔物猎人")),
+    ("寶可夢", ("pokemon", "pokémon", "寶可夢", "宝可梦")),
+    ("雀魂", ("mahjong soul", "雀魂")),
+    ("Splatoon", ("splatoon", "斯普拉遁")),
+    ("Dead by Daylight", ("dead by daylight", "黎明死線", "黎明死线", "dbd")),
+    ("Among Us", ("among us", "太空狼人殺", "太空狼人杀")),
+    ("Phasmophobia", ("phasmophobia", "恐鬼症")),
+    ("Fortnite", ("fortnite", "要塞英雄", "堡垒之夜")),
+    ("Overwatch", ("overwatch", "鬥陣特攻", "守望先锋")),
+    ("Warframe", ("warframe", "戰甲神兵", "星際戰甲")),
+    ("Roblox", ("roblox", "機器磚塊", "機器方塊")),
+)
 CONTENT_TYPE_DESCRIPTIONS = {
     "紀念／重大活動": "生日、周年、新衣、新裝、3D 或初配信等重要節點",
     "ASMR": "助眠、掏耳與近距離聲音內容",
@@ -525,69 +566,162 @@ KEYWORD_STOPWORDS = {
 }
 
 
+def _contains_game_alias(text: str, alias: str) -> bool:
+    normalized_text = unicodedata.normalize("NFKC", text).casefold()
+    normalized_alias = unicodedata.normalize("NFKC", alias).casefold().strip()
+    if not normalized_alias:
+        return False
+    if re.fullmatch(r"[a-z0-9 .:+_-]+", normalized_alias):
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(normalized_alias)}(?![a-z0-9])", normalized_text))
+    return normalized_alias in normalized_text
+
+
+def detect_game_name(title: str, confirmed_game_names: Iterable[str] = ()) -> tuple[str, str] | None:
+    for game_name in confirmed_game_names:
+        candidate = str(game_name).strip()
+        if candidate and _contains_game_alias(title, candidate):
+            return candidate, candidate
+    for game_name, aliases in SYSTEM_GAME_ALIASES:
+        for alias in aliases:
+            if _contains_game_alias(title, alias):
+                return game_name, alias
+    return None
+
+
+def classify_content_details(
+    title: str,
+    description: str = "",
+    tags: Iterable[str] = (),
+    category_id: str | None = None,
+    live_state: str | None = None,
+    confirmed_game_names: Iterable[str] = (),
+) -> dict[str, Any]:
+    tag_values = [str(tag) for tag in tags]
+    confirmed_names = [str(value).strip() for value in confirmed_game_names if str(value).strip()]
+    tag_text = " ".join(tag_values)
+    description_excerpt = description[:600]
+    live_format = live_state in {"live", "upcoming", "completed"}
+    topics: list[str] = []
+    attributes: list[str] = []
+    source = "未辨識"
+    evidence = "沒有足夠的標題、YouTube 類別、標籤或說明證據"
+    game_name = ""
+
+    def add_topic(label: str) -> None:
+        if label not in topics:
+            topics.append(label)
+
+    # Title evidence is authoritative. YouTube categories and tags are supporting
+    # evidence only, while reusable descriptions are the final fallback. This keeps
+    # old SEO tags from overriding an explicit current title such as "早安台".
+    event_signal = CONTENT_PATTERNS["紀念／重大活動"].search(title)
+    asmr_signal = CONTENT_PATTERNS["ASMR"].search(title)
+    song_signal = CONTENT_PATTERNS["歌回"].search(title)
+    music_signal = CONTENT_PATTERNS["音樂作品"].search(title)
+    chat_signal = CONTENT_PATTERNS["雜談"].search(title)
+    game_signal = CONTENT_PATTERNS["遊戲"].search(title)
+    morning_signal = MORNING_CHAT_PATTERN.search(title)
+    mixed_song_chat = MIXED_SONG_CHAT_PATTERN.search(title)
+    detected_game = detect_game_name(title, confirmed_names)
+
+    if mixed_song_chat:
+        add_topic("歌回")
+        add_topic("雜談")
+        source = "標題"
+        evidence = f"標題含混合主題「{mixed_song_chat.group(0)}」"
+    elif event_signal:
+        add_topic("紀念／重大活動")
+        source = "標題"
+        evidence = f"標題含「{event_signal.group(0)}」"
+        if live_format and (song_signal or music_signal):
+            add_topic("歌回")
+        elif not live_format and music_signal:
+            add_topic("音樂作品")
+    elif asmr_signal:
+        add_topic("ASMR")
+        source = "標題"
+        evidence = f"標題含「{asmr_signal.group(0)}」"
+    elif live_format and (song_signal or music_signal):
+        add_topic("歌回")
+        source = "標題"
+        evidence = f"標題含「{(song_signal or music_signal).group(0)}」"
+    elif not live_format and music_signal:
+        add_topic("音樂作品")
+        source = "標題"
+        evidence = f"標題含「{music_signal.group(0)}」"
+    elif song_signal:
+        add_topic("歌回")
+        source = "標題"
+        evidence = f"標題含「{song_signal.group(0)}」"
+    elif detected_game or game_signal:
+        add_topic("遊戲")
+        source = "標題（既有確認遊戲）" if detected_game and detected_game[0] in set(confirmed_names) \
+            else "標題（系統遊戲別名）" if detected_game else "標題"
+        if detected_game:
+            game_name = detected_game[0]
+            evidence = f"標題含遊戲別名「{detected_game[1]}」"
+        else:
+            evidence = f"標題含「{game_signal.group(0)}」"
+    elif chat_signal or morning_signal:
+        signal = chat_signal or morning_signal
+        add_topic("雜談")
+        source = "標題"
+        evidence = f"標題含「{signal.group(0)}」"
+
+    # Do not use collaboration wording from descriptions: phrases such as
+    # "除非合作請勿提及其他頻道" and business contact boilerplate are common.
+    if not topics and str(category_id or "") == "20":
+        add_topic("遊戲")
+        source = "YouTube 類別"
+        evidence = "YouTube categoryId 20（Gaming）"
+
+    if not topics:
+        for label in ("ASMR", "歌回" if live_format else "音樂作品", "雜談", "遊戲"):
+            if match := CONTENT_PATTERNS[label].search(tag_text):
+                add_topic(label)
+                source = "影片標籤"
+                evidence = f"影片標籤含「{match.group(0)}」"
+                break
+
+    if not topics:
+        for label in ("紀念／重大活動", "ASMR", "歌回" if live_format else "音樂作品", "雜談", "遊戲"):
+            if match := CONTENT_PATTERNS[label].search(description_excerpt):
+                add_topic(label)
+                source = "說明文字"
+                evidence = f"說明文字含「{match.group(0)}」"
+                break
+
+    if not topics:
+        add_topic("其他")
+    collaboration_tags = {"聯動", "联动", "コラボ", "collab", "collaboration"}
+    if CONTENT_PATTERNS["聯動"].search(title) or any(
+        tag.strip().lstrip("#＃").lower() in collaboration_tags for tag in tag_values
+    ):
+        attributes.append("聯動")
+    ordered_topics = [label for label in CONTENT_TOPIC_ORDER if label in topics]
+    labels = [*ordered_topics, *attributes]
+    return {
+        "content_type": " + ".join(ordered_topics),
+        "topics": ordered_topics,
+        "attributes": attributes,
+        "labels": labels,
+        "classification_source": source,
+        "classification_evidence": evidence,
+        "game_name": game_name,
+    }
+
+
 def classify_content_labels(
     title: str,
     description: str = "",
     tags: Iterable[str] = (),
     category_id: str | None = None,
     live_state: str | None = None,
+    confirmed_game_names: Iterable[str] = (),
 ) -> list[str]:
-    tag_values = [str(tag) for tag in tags]
-    title_and_tags = " ".join([title, *tag_values])
-    description_excerpt = description[:600]
-    live_format = live_state in {"live", "upcoming", "completed"}
-    labels: list[str] = []
-
-    def add(label: str) -> None:
-        if label not in labels:
-            labels.append(label)
-
-    # Main topic is chosen independently from format and collaboration. Title is
-    # authoritative, tags are supporting evidence, and reusable descriptions are
-    # only a final fallback. Event tags are deliberately ignored because channels
-    # often reuse #debut / #初配信 on unrelated uploads.
-    event_signal = CONTENT_PATTERNS["紀念／重大活動"].search(title)
-    asmr_signal = CONTENT_PATTERNS["ASMR"].search(title_and_tags)
-    song_signal = CONTENT_PATTERNS["歌回"].search(title_and_tags)
-    music_signal = CONTENT_PATTERNS["音樂作品"].search(title_and_tags)
-    chat_signal = CONTENT_PATTERNS["雜談"].search(title_and_tags)
-    game_signal = CONTENT_PATTERNS["遊戲"].search(title_and_tags)
-
-    if event_signal:
-        add("紀念／重大活動")
-        if live_format and (song_signal or music_signal):
-            add("歌回")
-        elif not live_format and music_signal:
-            add("音樂作品")
-    elif asmr_signal:
-        add("ASMR")
-    elif live_format and (song_signal or music_signal):
-        add("歌回")
-    elif not live_format and music_signal:
-        add("音樂作品")
-    elif song_signal:
-        add("歌回")
-    elif chat_signal:
-        add("雜談")
-    elif str(category_id or "") == "20" or game_signal:
-        add("遊戲")
-
-    # Do not use collaboration wording from descriptions: phrases such as
-    # "除非合作請勿提及其他頻道" and business contact boilerplate are common.
-    if not labels:
-        for label in ("紀念／重大活動", "ASMR", "歌回" if live_format else "音樂作品", "雜談", "遊戲"):
-            if CONTENT_PATTERNS[label].search(description_excerpt):
-                add(label)
-                break
-
-    if not labels:
-        add("其他")
-    collaboration_tags = {"聯動", "联动", "コラボ", "collab", "collaboration"}
-    if CONTENT_PATTERNS["聯動"].search(title) or any(
-        tag.strip().lstrip("#＃").lower() in collaboration_tags for tag in tag_values
-    ):
-        add("聯動")
-    return labels
+    return classify_content_details(
+        title, description, tags, category_id, live_state, confirmed_game_names
+    )["labels"]
 
 
 def classify_content_fields(
@@ -596,8 +730,11 @@ def classify_content_fields(
     tags: Iterable[str] = (),
     category_id: str | None = None,
     live_state: str | None = None,
+    confirmed_game_names: Iterable[str] = (),
 ) -> str:
-    return classify_content_labels(title, description, tags, category_id, live_state)[0]
+    return classify_content_details(
+        title, description, tags, category_id, live_state, confirmed_game_names
+    )["content_type"]
 
 
 def video_format(live_state: str, duration_seconds: int | None, title: str = "", description: str = "") -> str:
@@ -779,6 +916,9 @@ class Database:
                   tags TEXT,
                   content_type TEXT NOT NULL DEFAULT '其他',
                   content_tags TEXT NOT NULL DEFAULT '[]',
+                  classification_source TEXT NOT NULL DEFAULT '未辨識',
+                  classification_evidence TEXT NOT NULL DEFAULT '',
+                  game_name TEXT NOT NULL DEFAULT '',
                   view_count INTEGER,
                   like_count INTEGER,
                   comment_count INTEGER,
@@ -791,6 +931,14 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS videos_live_idx ON videos(live_state, scheduled_start);
                 CREATE INDEX IF NOT EXISTS videos_channel_idx ON videos(channel_id, published_at DESC);
+
+                CREATE TABLE IF NOT EXISTS video_classification_overrides (
+                  video_id TEXT PRIMARY KEY REFERENCES videos(video_id) ON DELETE CASCADE,
+                  content_topics TEXT NOT NULL,
+                  game_name TEXT NOT NULL DEFAULT '',
+                  note TEXT NOT NULL DEFAULT '',
+                  updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS concurrency_samples (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -934,6 +1082,10 @@ class Database:
                 CREATE TABLE IF NOT EXISTS creator_oauth_video_metrics (
                   channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
                   video_id TEXT NOT NULL,
+                  title TEXT,
+                  thumbnail_url TEXT,
+                  published_at TEXT,
+                  live_at TEXT,
                   metrics_json TEXT NOT NULL,
                   synced_at TEXT NOT NULL,
                   PRIMARY KEY(channel_id,video_id)
@@ -1003,6 +1155,16 @@ class Database:
                     self.connection.execute(
                         f"ALTER TABLE creator_analytics_rows ADD COLUMN {column} {definition}"
                     )
+            oauth_video_columns = {
+                row["name"] for row in self.connection.execute(
+                    "PRAGMA table_info(creator_oauth_video_metrics)"
+                ).fetchall()
+            }
+            for column in ("title", "thumbnail_url", "published_at", "live_at"):
+                if column not in oauth_video_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE creator_oauth_video_metrics ADD COLUMN {column} TEXT"
+                    )
             video_columns = {
                 row["name"] for row in self.connection.execute("PRAGMA table_info(videos)").fetchall()
             }
@@ -1018,6 +1180,13 @@ class Database:
                 self.connection.execute(
                     "ALTER TABLE videos ADD COLUMN content_type TEXT NOT NULL DEFAULT '其他'"
                 )
+            for column, definition in {
+                "classification_source": "TEXT NOT NULL DEFAULT '未辨識'",
+                "classification_evidence": "TEXT NOT NULL DEFAULT ''",
+                "game_name": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if column not in video_columns:
+                    self.connection.execute(f"ALTER TABLE videos ADD COLUMN {column} {definition}")
             classifier_row = self.connection.execute(
                 "SELECT value FROM app_settings WHERE key='content_classifier_version'"
             ).fetchone()
@@ -1025,28 +1194,55 @@ class Database:
                 classifier_version = int(json.loads(classifier_row["value"])) if classifier_row else 0
             except (TypeError, ValueError, json.JSONDecodeError):
                 classifier_version = 0
-            if content_type_added or content_tags_added or classifier_version < 3:
+            if content_type_added or content_tags_added or classifier_version < 4:
+                confirmed_game_names = [
+                    row["game_name"] for row in self.connection.execute(
+                        "SELECT DISTINCT game_name FROM video_classification_overrides WHERE game_name<>''"
+                    ).fetchall()
+                ]
                 existing_videos = self.connection.execute(
-                    "SELECT video_id,title,description,category_id,tags,live_state FROM videos"
+                    """SELECT v.video_id,v.title,v.description,v.category_id,v.tags,v.live_state,
+                              o.content_topics AS override_topics,o.game_name AS override_game_name,
+                              o.note AS override_note
+                         FROM videos v LEFT JOIN video_classification_overrides o ON o.video_id=v.video_id"""
                 ).fetchall()
+                classification_rows: list[tuple[str, str, str, str, str, str]] = []
+                for row in existing_videos:
+                    automatic = classify_content_details(
+                        row["title"], row["description"] or "", parse_json_list(row["tags"]),
+                        row["category_id"], row["live_state"], confirmed_game_names
+                    )
+                    if row["override_topics"]:
+                        topics = [
+                            label for label in parse_json_list(row["override_topics"])
+                            if label in CONTENT_TOPIC_ORDER and label != "其他"
+                        ] or ["其他"]
+                        override_evidence = row["override_note"] or f"使用者已確認：{' + '.join(topics)}"
+                        if row["override_game_name"]:
+                            override_evidence += f"；遊戲：{row['override_game_name']}"
+                        details = {
+                            "content_type": " + ".join(topics),
+                            "labels": [*topics, *automatic["attributes"]],
+                            "classification_source": "人工確認",
+                            "classification_evidence": override_evidence,
+                            "game_name": row["override_game_name"] or "",
+                        }
+                    else:
+                        details = automatic
+                    classification_rows.append((
+                        details["content_type"], json.dumps(details["labels"], ensure_ascii=False),
+                        details["classification_source"], details["classification_evidence"],
+                        details["game_name"], row["video_id"],
+                    ))
                 self.connection.executemany(
-                    "UPDATE videos SET content_type=?,content_tags=? WHERE video_id=?",
-                    [
-                        (
-                            (labels := classify_content_labels(
-                                row["title"], row["description"] or "",
-                                parse_json_list(row["tags"]), row["category_id"], row["live_state"]
-                            ))[0],
-                            json.dumps(labels, ensure_ascii=False),
-                            row["video_id"],
-                        )
-                        for row in existing_videos
-                    ],
+                    """UPDATE videos SET content_type=?,content_tags=?,classification_source=?,
+                              classification_evidence=?,game_name=? WHERE video_id=?""",
+                    classification_rows,
                 )
                 now = utc_now()
                 self.connection.execute(
-                    """INSERT INTO app_settings(key,value,updated_at) VALUES ('content_classifier_version','3',?)
-                       ON CONFLICT(key) DO UPDATE SET value='3',updated_at=excluded.updated_at""",
+                    """INSERT INTO app_settings(key,value,updated_at) VALUES ('content_classifier_version','4',?)
+                       ON CONFLICT(key) DO UPDATE SET value='4',updated_at=excluded.updated_at""",
                     (now,),
                 )
             self.connection.execute(
@@ -1077,6 +1273,26 @@ class Database:
     def close(self) -> None:
         with self.lock:
             self.connection.close()
+
+    def export_public_monitoring(
+        self,
+        *,
+        include_blacklist: bool = False,
+        include_source_evidence: bool = False,
+    ) -> tuple[str, bytes, dict[str, Any]]:
+        with self.lock:
+            return export_public_package(
+                self.connection,
+                include_blacklist=include_blacklist,
+                include_source_evidence=include_source_evidence,
+            )
+
+    def preview_public_monitoring(self, package_bytes: bytes) -> dict[str, Any]:
+        return preview_public_package(package_bytes)
+
+    def import_public_monitoring(self, package_bytes: bytes, mode: str) -> dict[str, Any]:
+        with self.lock:
+            return import_public_package(self.connection, package_bytes, mode)
 
     def get_setting(self, key: str, default: Any) -> Any:
         raw = self.scalar("SELECT value FROM app_settings WHERE key=?", (key,))
@@ -1605,26 +1821,56 @@ class Database:
             live_state = "video"
         concurrent = int(live["concurrentViewers"]) if live.get("concurrentViewers") else None
         tags = [str(tag) for tag in snippet.get("tags", []) if str(tag).strip()]
-        content_labels = classify_content_labels(
+        confirmed_game_names = [
+            row["game_name"] for row in self.rows(
+                "SELECT DISTINCT game_name FROM video_classification_overrides WHERE game_name<>''"
+            )
+        ]
+        automatic = classify_content_details(
             snippet.get("title", item["id"]),
             snippet.get("description", ""),
             tags,
             snippet.get("categoryId"),
             live_state,
+            confirmed_game_names,
         )
-        content_type = content_labels[0]
+        override_rows = self.rows(
+            "SELECT content_topics,game_name,note FROM video_classification_overrides WHERE video_id=?",
+            (item["id"],),
+        )
+        if override_rows:
+            override = override_rows[0]
+            topics = [
+                label for label in parse_json_list(override["content_topics"])
+                if label in CONTENT_TOPIC_ORDER and label != "其他"
+            ] or ["其他"]
+            override_evidence = override["note"] or f"使用者已確認：{' + '.join(topics)}"
+            if override["game_name"]:
+                override_evidence += f"；遊戲：{override['game_name']}"
+            classification = {
+                "content_type": " + ".join(topics),
+                "labels": [*topics, *automatic["attributes"]],
+                "classification_source": "人工確認",
+                "classification_evidence": override_evidence,
+                "game_name": override["game_name"] or "",
+            }
+        else:
+            classification = automatic
         now = utc_now()
         self.execute(
             """
             INSERT INTO videos (
               video_id,channel_id,title,description,thumbnail_url,published_at,duration_seconds,
-              category_id,tags,content_type,content_tags,view_count,like_count,comment_count,scheduled_start,
-              actual_start,actual_end,live_state,current_concurrent,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              category_id,tags,content_type,content_tags,classification_source,classification_evidence,
+              game_name,view_count,like_count,comment_count,scheduled_start,actual_start,actual_end,
+              live_state,current_concurrent,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(video_id) DO UPDATE SET
               title=excluded.title, description=excluded.description, thumbnail_url=excluded.thumbnail_url,
               duration_seconds=excluded.duration_seconds, category_id=excluded.category_id,
               tags=excluded.tags, content_type=excluded.content_type, content_tags=excluded.content_tags,
+              classification_source=excluded.classification_source,
+              classification_evidence=excluded.classification_evidence, game_name=excluded.game_name,
               view_count=excluded.view_count, like_count=excluded.like_count,
               comment_count=excluded.comment_count, scheduled_start=excluded.scheduled_start,
               actual_start=excluded.actual_start, actual_end=excluded.actual_end,
@@ -1635,8 +1881,10 @@ class Database:
                 item["id"], snippet.get("channelId"), snippet.get("title", item["id"]),
                 snippet.get("description", ""), thumbnail, snippet.get("publishedAt"),
                 parse_duration(details.get("duration")), snippet.get("categoryId"),
-                json.dumps(tags, ensure_ascii=False), content_type,
-                json.dumps(content_labels, ensure_ascii=False),
+                json.dumps(tags, ensure_ascii=False), classification["content_type"],
+                json.dumps(classification["labels"], ensure_ascii=False),
+                classification["classification_source"], classification["classification_evidence"],
+                classification["game_name"],
                 int(statistics["viewCount"]) if statistics.get("viewCount") else None,
                 int(statistics["likeCount"]) if statistics.get("likeCount") else None,
                 int(statistics["commentCount"]) if statistics.get("commentCount") else None,
@@ -1663,6 +1911,14 @@ class Database:
 
 class QuotaExceeded(RuntimeError):
     pass
+
+
+class YouTubeAPIError(RuntimeError):
+    def __init__(self, status_code: int, reason: str, detail: str):
+        self.status_code = status_code
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"YouTube API {status_code}: {detail[:400]}")
 
 
 class YouTubeClient:
@@ -1712,7 +1968,17 @@ class YouTubeClient:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"YouTube API {error.code}: {detail[:400]}") from error
+            reason = ""
+            try:
+                parsed = json.loads(detail)
+                reasons = parsed.get("error", {}).get("errors", [])
+                if reasons:
+                    reason = str(reasons[0].get("reason") or "")
+                if not reason:
+                    reason = str(parsed.get("error", {}).get("status") or "")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+            raise YouTubeAPIError(error.code, reason, detail) from error
         except urllib.error.URLError as error:
             raise RuntimeError(f"無法連線 YouTube API：{error.reason}") from error
 
@@ -1773,6 +2039,7 @@ class TrackerService:
         self.last_job_finished_at: str | None = None
         self.last_job_status: str | None = None
         self.last_error: str | None = None
+        self.last_warning: str | None = None
         self.discovery_batch_id: int | None = None
         self.discovery_progress: dict[str, Any] = {
             "status": "idle",
@@ -1818,8 +2085,8 @@ class TrackerService:
                 "retention_options": list(self.retention_choices),
                 "creator_retention_options": list(CREATOR_RETENTION_CHOICES),
                 "discovery_terms": list(self.runtime_settings["discovery_terms"]),
-                "hourly_live_scan_offsets": list(HOURLY_LIVE_SCAN_OFFSETS),
-                "hourly_live_scan_timezone": "Asia/Taipei",
+                "enhanced_live_scan_times": list(ENHANCED_LIVE_SCAN_TIMES),
+                "enhanced_live_scan_timezone": "Asia/Taipei",
                 "owned_channel_live_scan_priority": True,
             }
 
@@ -1960,6 +2227,31 @@ class TrackerService:
                         "status": "error",
                         "error": self.last_error,
                     })
+
+    @staticmethod
+    def _is_missing_upload_playlist(error: Exception) -> bool:
+        return (
+            isinstance(error, YouTubeAPIError)
+            and error.status_code == 404
+            and error.reason == "playlistNotFound"
+        )
+
+    def _record_upload_playlist_warning(self, channel: dict[str, Any], error: Exception) -> None:
+        title = str(channel.get("title") or channel["channel_id"])
+        warning = (
+            f"已略過「{title}」的影片更新：YouTube 找不到或無法存取這個頻道的上傳播放清單；"
+            "既有資料已保留，更新頻道資料後會再重試。"
+        )
+        with self.state_lock:
+            self.last_warning = warning
+        print(
+            "[uploads-playlist-skip] "
+            f"channel_id={channel['channel_id']} "
+            f"playlist_id={channel['uploads_playlist_id']} "
+            f"error={error}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def launch_job(self, name: str, callback: Callable[[], None]) -> tuple[bool, str]:
         if not self.config.api_key and name != "oauth-analytics-sync":
@@ -2978,12 +3270,28 @@ class TrackerService:
             summary = self._fetch_creator_analytics(start.isoformat(), end.isoformat())
             daily = self._fetch_creator_analytics(start.isoformat(), end.isoformat(), "day")
             videos = self._fetch_creator_analytics(start.isoformat(), end.isoformat(), "video")
+            video_details = self.oauth.video_details(list(videos))
         except Exception as error:
             self.database.execute(
                 "UPDATE creator_oauth_connections SET last_error=? WHERE channel_id=?",
                 (str(error)[:500], channel_id),
             )
             raise
+        video_metadata: dict[str, dict[str, str | None]] = {}
+        for item in video_details:
+            video_id = str(item.get("id") or "").strip()
+            if not video_id:
+                continue
+            snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else {}
+            live = item.get("liveStreamingDetails") if isinstance(item.get("liveStreamingDetails"), dict) else {}
+            thumbnails = snippet.get("thumbnails") if isinstance(snippet.get("thumbnails"), dict) else {}
+            thumbnail = thumbnails.get("medium") or thumbnails.get("high") or thumbnails.get("default") or {}
+            video_metadata[video_id] = {
+                "title": str(snippet.get("title") or "").strip() or None,
+                "thumbnail_url": str(thumbnail.get("url") or "").strip() or None,
+                "published_at": str(snippet.get("publishedAt") or "").strip() or None,
+                "live_at": str(live.get("actualStartTime") or live.get("scheduledStartTime") or "").strip() or None,
+            }
         synced_at = utc_now()
         last_data_date = max(daily) if daily else None
         with self.database.lock:
@@ -3007,9 +3315,16 @@ class TrackerService:
             )
             connection.executemany(
                 """INSERT INTO creator_oauth_video_metrics
-                   (channel_id,video_id,metrics_json,synced_at) VALUES (?,?,?,?)""",
-                [(channel_id, key, json.dumps(value, ensure_ascii=False), synced_at)
-                 for key, value in videos.items()],
+                   (channel_id,video_id,title,thumbnail_url,published_at,live_at,metrics_json,synced_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                [(
+                    channel_id, key,
+                    video_metadata.get(key, {}).get("title"),
+                    video_metadata.get(key, {}).get("thumbnail_url"),
+                    video_metadata.get(key, {}).get("published_at"),
+                    video_metadata.get(key, {}).get("live_at"),
+                    json.dumps(value, ensure_ascii=False), synced_at,
+                ) for key, value in videos.items()],
             )
             connection.execute(
                 """UPDATE creator_oauth_connections
@@ -3023,6 +3338,7 @@ class TrackerService:
             "date_end": end.isoformat(),
             "daily_rows": len(daily),
             "video_rows": len(videos),
+            "video_metadata_rows": len(video_metadata),
             "synced_at": synced_at,
         }
 
@@ -3054,7 +3370,13 @@ class TrackerService:
             (channel_id,),
         )
         video_rows = self.database.rows(
-            """SELECT o.video_id,o.metrics_json,o.synced_at,v.title,v.thumbnail_url,v.published_at
+            """SELECT o.video_id,o.metrics_json,o.synced_at,
+                      COALESCE(o.title,v.title) AS title,
+                      COALESCE(o.thumbnail_url,v.thumbnail_url) AS thumbnail_url,
+                      COALESCE(o.published_at,v.published_at) AS published_at,
+                      o.live_at,
+                      COALESCE(o.live_at,o.published_at,v.actual_start,v.scheduled_start,v.published_at)
+                        AS content_date
                  FROM creator_oauth_video_metrics o
                  LEFT JOIN videos v ON v.video_id=o.video_id AND v.channel_id=o.channel_id
                 WHERE o.channel_id=? ORDER BY json_extract(o.metrics_json,'$.views') DESC LIMIT 50""",
@@ -3184,6 +3506,106 @@ class TrackerService:
             "manual_metrics": manual_metrics,
         }
 
+    def _reclassify_automatic_videos(self) -> None:
+        confirmed_game_names = [
+            row["game_name"] for row in self.database.rows(
+                "SELECT DISTINCT game_name FROM video_classification_overrides WHERE game_name<>''"
+            )
+        ]
+        videos = self.database.rows(
+            """SELECT v.video_id,v.title,v.description,v.category_id,v.tags,v.live_state
+                 FROM videos v LEFT JOIN video_classification_overrides o ON o.video_id=v.video_id
+                WHERE o.video_id IS NULL"""
+        )
+        rows: list[tuple[str, str, str, str, str, str]] = []
+        for video in videos:
+            details = classify_content_details(
+                video["title"], video["description"] or "", parse_json_list(video["tags"]),
+                video["category_id"], video["live_state"], confirmed_game_names
+            )
+            rows.append((
+                details["content_type"], json.dumps(details["labels"], ensure_ascii=False),
+                details["classification_source"], details["classification_evidence"],
+                details["game_name"], video["video_id"],
+            ))
+        if rows:
+            self.database.executemany(
+                """UPDATE videos SET content_type=?,content_tags=?,classification_source=?,
+                          classification_evidence=?,game_name=? WHERE video_id=?""",
+                rows,
+            )
+
+    def update_video_classification(self, payload: dict[str, Any]) -> dict[str, Any]:
+        video_id = str(payload.get("video_id", "")).strip()
+        if not video_id:
+            raise ValueError("缺少 video_id")
+        video_rows = self.database.rows(
+            "SELECT video_id,title,content_tags FROM videos WHERE video_id=?", (video_id,)
+        )
+        if not video_rows:
+            raise ValueError("找不到這筆內容")
+        raw_topics = payload.get("topics", [])
+        if not isinstance(raw_topics, list):
+            raise ValueError("topics 必須是陣列")
+        topics = [
+            label for label in CONTENT_TOPIC_ORDER
+            if label in {str(value).strip() for value in raw_topics} and label != "其他"
+        ]
+        if not topics:
+            topics = ["其他"]
+        game_name = str(payload.get("game_name", "")).strip()[:120]
+        if game_name and "遊戲" not in topics:
+            if topics == ["其他"]:
+                topics = []
+            topics.append("遊戲")
+            topics.sort(key=CONTENT_TOPIC_ORDER.index)
+        note = str(payload.get("note", "")).strip()[:240]
+        evidence = note or f"使用者已確認：{' + '.join(topics)}"
+        if game_name:
+            evidence += f"；遊戲：{game_name}"
+        attributes = [
+            label for label in parse_json_list(video_rows[0]["content_tags"])
+            if label in CONTENT_ATTRIBUTES
+        ]
+        now = utc_now()
+        self.database.execute(
+            """INSERT INTO video_classification_overrides(video_id,content_topics,game_name,note,updated_at)
+               VALUES (?,?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET
+                 content_topics=excluded.content_topics,game_name=excluded.game_name,
+                 note=excluded.note,updated_at=excluded.updated_at""",
+            (video_id, json.dumps(topics, ensure_ascii=False), game_name, note, now),
+        )
+        self.database.execute(
+            """UPDATE videos SET content_type=?,content_tags=?,classification_source='人工確認',
+                      classification_evidence=?,game_name=? WHERE video_id=?""",
+            (
+                " + ".join(topics), json.dumps([*topics, *attributes], ensure_ascii=False),
+                evidence, game_name, video_id,
+            ),
+        )
+        self._reclassify_automatic_videos()
+        return self.database.rows(
+            """SELECT video_id,title,content_type,content_tags,classification_source,
+                      classification_evidence,game_name FROM videos WHERE video_id=?""",
+            (video_id,),
+        )[0]
+
+    def reset_video_classification(self, video_id: str) -> dict[str, Any]:
+        normalized = video_id.strip()
+        if not normalized or not self.database.scalar(
+            "SELECT 1 FROM video_classification_overrides WHERE video_id=?", (normalized,)
+        ):
+            raise ValueError("找不到這筆人工分類")
+        self.database.execute(
+            "DELETE FROM video_classification_overrides WHERE video_id=?", (normalized,)
+        )
+        self._reclassify_automatic_videos()
+        return self.database.rows(
+            """SELECT video_id,title,content_type,content_tags,classification_source,
+                      classification_evidence,game_name FROM videos WHERE video_id=?""",
+            (normalized,),
+        )[0]
+
     def creator_analytics(
         self,
         requested_channel_id: str | None = None,
@@ -3265,7 +3687,10 @@ class TrackerService:
                       v.video_id AS matched_public_video_id,
                       v.live_state AS public_live_state,
                       v.duration_seconds AS public_duration_seconds,
-                      v.content_type AS public_content_type
+                      v.content_type AS public_content_type,
+                      v.classification_source AS public_classification_source,
+                      v.classification_evidence AS public_classification_evidence,
+                      v.game_name AS public_game_name
                  FROM creator_analytics_rows r
                  LEFT JOIN videos v ON v.video_id=r.video_id AND v.channel_id=r.channel_id
                 WHERE r.channel_id=? AND r.id=(
@@ -3289,6 +3714,9 @@ class TrackerService:
             public_live_state = row.pop("public_live_state", None)
             public_duration_seconds = row.pop("public_duration_seconds", None)
             public_content_type = row.pop("public_content_type", None)
+            public_classification_source = row.pop("public_classification_source", None)
+            public_classification_evidence = row.pop("public_classification_evidence", None)
+            public_game_name = row.pop("public_game_name", None)
             title = str(row.get("video_title") or "")
 
             if matched_public_video_id:
@@ -3299,13 +3727,17 @@ class TrackerService:
                     title,
                 )
                 row["content_topic"] = str(public_content_type or classify_content_fields(title))
-                row["classification_source"] = "公開監測規則"
+                row["classification_source"] = str(public_classification_source or "公開監測規則")
+                row["classification_evidence"] = str(public_classification_evidence or "")
+                row["game_name"] = str(public_game_name or "")
             else:
                 duration = row.get("duration_seconds")
                 row["content_format"] = "Shorts" if duration is not None and float(duration) <= 60 else "未判斷"
                 inferred_topic = classify_content_fields(title)
                 row["content_topic"] = inferred_topic
                 row["classification_source"] = "匯入標題規則" if inferred_topic != "其他" else "未分類"
+                row["classification_evidence"] = ""
+                row["game_name"] = ""
             enriched_rows.append(row)
 
         reports = sorted({str(row["report_name"]) for row in enriched_rows}, key=str.casefold)
@@ -3321,6 +3753,7 @@ class TrackerService:
                 str(row.get("video_title") or ""),
                 str(row.get("video_id") or ""),
                 str(row.get("report_name") or ""),
+                str(row.get("game_name") or ""),
             )).casefold():
                 continue
             if date_start and (not display_date or display_date < date_start):
@@ -3433,15 +3866,18 @@ class TrackerService:
         analysis_ids = [channel["channel_id"] for channel in cohort_channels]
         if reference_channel and reference_channel["channel_id"] not in analysis_ids:
             analysis_ids.append(reference_channel["channel_id"])
-        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+        period_end = datetime.now(TAIPEI)
+        period_start = period_end - timedelta(days=days)
+        cutoff = period_start.astimezone(UTC).isoformat(timespec="seconds")
 
         videos: list[dict[str, Any]] = []
         snapshots: list[dict[str, Any]] = []
         for analysis_group in chunks(analysis_ids, 400):
             placeholders = ",".join("?" for _ in analysis_group)
             videos.extend(self.database.rows(
-                f"""SELECT v.video_id,v.channel_id,v.title,v.description,v.thumbnail_url,
+                    f"""SELECT v.video_id,v.channel_id,v.title,v.description,v.thumbnail_url,
                            v.published_at,v.duration_seconds,v.category_id,v.tags,v.content_type,v.content_tags,
+                           v.classification_source,v.classification_evidence,v.game_name,
                            v.view_count,v.like_count,v.comment_count,v.live_state,
                            v.current_concurrent,v.scheduled_start,v.actual_start,v.actual_end,
                            MAX(cs.concurrent_viewers) AS peak_concurrent
@@ -3532,6 +3968,7 @@ class TrackerService:
         keyword_counter: Counter[str] = Counter()
         schedule_counts = [[0 for _ in range(6)] for _ in range(7)]
         schedule_peaks: list[list[list[int]]] = [[[] for _ in range(6)] for _ in range(7)]
+        schedule_streams: list[list[list[dict[str, Any]]]] = [[[] for _ in range(6)] for _ in range(7)]
         ranked_videos: list[dict[str, Any]] = []
 
         for video in cohort_videos:
@@ -3555,10 +3992,11 @@ class TrackerService:
                     if subscribers and video["peak_concurrent"] is not None else None
                 ),
                 "content_type": video["content_type"] or "其他",
-                "attributes": [
-                    label for label in video["content_labels"]
-                    if label != (video["content_type"] or "其他")
-                ],
+                "topics": [label for label in video["content_labels"] if label in CONTENT_TOPIC_ORDER],
+                "attributes": [label for label in video["content_labels"] if label in CONTENT_ATTRIBUTES],
+                "classification_source": video["classification_source"] or "未辨識",
+                "classification_evidence": video["classification_evidence"] or "",
+                "game_name": video["game_name"] or "",
                 "format_type": video["format_type"], "published_at": video["published_at"],
             })
             if video["format_type"] == "直播":
@@ -3570,6 +4008,14 @@ class TrackerService:
                     schedule_counts[day][block] += 1
                     if video["peak_concurrent"] is not None:
                         schedule_peaks[day][block].append(int(video["peak_concurrent"]))
+                    schedule_streams[day][block].append({
+                        "video_id": video["video_id"],
+                        "title": video["title"],
+                        "channel_id": video["channel_id"],
+                        "channel_title": channel.get("title", video["channel_id"]),
+                        "started_at": local_time.isoformat(timespec="minutes"),
+                        "peak_concurrent": video["peak_concurrent"],
+                    })
 
         def ranked_distinct(
             candidates: Iterable[dict[str, Any]],
@@ -3607,9 +4053,14 @@ class TrackerService:
                 if subscribers and item["view_count"] is not None:
                     rates.append(float(item["view_count"]) / subscribers * 100)
             video_ids = {item["video_id"] for item in items}
+            topic_labels = [part.strip() for part in label.split(" + ") if part.strip()]
+            if len(topic_labels) > 1:
+                description = "同一內容同時包含" + "與".join(topic_labels)
+            else:
+                description = CONTENT_TYPE_DESCRIPTIONS.get(label, CONTENT_TYPE_DESCRIPTIONS["其他"])
             return {
                 "content_type": label,
-                "description": CONTENT_TYPE_DESCRIPTIONS.get(label, CONTENT_TYPE_DESCRIPTIONS["其他"]),
+                "description": description,
                 "items": len(items),
                 "share": len(items) / total_items * 100 if total_items else 0,
                 "streams": sum(1 for item in items if item["format_type"] == "直播"),
@@ -3656,11 +4107,37 @@ class TrackerService:
                 {
                     "count": schedule_counts[day][block],
                     "median_peak": percentile(schedule_peaks[day][block], .5),
+                    "streams": sorted(
+                        schedule_streams[day][block],
+                        key=lambda row: (row["started_at"], row["channel_title"].casefold()),
+                    ),
                 }
                 for block in range(6)
             ]
             for day in range(7)
         ]
+        schedule_stream_count = sum(sum(row) for row in schedule_counts)
+        schedule_channel_count = len({
+            stream["channel_id"]
+            for day in schedule_streams for block in day for stream in block
+        })
+        day_labels = ("週一", "週二", "週三", "週四", "週五", "週六", "週日")
+        block_labels = ("00:00–04:00", "04:00–08:00", "08:00–12:00", "12:00–16:00", "16:00–20:00", "20:00–24:00")
+        if schedule_stream_count:
+            busiest_day, busiest_block = max(
+                ((day, block) for day in range(7) for block in range(6)),
+                key=lambda pair: schedule_counts[pair[0]][pair[1]],
+            )
+            busiest_count = schedule_counts[busiest_day][busiest_block]
+            schedule_conclusion = (
+                f"開台最集中在{day_labels[busiest_day]} {block_labels[busiest_block]}，"
+                f"共 {busiest_count} 場，占有時間資料直播的 "
+                f"{busiest_count / schedule_stream_count * 100:.1f}%。"
+            )
+            if schedule_stream_count < 10:
+                schedule_conclusion += "目前樣本較少，建議累積更多直播後再判讀固定時段。"
+        else:
+            schedule_conclusion = "目前期間沒有可用的直播開始時間，尚無法判斷集中時段。"
         ranked_videos.sort(key=lambda row: row["view_rate"] if row["view_rate"] is not None else -1, reverse=True)
         videos_by_format = {
             "綜合": ranked_distinct(ranked_videos, "view_rate", 12),
@@ -3710,6 +4187,17 @@ class TrackerService:
                 {"format_type": label, "items": count} for label, count in format_counter.most_common()
             ],
             "schedule": schedule,
+            "schedule_summary": {
+                "date_start": period_start.date().isoformat(),
+                "date_end": period_end.date().isoformat(),
+                "channel_count": schedule_channel_count,
+                "stream_count": schedule_stream_count,
+                "conclusion": schedule_conclusion,
+            },
+            "classification_guide": {
+                "priority": "人工確認 → 標題（含系統與既有確認的遊戲別名）→ YouTube 類別 → 影片標籤 → 說明文字",
+                "representative_ranking": "代表內容依觀看／訂閱比由高至低排序，每個頻道最多一項；直播同接只作為卡片補充指標。",
+            },
             "top_videos": videos_by_format["綜合"],
             "top_videos_by_format": videos_by_format,
             "top_channels": sorted(
@@ -3730,7 +4218,7 @@ class TrackerService:
 
     def trends(
         self,
-        days: int = 30,
+        days: int = 7,
         min_subscribers: int = 0,
         max_subscribers: int = 100_000_000,
         category: str | None = None,
@@ -3738,6 +4226,8 @@ class TrackerService:
         channel_ids: list[str] | None = None,
         comparison_ids: list[str] | None = None,
         format_type: str = "主要內容",
+        content_topic: str = "全部",
+        organization_scope: str = "peer",
         include_graduated: bool = False,
     ) -> dict[str, Any]:
         days = max(7, min(365, int(days)))
@@ -3748,6 +4238,11 @@ class TrackerService:
         allowed_formats = {"主要內容", "直播", "影片", "Shorts", "全部"}
         if format_type not in allowed_formats:
             format_type = "主要內容"
+        allowed_topics = {*CONTENT_TOPIC_ORDER, "全部"}
+        if content_topic not in allowed_topics:
+            content_topic = "全部"
+        if organization_scope not in {"peer", "all"}:
+            organization_scope = "peer"
 
         conditions = ["discovery_status='eligible'"]
         params: list[Any] = []
@@ -3780,6 +4275,23 @@ class TrackerService:
         ) if reference_channel_id else []
         reference = reference_rows[0] if reference_rows else None
 
+        organization_channels = list(cohort)
+        if organization_scope == "all":
+            organization_conditions = ["discovery_status='eligible'"]
+            organization_params: list[Any] = []
+            if category and category != "全部":
+                organization_conditions.append("category=?")
+                organization_params.append(category)
+            if not include_graduated:
+                organization_conditions.append("activity_status<>'已確認畢業'")
+            organization_channels = self.database.rows(
+                f"""SELECT channel_id,title,handle,thumbnail_url,subscriber_count,view_count,
+                           video_count,category,organization_name,activity_status,updated_at
+                    FROM channels WHERE {' AND '.join(organization_conditions)}
+                    ORDER BY subscriber_count DESC""",
+                tuple(organization_params),
+            )
+
         data_channels = list(cohort)
         if reference and all(row["channel_id"] != reference["channel_id"] for row in data_channels):
             data_channels.append(reference)
@@ -3794,6 +4306,10 @@ class TrackerService:
             for row in comparison_rows:
                 if all(existing["channel_id"] != row["channel_id"] for existing in data_channels):
                     data_channels.append(row)
+        trend_data_ids = {row["channel_id"] for row in data_channels}
+        for row in organization_channels:
+            if all(existing["channel_id"] != row["channel_id"] for existing in data_channels):
+                data_channels.append(row)
         data_ids = [row["channel_id"] for row in data_channels]
         channel_lookup = {row["channel_id"]: row for row in data_channels}
         now = datetime.now(UTC)
@@ -3831,7 +4347,7 @@ class TrackerService:
             video["format_type"] = actual
             video["attributes"] = [
                 label for label in parse_json_list(video.get("content_tags"))
-                if label != (video.get("content_type") or "其他")
+                if label in CONTENT_ATTRIBUTES
             ]
             if format_type == "全部":
                 return True
@@ -3884,7 +4400,12 @@ class TrackerService:
         def published_time(video: dict[str, Any]) -> datetime | None:
             return parse_api_time(video.get("published_at") or video.get("actual_start") or video.get("scheduled_start"))
 
+        metric_cache: dict[str, dict[str, Any]] = {}
+
         def channel_metrics(channel: dict[str, Any]) -> dict[str, Any]:
+            cached = metric_cache.get(channel["channel_id"])
+            if cached is not None:
+                return cached
             channel_videos = [video for video in videos if video["channel_id"] == channel["channel_id"]]
             current_videos = [
                 video for video in channel_videos
@@ -3912,7 +4433,7 @@ class TrackerService:
             previous_ccv_rate = (
                 previous_peak / subscribers * 100 if previous_peak is not None and subscribers else None
             )
-            return {
+            result = {
                 **channel,
                 "is_reference": bool(reference and channel["channel_id"] == reference["channel_id"]),
                 "recent_items": len(current_videos),
@@ -3928,6 +4449,8 @@ class TrackerService:
                 "stickiness_delta": rolling_delta(stickiness, previous_stickiness),
                 "ccv_rate_delta": rolling_delta(ccv_rate, previous_ccv_rate),
             }
+            metric_cache[channel["channel_id"]] = result
+            return result
 
         cohort_metrics = [channel_metrics(channel) for channel in cohort]
         reference_metrics = channel_metrics(reference) if reference else None
@@ -3972,9 +4495,15 @@ class TrackerService:
         )
 
         ranked_videos: list[dict[str, Any]] = []
+        ranking_channel_ids = {row["channel_id"] for row in ranking_pool}
         for video in videos:
+            if video["channel_id"] not in ranking_channel_ids:
+                continue
             published = published_time(video)
             if not published or published < now - timedelta(days=30):
+                continue
+            video_topics = [part.strip() for part in str(video.get("content_type") or "其他").split("+")]
+            if content_topic != "全部" and content_topic not in video_topics:
                 continue
             channel = channel_lookup.get(video["channel_id"], {})
             subscribers = int(channel.get("subscriber_count") or 0)
@@ -3993,7 +4522,8 @@ class TrackerService:
 
         organizations: list[dict[str, Any]] = []
         organization_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in cohort_metrics:
+        organization_metrics = [channel_metrics(channel) for channel in organization_channels]
+        for row in organization_metrics:
             if row.get("organization_name"):
                 organization_groups[row["organization_name"]].append(row)
         for name, members in organization_groups.items():
@@ -4047,7 +4577,11 @@ class TrackerService:
         ]
 
         oldest_snapshot = min(
-            (parse_api_time(row["captured_at"]) for row in snapshots if parse_api_time(row["captured_at"])),
+            (
+                parse_api_time(row["captured_at"])
+                for row in snapshots
+                if row["channel_id"] in trend_data_ids and parse_api_time(row["captured_at"])
+            ),
             default=None,
         )
         collected_days = max(0.0, (now - oldest_snapshot).total_seconds() / 86400) if oldest_snapshot else 0.0
@@ -4061,7 +4595,9 @@ class TrackerService:
                 "days": days, "min_subscribers": min_subscribers,
                 "max_subscribers": max_subscribers, "category": category or "全部",
                 "channel_ids": selected_ids, "comparison_ids": comparison_ids,
-                "format_type": format_type, "include_graduated": include_graduated,
+                "format_type": format_type, "content_topic": content_topic,
+                "organization_scope": organization_scope,
+                "include_graduated": include_graduated,
             },
             "reference": reference_metrics,
             "comparison_channels": comparison_channels,
@@ -4081,6 +4617,10 @@ class TrackerService:
                 "ccv_rate": ranked("ccv_rate"),
                 "top_videos": ranked_videos[:30],
                 "organizations": organizations,
+            },
+            "organization_coverage": {
+                "scope_channels": len(organization_metrics),
+                "named_channels": sum(1 for row in organization_metrics if row.get("organization_name")),
             },
             "series": series_rows,
             "peer_series": peer_series,
@@ -4156,7 +4696,7 @@ class TrackerService:
     def scan_hourly_live_candidates(self) -> dict[str, int | bool]:
         owned_channel_id = self.owned_channel_id()
         channels = self.database.rows(
-            """SELECT channel_id,uploads_playlist_id FROM channels
+            """SELECT channel_id,title,uploads_playlist_id FROM channels
                WHERE discovery_status IN ('eligible','owned') AND uploads_playlist_id IS NOT NULL
                ORDER BY CASE WHEN channel_id=? THEN 0 ELSE 1 END,channel_id""",
             (owned_channel_id,),
@@ -4179,11 +4719,17 @@ class TrackerService:
 
         candidate_ids: list[str] = []
         for channel in selected:
-            payload = self.youtube.get("playlistItems", {
-                "part": "contentDetails,snippet",
-                "playlistId": channel["uploads_playlist_id"],
-                "maxResults": 5,
-            })
+            try:
+                payload = self.youtube.get("playlistItems", {
+                    "part": "contentDetails,snippet",
+                    "playlistId": channel["uploads_playlist_id"],
+                    "maxResults": 5,
+                })
+            except Exception as error:
+                if not self._is_missing_upload_playlist(error):
+                    raise
+                self._record_upload_playlist_warning(channel, error)
+                continue
             candidate_ids.extend(
                 item.get("contentDetails", {}).get("videoId")
                 for item in payload.get("items", [])
@@ -4216,7 +4762,7 @@ class TrackerService:
         upload_scan_hours = self.settings_payload()["upload_scan_hours"]
         cutoff = (datetime.now(UTC) - timedelta(hours=upload_scan_hours)).isoformat(timespec="seconds")
         due = self.database.rows(
-            """SELECT channel_id,uploads_playlist_id FROM channels
+            """SELECT channel_id,title,uploads_playlist_id FROM channels
                WHERE discovery_status IN ('eligible','owned') AND uploads_playlist_id IS NOT NULL
                  AND (last_upload_scan_at IS NULL OR last_upload_scan_at < ?)
                ORDER BY COALESCE(last_upload_scan_at,'') ASC LIMIT ?""",
@@ -4224,10 +4770,20 @@ class TrackerService:
         )
         video_ids: list[str] = []
         for channel in due:
-            payload = self.youtube.get("playlistItems", {
-                "part": "contentDetails,snippet", "playlistId": channel["uploads_playlist_id"],
-                "maxResults": 10,
-            })
+            try:
+                payload = self.youtube.get("playlistItems", {
+                    "part": "contentDetails,snippet", "playlistId": channel["uploads_playlist_id"],
+                    "maxResults": 10,
+                })
+            except Exception as error:
+                if not self._is_missing_upload_playlist(error):
+                    raise
+                self._record_upload_playlist_warning(channel, error)
+                self.database.execute(
+                    "UPDATE channels SET last_upload_scan_at=? WHERE channel_id=?",
+                    (utc_now(), channel["channel_id"]),
+                )
+                continue
             video_ids.extend(
                 item.get("contentDetails", {}).get("videoId")
                 for item in payload.get("items", [])
@@ -4362,6 +4918,7 @@ class TrackerService:
             last_job_finished_at = self.last_job_finished_at
             last_job_status = self.last_job_status
             error = self.last_error
+            warning = self.last_warning
             progress = dict(self.discovery_progress)
         search_usage = self.youtube.usage("search")
         general_usage = self.youtube.usage("general")
@@ -4389,6 +4946,7 @@ class TrackerService:
             "last_job_finished_at": last_job_finished_at,
             "last_job_status": last_job_status,
             "last_error": error,
+            "last_warning": warning,
             "eligible_channels": int(self.database.scalar(
                 "SELECT COUNT(*) FROM channels WHERE discovery_status='eligible'"
             ) or 0),
@@ -4451,9 +5009,14 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def _headers(self, status: int = 200) -> None:
+    def _headers(
+        self,
+        status: int = 200,
+        content_type: str = "application/json; charset=utf-8",
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         origin = self.headers.get("Origin")
         if origin in self.trusted_origins:
             self.send_header("Access-Control-Allow-Origin", origin)
@@ -4462,6 +5025,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
@@ -4479,6 +5044,33 @@ class RequestHandler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, json.JSONDecodeError):
             return {}
+
+    def _body_bytes(self, limit: int = MAX_PACKAGE_BYTES) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("無法判斷上傳檔案大小") from error
+        if length <= 0:
+            raise ValueError("請先選擇公開監測資料 ZIP")
+        if length > limit:
+            raise ValueError("資料包超過 256 MB 上傳上限")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("資料包上傳不完整，請重新選擇檔案")
+        return body
+
+    def _binary(self, payload: bytes, filename: str) -> None:
+        safe_filename = re.sub(r"[^A-Za-z0-9._-]", "-", filename) or "tai-v-pulse-public-data.zip"
+        self._headers(
+            200,
+            "application/zip",
+            {
+                "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                "Content-Length": str(len(payload)),
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            },
+        )
+        self.wfile.write(payload)
 
     def _origin_allowed(self) -> bool:
         origin = self.headers.get("Origin")
@@ -4531,7 +5123,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
-        if route == "/api/creator/oauth/start":
+        if route == "/api/public-data/export":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                filename, payload, _ = self.service.database.export_public_monitoring(
+                    include_blacklist=query.get("include_blacklist", ["false"])[0].lower() == "true",
+                    include_source_evidence=query.get(
+                        "include_source_evidence", ["false"]
+                    )[0].lower() == "true",
+                )
+                self._binary(payload, filename)
+            except (OSError, sqlite3.Error, ValueError) as error:
+                self._json({"error": f"無法建立公開監測資料包：{error}"}, 500)
+        elif route == "/api/creator/oauth/start":
             try:
                 self._redirect(self.service.creator_oauth_authorization_url())
             except (ValueError, OAuthError) as error:
@@ -4629,7 +5233,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 self._json(self.service.trends(
-                    days=int(query.get("days", ["30"])[0]),
+                    days=int(query.get("days", ["7"])[0]),
                     min_subscribers=int(query.get("min_subscribers", ["0"])[0]),
                     max_subscribers=int(query.get("max_subscribers", ["100000000"])[0]),
                     category=query.get("category", [None])[0],
@@ -4637,6 +5241,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     channel_ids=[value for value in query.get("channel_ids", [""])[0].split(",") if value],
                     comparison_ids=[value for value in query.get("comparison_ids", [""])[0].split(",") if value],
                     format_type=query.get("format_type", ["主要內容"])[0],
+                    content_topic=query.get("content_topic", ["全部"])[0],
+                    organization_scope=query.get("organization_scope", ["peer"])[0],
                     include_graduated=query.get("include_graduated", ["false"])[0].lower() == "true",
                 ))
             except (TypeError, ValueError) as error:
@@ -4689,7 +5295,33 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self._reject_untrusted_origin():
             return
         route = urllib.parse.urlparse(self.path).path
-        if route == "/api/creator/oauth/client":
+        if route == "/api/public-data/import-preview":
+            try:
+                preview = self.service.database.preview_public_monitoring(self._body_bytes())
+                self._json({"preview": preview})
+            except (OSError, ValueError, zipfile.BadZipFile) as error:
+                self._json({"error": str(error)}, 400)
+        elif route == "/api/public-data/import":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            mode = query.get("mode", [""])[0]
+            if not self.service.run_lock.acquire(blocking=False):
+                self._json({"error": "目前有背景更新正在執行，請稍後再匯入"}, 409)
+                return
+            self.service._set_job("public-data-import")
+            try:
+                result = self.service.database.import_public_monitoring(self._body_bytes(), mode)
+                action = "合併" if mode == "merge" else "取代"
+                self._json({
+                    "message": f"公開監測資料已{action}完成；API Key 與私人資料未變更",
+                    "result": result,
+                }, 201)
+            except (OSError, sqlite3.Error, ValueError, zipfile.BadZipFile) as error:
+                self.service._record_error(error)
+                self._json({"error": str(error)}, 400)
+            finally:
+                self.service._set_job(None)
+                self.service.run_lock.release()
+        elif route == "/api/creator/oauth/client":
             try:
                 self._json({
                     "message": "OAuth 桌面應用程式設定已加密保存",
@@ -4759,6 +5391,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 metric = self.service.add_creator_manual_metric(body)
                 self._json({"message": "手動補充資料已儲存", "metric": metric}, 201)
+            except ValueError as error:
+                self._json({"error": str(error)}, 400)
+        elif route == "/api/content-classification":
+            try:
+                video = self.service.update_video_classification(self._body_json())
+                self._json({"message": "內容分類已確認，後續更新會保留這次修正", "video": video})
             except ValueError as error:
                 self._json({"error": str(error)}, 400)
         elif route == "/api/creator/channel":
@@ -4844,6 +5482,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.service.delete_creator_manual_metric(metric_id)
                 self._json({"message": "手動補充資料已刪除"})
             except (TypeError, ValueError) as error:
+                self._json({"error": str(error)}, 404)
+            return
+        classification_prefix = "/api/content-classification/"
+        if route.startswith(classification_prefix):
+            try:
+                video_id = urllib.parse.unquote(route[len(classification_prefix):]).strip()
+                video = self.service.reset_video_classification(video_id)
+                self._json({"message": "已改回自動分類", "video": video})
+            except ValueError as error:
                 self._json({"error": str(error)}, 404)
             return
         prefix = "/api/channels/"

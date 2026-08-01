@@ -423,6 +423,21 @@ class GoogleOAuth:
             params["maxResults"] = max_results
         return self.authorized_json(f"{YOUTUBE_ANALYTICS_ENDPOINT}?{urllib.parse.urlencode(params)}")
 
+    def video_details(self, video_ids: list[str]) -> list[dict[str, Any]]:
+        normalized = list(dict.fromkeys(video_id.strip() for video_id in video_ids if video_id.strip()))
+        items: list[dict[str, Any]] = []
+        for offset in range(0, len(normalized), 50):
+            params = urllib.parse.urlencode({
+                "part": "snippet,liveStreamingDetails",
+                "id": ",".join(normalized[offset:offset + 50]),
+                "maxResults": 50,
+            })
+            payload = self.authorized_json(f"{YOUTUBE_API_ENDPOINT}/videos?{params}")
+            batch = payload.get("items") if isinstance(payload, dict) else None
+            if isinstance(batch, list):
+                items.extend(item for item in batch if isinstance(item, dict))
+        return items
+
     def revoke_and_delete(self) -> str | None:
         token = self.token_store.read() if self.token_store.exists() else None
         warning: str | None = None

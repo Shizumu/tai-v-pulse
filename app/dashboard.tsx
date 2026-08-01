@@ -69,8 +69,8 @@ type CollectionSettings = {
   retention_options: number[];
   creator_retention_options: number[];
   discovery_terms: string[];
-  hourly_live_scan_offsets: number[];
-  hourly_live_scan_timezone: "Asia/Taipei";
+  enhanced_live_scan_times: string[];
+  enhanced_live_scan_timezone: "Asia/Taipei";
   owned_channel_live_scan_priority: boolean;
 };
 
@@ -126,6 +126,7 @@ type Summary = {
   last_job_finished_at: string | null;
   last_job_status: "completed" | "error" | null;
   last_error: string | null;
+  last_warning: string | null;
   eligible_channels: number;
   review_channels: number;
   excluded_channels: number;
@@ -176,6 +177,28 @@ type Summary = {
   live_videos: LiveVideo[];
 };
 
+type PublicDataPreview = {
+  valid: boolean;
+  format_version: number;
+  created_at: string;
+  producer_version: string;
+  options: {
+    include_blacklist: boolean;
+    include_source_evidence: boolean;
+  };
+  counts: {
+    channels: number;
+    channel_snapshots: number;
+    videos: number;
+    video_snapshots: number;
+    concurrency_samples: number;
+    video_classification_overrides: number;
+    excluded_channels: number;
+  };
+  checks: { key: string; status: "passed"; message: string }[];
+  warnings: string[];
+};
+
 const DEFAULT_SETTINGS: CollectionSettings = {
   min_subscribers: 1000,
   live_poll_seconds: 60,
@@ -187,8 +210,8 @@ const DEFAULT_SETTINGS: CollectionSettings = {
   retention_options: [7, 14, 30],
   creator_retention_options: [30, 180, 365, 730, 1095, 1825, 3650, 0],
   discovery_terms: ["台V", "台灣VTuber", "台灣 VTuber", "Taiwan VTuber"],
-  hourly_live_scan_offsets: [-5, 0, 5],
-  hourly_live_scan_timezone: "Asia/Taipei",
+  enhanced_live_scan_times: ["00:05", "01:05", "08:05", "12:05", "15:05", "18:05", "19:05", "20:05", "21:05", "22:05", "23:05"],
+  enhanced_live_scan_timezone: "Asia/Taipei",
   owned_channel_live_scan_priority: true,
 };
 
@@ -224,6 +247,7 @@ const EMPTY_SUMMARY: Summary = {
   last_job_finished_at: null,
   last_job_status: null,
   last_error: null,
+  last_warning: null,
   eligible_channels: 0,
   review_channels: 0,
   excluded_channels: 0,
@@ -269,14 +293,9 @@ function fullNumber(value: number | null | undefined) {
   return new Intl.NumberFormat("zh-TW").format(value);
 }
 
-function liveScanOffset(value: number) {
-  if (value === 0) return "整點";
-  return value < 0 ? `整點前 ${Math.abs(value)} 分` : `整點後 ${value} 分`;
-}
-
 function time(value: string | null) {
   if (!value) return "時間未定";
-  return new Intl.DateTimeFormat("zh-TW", {
+  return `${new Intl.DateTimeFormat("zh-TW", {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -284,7 +303,16 @@ function time(value: string | null) {
     minute: "2-digit",
     hour12: false,
     timeZone: "Asia/Taipei",
-  }).format(new Date(value));
+  }).format(new Date(value))}（台北時間）`;
+}
+
+function taipeiClock(value: Date) {
+  return new Intl.DateTimeFormat("zh-TW", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Taipei",
+  }).format(value);
 }
 
 function ago(value: string | null) {
@@ -342,6 +370,19 @@ export default function Dashboard() {
   const [classificationOrganization, setClassificationOrganization] = useState("");
   const [classificationTags, setClassificationTags] = useState("");
   const [classificationActivity, setClassificationActivity] = useState("自動判斷");
+  const [includeTransferBlacklist, setIncludeTransferBlacklist] = useState(false);
+  const [includeTransferEvidence, setIncludeTransferEvidence] = useState(true);
+  const [exportingPublicData, setExportingPublicData] = useState(false);
+  const [publicDataFile, setPublicDataFile] = useState<File | null>(null);
+  const [publicDataPreview, setPublicDataPreview] = useState<PublicDataPreview | null>(null);
+  const [previewingPublicData, setPreviewingPublicData] = useState(false);
+  const [importingPublicData, setImportingPublicData] = useState(false);
+  const [publicDataMode, setPublicDataMode] = useState<"merge" | "replace">("merge");
+  const [replacePublicDataAcknowledged, setReplacePublicDataAcknowledged] = useState(false);
+  const [publicDataMessage, setPublicDataMessage] = useState<string | null>(null);
+  const [publicDataHasError, setPublicDataHasError] = useState(false);
+  const [showPublicTransfer, setShowPublicTransfer] = useState(false);
+  const [taipeiNow, setTaipeiNow] = useState("—");
 
   const refresh = useCallback(async () => {
     try {
@@ -362,6 +403,13 @@ export default function Dashboard() {
     const timer = window.setInterval(() => void refresh(), 15000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    const updateClock = () => setTaipeiNow(taipeiClock(new Date()));
+    updateClock();
+    const timer = window.setInterval(updateClock, 60000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const runDiscovery = async () => {
     setMessage(null);
@@ -529,6 +577,14 @@ export default function Dashboard() {
     setShowSettings(true);
   };
 
+  const cancelSettings = () => {
+    setSettingsDraft(data.settings);
+    setTermsDraft(data.settings.discovery_terms.join("\n"));
+    setShowRetentionWarning(false);
+    setRetentionAcknowledged(false);
+    setShowSettings(false);
+  };
+
   const persistSettings = async () => {
     setSavingSettings(true);
     setMessage(null);
@@ -568,6 +624,100 @@ export default function Dashboard() {
       return;
     }
     await persistSettings();
+  };
+
+  const exportPublicData = async () => {
+    setShowPublicTransfer(true);
+    setExportingPublicData(true);
+    setPublicDataMessage(null);
+    setPublicDataHasError(false);
+    const params = new URLSearchParams({
+      include_blacklist: String(includeTransferBlacklist),
+      include_source_evidence: String(includeTransferEvidence),
+    });
+    try {
+      const response = await fetch(`${API_BASE}/api/public-data/export?${params.toString()}`, {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string };
+        throw new Error(payload.error ?? "無法建立公開監測資料包");
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") ?? "";
+      const filename = disposition.match(/filename="([^"]+)"/)?.[1]
+        ?? `tai-v-pulse-public-monitoring-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}.zip`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setPublicDataMessage("公開監測資料包已建立；請將 ZIP 妥善保存，到另一台電腦先預覽再匯入。");
+    } catch (error) {
+      setPublicDataHasError(true);
+      setPublicDataMessage(error instanceof Error ? error.message : "無法建立公開監測資料包");
+    } finally {
+      setExportingPublicData(false);
+    }
+  };
+
+  const previewPublicData = async (file: File) => {
+    setShowPublicTransfer(true);
+    setPublicDataFile(file);
+    setPublicDataPreview(null);
+    setPublicDataMessage(null);
+    setPublicDataHasError(false);
+    setPreviewingPublicData(true);
+    setReplacePublicDataAcknowledged(false);
+    try {
+      const response = await fetch(`${API_BASE}/api/public-data/import-preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/zip" },
+        body: file,
+      });
+      const payload = (await response.json()) as { preview?: PublicDataPreview; error?: string };
+      if (!response.ok || !payload.preview) throw new Error(payload.error ?? "無法預覽資料包");
+      setPublicDataPreview(payload.preview);
+      setPublicDataMessage("完整性檢查通過；請確認筆數與影響範圍後再匯入。");
+    } catch (error) {
+      setPublicDataHasError(true);
+      setPublicDataMessage(error instanceof Error ? error.message : "無法預覽資料包");
+    } finally {
+      setPreviewingPublicData(false);
+    }
+  };
+
+  const importPublicData = async () => {
+    if (!publicDataFile || !publicDataPreview?.valid) return;
+    setImportingPublicData(true);
+    setPublicDataMessage(null);
+    setPublicDataHasError(false);
+    try {
+      const response = await fetch(`${API_BASE}/api/public-data/import?mode=${publicDataMode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/zip" },
+        body: publicDataFile,
+      });
+      const payload = (await response.json()) as {
+        message?: string;
+        error?: string;
+        result?: { preserved_private_channels?: number };
+      };
+      if (!response.ok) throw new Error(payload.error ?? "無法匯入公開監測資料");
+      const preserved = payload.result?.preserved_private_channels ?? 0;
+      setPublicDataMessage(
+        `${payload.message ?? "公開監測資料已匯入"}${preserved ? `；另保留 ${preserved} 個有私人資料引用的工作區頻道` : ""}。後續更新仍使用這台電腦自己的 API Key。`,
+      );
+      await refresh();
+    } catch (error) {
+      setPublicDataHasError(true);
+      setPublicDataMessage(error instanceof Error ? error.message : "無法匯入公開監測資料");
+    } finally {
+      setImportingPublicData(false);
+    }
   };
 
   const openChannel = async (channelId: string) => {
@@ -623,6 +773,8 @@ export default function Dashboard() {
 
   const quotaPercent = Math.min(100, Math.round((data.quota_general / Math.max(1, data.quota_general_safe_limit)) * 100));
   const searchQuotaPercent = Math.min(100, Math.round((data.quota_search / Math.max(1, data.quota_search_safe_limit)) * 100));
+  const publicTransferMustStayOpen = Boolean(publicDataFile) || previewingPublicData || importingPublicData || publicDataHasError;
+  const publicTransferExpanded = showPublicTransfer || publicTransferMustStayOpen;
   const trendSnapshots = detail?.snapshots.slice(-40) ?? [];
   const trendValues = trendSnapshots.map((snapshot) => snapshot.subscriber_count ?? 0);
   const trendMin = trendValues.length ? Math.min(...trendValues) : 0;
@@ -745,67 +897,28 @@ export default function Dashboard() {
 
       {!connected && <section className="notice warning"><span className="notice-icon">!</span><div><strong>資料服務尚未啟動</strong><p>執行 start-local.ps1 後，本頁會自動連線。介面可以先預覽，但不會呼叫 YouTube。</p></div></section>}
       {connected && !data.api_key_configured && <section className="notice"><span className="notice-icon">i</span><div><strong>還差一把 API Key</strong><p>在 .env 填入 YOUTUBE_API_KEY；請不要把 Key 貼到聊天或公開檔案。</p></div></section>}
-      {connected && !data.search_quota_available && <section className="notice quota-warning"><span className="notice-icon">!</span><div><strong>今日搜尋配額已達安全上限（{data.quota_search}/{data.quota_search_safe_limit}）</strong><p>大範圍探索與僅輸入名稱的搜尋暫停，預計台北時間 {time(data.quota_reset_at)} 重置；仍可貼上頻道網址、@handle 或 Channel ID 手動新增。</p></div></section>}
-      {(message || data.last_error) && <section className="inline-message">{message ?? data.last_error}</section>}
+      {connected && !data.search_quota_available && <section className="notice quota-warning"><span className="notice-icon">!</span><div><strong>今日搜尋配額已達安全上限（{data.quota_search}/{data.quota_search_safe_limit}）</strong><p>大範圍探索與僅輸入名稱的搜尋暫停，預計 {time(data.quota_reset_at)} 重置；仍可貼上頻道網址、@handle 或 Channel ID 手動新增。</p></div></section>}
+      {(message || data.last_warning || data.last_error) && <section className="inline-message">{message ?? data.last_warning ?? data.last_error}</section>}
       {data.discovery_progress.status !== "idle" && <section className={`panel discovery-progress ${data.discovery_progress.status}`}>
         <div className="discovery-progress-copy"><p className="section-kicker">DISCOVERY STATUS</p><h2>{data.discovery_progress.status === "running" ? data.discovery_progress.message : data.discovery_progress.status === "completed" ? "候選頻道探索完成" : "候選頻道探索未完成"}</h2><p>{data.discovery_progress.status === "running" ? `搜尋字樣 ${data.discovery_progress.term_index}/${data.discovery_progress.total_terms}${data.discovery_progress.current_term ? ` · ${data.discovery_progress.current_term}` : ""}` : `${data.discovery_progress.completed_at ? time(data.discovery_progress.completed_at) : ""}${data.discovery_progress.error ? ` · ${data.discovery_progress.error}` : ""}`}</p><a className="candidate-review-link" href="/candidates">查看候選審核與未收錄原因 →</a></div>
         <div className="discovery-stats"><span><strong>{data.discovery_progress.candidate_count}</strong>候選</span><span><strong>{data.discovery_progress.new_count}</strong>新收錄</span><span><strong>{data.discovery_progress.refreshed_count}</strong>已更新</span><span><strong>{data.discovery_progress.below_threshold_count}</strong>未達門檻</span><span><strong>{data.discovery_progress.excluded_count}</strong>黑名單</span></div>
         {data.discovery_progress.status === "running" && <div className="discovery-track"><i style={{ width: `${data.discovery_progress.total_terms ? Math.min(100, ((Math.max(0, data.discovery_progress.term_index - 1) + Math.min(1, data.discovery_progress.current_page / Math.max(1, data.discovery_progress.pages_per_term))) / data.discovery_progress.total_terms) * 100) : 4}%` }} /></div>}
       </section>}
 
+      {data.eligible_channels === 0 && <section className="panel monitor-onboarding" aria-labelledby="monitor-onboarding-title">
+        <div><p className="section-kicker">START HERE</p><h2 id="monitor-onboarding-title">先收錄一個頻道，開始看懂自己的位置</h2><p>台V Pulse 會用公開資料整理同級內容、直播環境與長期趨勢；資料累積越完整，比較就越可靠。</p></div>
+        <div className="monitor-onboarding-actions"><a className="button primary" href="#specific-channel-search">指定收錄頻道</a><a className="text-link" href="/creator">或前往頻道工作區選擇我的頻道 →</a></div>
+      </section>}
+
       <section className="hero-grid">
-        <article className="hero-card live-hero"><div className="hero-heading"><span className="live-dot" />現正直播</div><strong>{data.live_count}</strong><p>每 {data.settings.live_poll_seconds} 秒批次更新同接</p><div className="mini-bars" aria-hidden="true">{[18, 33, 23, 51, 39, 72, 57, 86, 64, 94, 78, 100].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}</div></article>
-        <article className="metric-card"><span>已收錄頻道</span><strong>{number(data.eligible_channels)}</strong><p>自動驗證或手動指定</p></article>
-        <article className="metric-card"><span>即將直播</span><strong>{number(data.upcoming_count)}</strong><p>由最新上傳與排程辨識</p></article>
-        <article className="metric-card"><span>同接資料點</span><strong>{number(data.sample_count)}</strong><p>公開快照保留 {retentionLabel(data.retention_days)}</p></article>
-        <article className="metric-card quota-card"><span>今日 API 配額</span><strong>{number(data.quota_general)} <small>/ {number(data.quota_general_safe_limit)} 一般安全額</small></strong><div className="quota-track"><i style={{ width: `${quotaPercent}%` }} /></div><p>一般 {quotaPercent}% · 搜尋 {data.quota_search}/{data.quota_search_safe_limit}（{searchQuotaPercent}%）</p></article>
+        <article className="hero-card live-hero"><div className="hero-heading"><span className="live-dot" /><span>現正直播</span><time dateTime={taipeiNow === "—" ? undefined : taipeiNow}><small>台北時間</small>{taipeiNow}</time></div><strong>{data.live_count}</strong><p>此刻有多少已收錄頻道正在直播 · 每 {data.settings.live_poll_seconds} 秒批次更新同接</p><div className="mini-bars" aria-hidden="true">{[18, 33, 23, 51, 39, 72, 57, 86, 64, 94, 78, 100].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}</div></article>
+        <article className="metric-card"><span>已收錄頻道</span><strong>{number(data.eligible_channels)}</strong><p>目前有多少頻道可納入比較</p></article>
+        <article className="metric-card"><span>即將直播</span><strong>{number(data.upcoming_count)}</strong><p>接下來有多少已知直播排程</p></article>
+        <article className="metric-card"><span>同接資料點</span><strong className={data.sample_count > 0 ? undefined : "accumulating"}>{data.sample_count > 0 ? number(data.sample_count) : "資料累積中"}</strong><p>用來看直播環境 · 公開快照保留 {retentionLabel(data.retention_days)}</p></article>
+        <article className="metric-card quota-card"><span>今日 API 配額</span><strong>{number(data.quota_general)} <small>/ {number(data.quota_general_safe_limit)} 一般安全額</small></strong><div className="quota-track"><i style={{ width: `${quotaPercent}%` }} /></div><p>今天安全更新空間 · 一般 {quotaPercent}% · 搜尋 {data.quota_search}/{data.quota_search_safe_limit}（{searchQuotaPercent}%）</p></article>
       </section>
 
-      <section className="content-grid">
-        <article className="panel live-panel">
-          <div className="panel-heading"><div><p className="section-kicker">LIVE RADAR</p><h2>直播雷達</h2></div><span>{data.live_videos.length} 個項目</span></div>
-          <div className="live-list">{data.live_videos.length === 0 ? <div className="empty-state"><span>◌</span><strong>目前沒有已知直播</strong><p>完成首次頻道探索和上傳掃描後，直播會出現在這裡。</p></div> : data.live_videos.map((video) => <article className="live-row" key={video.video_id}><a className="live-thumb-link" href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" aria-label={`開啟 ${video.title} 的 YouTube 頁面`}><div className="thumb" style={video.thumbnail_url ? { backgroundImage: `url(${video.thumbnail_url})` } : undefined}><span>{video.live_state === "live" ? "LIVE" : "預定"}</span></div></a><div className="live-copy"><a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer"><strong>{video.title}</strong></a><button type="button" onClick={() => void openChannel(video.channel_id)}>{video.channel_title} · 頻道資料 →</button></div><div className="live-stat"><strong>{video.live_state === "live" ? number(video.current_concurrent) : time(video.scheduled_start)}</strong><span>{video.live_state === "live" ? "目前同接" : "預定開始"}</span></div></article>)}</div>
-        </article>
-
-        <aside className="panel rules-panel">
-          <div className="panel-heading"><div><p className="section-kicker">COLLECTION RULES</p><h2>收錄規則</h2></div><button className="text-button" type="button" onClick={openSettings} disabled={!connected}>編輯</button></div>
-          <dl className="rules-list">
-            <div><dt>自述字樣</dt><dd>{data.settings.discovery_terms.join("、")}</dd></div>
-            <div><dt>最低訂閱</dt><dd>{fullNumber(data.settings.min_subscribers)}</dd></div>
-            <div><dt>同接頻率</dt><dd>{data.settings.live_poll_seconds} 秒／批次 50 支</dd></div>
-            <div><dt>整點開台偵測</dt><dd>{data.settings.hourly_live_scan_offsets.map(liveScanOffset).join("、")}（台北時間）</dd></div>
-            <div><dt>頻道更新</dt><dd>每 {data.settings.channel_refresh_hours} 小時</dd></div>
-            <div><dt>公開快照保留</dt><dd>{retentionLabel(data.settings.retention_days)}{data.settings.edition === "personal" ? "（私人版）" : "（最長 30 天）"}</dd></div>
-            <div><dt>我的頻道資料</dt><dd>{retentionLabel(data.settings.creator_retention_days)}</dd></div>
-            <div><dt>執行模式</dt><dd>{data.settings.edition === "personal" ? "私人本機版" : "對外發布版"}</dd></div>
-            <div><dt>手動排除</dt><dd>{data.excluded_channels} 個黑名單頻道</dd></div>
-          </dl>
-            <div className="rule-note"><strong>手動開台加強偵測已啟用</strong><p>每次整點前後會輕量檢查所有已收錄頻道的最新內容，「我的頻道」固定優先；發現直播後改由每 {data.settings.live_poll_seconds} 秒更新同接。一般配額接近安全線時，其他頻道會暫停這項加強掃描，但仍優先保留「我的頻道」。</p></div>
-            <div className="rule-note"><strong>{data.settings.edition === "personal" ? "私人版長期保存已開啟" : "公開資料與私人資料分開保存"}</strong><p>{data.settings.edition === "personal" ? "這是你本機專用的設定，不會寫入對外發布版；可自行選擇長期或永久保留公開快照。" : "對外發布版的 YouTube 公開 API 快照最長保留 30 天；較長期限只套用於使用者自行匯入或手動補充的資料。"}</p></div>
-        </aside>
-      </section>
-
-      {showSettings && (
-        <section className="panel settings-panel">
-          <div className="panel-heading"><div><p className="section-kicker">RULE EDITOR</p><h2>編輯收錄與監控規則</h2></div><button className="text-button" type="button" onClick={() => setShowSettings(false)}>關閉</button></div>
-          <form className="settings-form" onSubmit={(event) => void saveSettings(event)}>
-            <label className="terms-field"><span>大範圍探索字樣</span><textarea value={termsDraft} onChange={(event) => setTermsDraft(event.target.value)} rows={5} /><small>每行一組，最多 12 組。候選頻道也必須在名稱、說明或關鍵字中出現其中一組；台V、台 v、台灣 VTuber 等大小寫與空白差異會自動辨識，不必逐條重複。</small></label>
-            <div className="settings-number-grid">
-              <label><span>最低訂閱數</span><input type="number" min={1} max={10000000} value={settingsDraft.min_subscribers} onChange={(event) => setSettingsDraft({ ...settingsDraft, min_subscribers: Number(event.target.value) })} /></label>
-              <label><span>同接更新頻率</span><select value={settingsDraft.live_poll_seconds} onChange={(event) => setSettingsDraft({ ...settingsDraft, live_poll_seconds: Number(event.target.value) })}>{LIVE_POLL_OPTIONS.map((value) => <option value={value} key={value}>每 {secondsLabel(value)}</option>)}</select></label>
-              <label><span>頻道統計更新</span><select value={settingsDraft.channel_refresh_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, channel_refresh_hours: Number(event.target.value) })}>{CHANNEL_REFRESH_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select></label>
-              <label><span>完整上傳掃描</span><select value={settingsDraft.upload_scan_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, upload_scan_hours: Number(event.target.value) })}>{UPLOAD_SCAN_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select><small>另於台北時間整點前 5 分、整點及整點後 5 分執行輕量開台偵測；所有已收錄頻道都會檢查，「我的頻道」優先。</small></label>
-              <label><span>公開 API 快照保留</span><select value={settingsDraft.retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, retention_days: Number(event.target.value) })}>{settingsDraft.retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>{settingsDraft.edition === "personal" ? "私人本機版已解除程式限制，可保留半年至永久；此選項不會出現在對外發布版。" : "對外發布版固定提供 7、14、30 天。"}</small></label>
-              <label><span>我的頻道匯入資料保留</span><select value={settingsDraft.creator_retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, creator_retention_days: Number(event.target.value) })}>{settingsDraft.creator_retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>只影響你自行匯入的 Studio 報表與手動補充資料；預設永久保存。</small></label>
-            </div>
-            <div className="settings-footer"><p>同接頻率越高，API 請求越多；長期私人資料請定期備份並妥善保護。</p><button className="button primary" type="submit" disabled={savingSettings}>{savingSettings ? "儲存中…" : "儲存規則"}</button></div>
-          </form>
-        </section>
-      )}
-
-      {showRetentionWarning && <div className="modal-backdrop" role="presentation"><section className="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="retention-warning-title"><p className="section-kicker">LOCAL DATA RETENTION</p><h2 id="retention-warning-title">確認私人版長期保存設定</h2><p>公開快照將保存 {retentionLabel(settingsDraft.retention_days)}；Studio／手動資料將保存 {retentionLabel(settingsDraft.creator_retention_days)}。</p><ul><li>這項設定只套用於你的私人本機版，不會帶進未來的對外發布版。</li><li>期限越長，資料庫容量、備份與隱私保護責任越高。</li><li>日後縮短期限時，排程清理的舊資料無法復原，請先備份。</li></ul><label className="consent-check"><input type="checkbox" checked={retentionAcknowledged} onChange={(event) => setRetentionAcknowledged(event.target.checked)} /><span>我了解並要在私人本機版使用這項長期保存設定</span></label><div className="dialog-actions"><button className="button ghost" type="button" onClick={() => setShowRetentionWarning(false)}>返回調整</button><button className="button primary" type="button" disabled={!retentionAcknowledged || savingSettings} onClick={() => { setShowRetentionWarning(false); void persistSettings(); }}>{savingSettings ? "儲存中…" : "確認並儲存"}</button></div></section></div>}
-
-      <section className="panel specific-search-panel">
+      <section className="panel specific-search-panel" id="specific-channel-search">
         <div className="panel-heading specific-heading"><div><p className="section-kicker">DIRECT CHANNEL LOOKUP</p><h2>指定 VTuber 搜尋</h2></div><p>{data.search_quota_available ? "直接指定不要求自述字樣" : "搜尋配額已滿時請使用網址、@handle 或 Channel ID"}，仍須公開訂閱數達 {fullNumber(data.settings.min_subscribers)}。</p></div>
         <div className="manual-queue-strip"><div><strong>手動新增待更新：{data.manual_refresh_queue_count}／{data.manual_refresh_queue_threshold}</strong><span>滿 50 個會自動批次更新；分類、所屬與標籤只存本機，不消耗 YouTube 配額。{data.manual_refresh_queue_failed > 0 ? `目前有 ${data.manual_refresh_queue_failed} 個待重試。` : ""}</span></div><button className="button ghost" type="button" onClick={() => void refreshManualQueue()} disabled={!connected || data.manual_refresh_queue_count === 0 || Boolean(data.current_job)}>立即更新這一批</button></div>
         <form className="specific-form" onSubmit={(event) => void searchSpecific(event)}><label><span>名稱、@handle、Channel ID 或頻道網址</span><input value={specificQuery} onChange={(event) => setSpecificQuery(event.target.value)} placeholder="例如：杏仁ミル、@handle、UC..." aria-label="指定 VTuber 頻道" /></label><button className="button primary" type="submit" disabled={!connected || !specificQuery.trim() || searchingSpecific}>{searchingSpecific ? "搜尋中…" : "搜尋頻道"}</button></form>
@@ -815,6 +928,57 @@ export default function Dashboard() {
           return <article className="candidate-card" key={channel.channel_id}>{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="candidate-avatar">V</span>}<div className="candidate-copy"><div className="candidate-title"><strong>{channel.title}</strong><span>{status}</span></div><small>{channel.handle ?? channel.channel_id}</small><p>{channel.description || "這個頻道沒有公開說明。"}</p></div><button className="button candidate-action" type="button" onClick={() => void addCandidate(channel)} disabled={unavailable || channel.already_added || actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中…" : channel.already_added ? "已收錄" : channel.excluded ? "重新收錄" : "收錄"}</button></article>;
         })}</div>}
       </section>
+
+      <section className="content-grid">
+        <article className="panel live-panel">
+          <div className="panel-heading"><div><p className="section-kicker">LIVE RADAR</p><h2>直播雷達</h2></div><span>{data.live_videos.length} 個項目</span></div>
+          <div className="live-list">{data.live_videos.length === 0 ? <div className="empty-state"><span>◌</span><strong>目前沒有已知直播</strong><p>完成首次頻道探索和上傳掃描後，直播會出現在這裡。</p></div> : data.live_videos.map((video) => <article className="live-row" key={video.video_id}><a className="live-thumb-link" href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" aria-label={`開啟 ${video.title} 的 YouTube 頁面`}><div className="thumb" style={video.thumbnail_url ? { backgroundImage: `url(${video.thumbnail_url})` } : undefined}><span>{video.live_state === "live" ? "LIVE" : "預定"}</span></div></a><div className="live-copy"><a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer"><strong>{video.title}</strong></a><button type="button" onClick={() => void openChannel(video.channel_id)}>{video.channel_title} · 頻道資料 →</button></div><div className="live-stat"><strong>{video.live_state === "live" ? number(video.current_concurrent) : time(video.scheduled_start)}</strong><span>{video.live_state === "live" ? "目前同接" : "預定開始"}</span></div></article>)}</div>
+        </article>
+
+        <aside className={`panel rules-panel${showSettings ? " editing" : ""}`}>
+          <div className="panel-heading"><div><p className="section-kicker">COLLECTION RULES</p><h2>收錄規則</h2></div><button className="text-button" type="button" onClick={showSettings ? cancelSettings : openSettings} disabled={!connected || savingSettings}>{showSettings ? "取消編輯" : "編輯"}</button></div>
+          {showSettings ? (
+            <form className="settings-form inline-settings-form" onSubmit={(event) => void saveSettings(event)}>
+              <div className="rules-section-heading editable"><strong>可修改設定</strong><span>儲存後摘要立即更新</span></div>
+              <label className="terms-field"><span>大範圍探索字樣</span><textarea value={termsDraft} onChange={(event) => setTermsDraft(event.target.value)} rows={5} /><small>每行一組，最多 12 組。候選頻道也必須在名稱、說明或關鍵字中出現其中一組；台V、台 v、台灣 VTuber 等大小寫與空白差異會自動辨識，不必逐條重複。</small></label>
+              <div className="settings-number-grid">
+                <label><span>最低訂閱數</span><input type="number" min={1} max={10000000} value={settingsDraft.min_subscribers} onChange={(event) => setSettingsDraft({ ...settingsDraft, min_subscribers: Number(event.target.value) })} /></label>
+                <label><span>同接更新頻率</span><select value={settingsDraft.live_poll_seconds} onChange={(event) => setSettingsDraft({ ...settingsDraft, live_poll_seconds: Number(event.target.value) })}>{LIVE_POLL_OPTIONS.map((value) => <option value={value} key={value}>每 {secondsLabel(value)}</option>)}</select></label>
+                <label><span>頻道統計更新</span><select value={settingsDraft.channel_refresh_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, channel_refresh_hours: Number(event.target.value) })}>{CHANNEL_REFRESH_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select></label>
+                <label><span>完整上傳掃描</span><select value={settingsDraft.upload_scan_hours} onChange={(event) => setSettingsDraft({ ...settingsDraft, upload_scan_hours: Number(event.target.value) })}>{UPLOAD_SCAN_OPTIONS.map((value) => <option value={value} key={value}>每 {hoursLabel(value)}</option>)}</select><small>分時開台偵測是系統排程，列在下方唯讀資訊。</small></label>
+                <label><span>公開 API 快照保留</span><select value={settingsDraft.retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, retention_days: Number(event.target.value) })}>{settingsDraft.retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>{settingsDraft.edition === "personal" ? "私人本機版可保留半年至永久；此選項不會出現在對外發布版。" : "對外發布版固定提供 7、14、30 天。"}</small></label>
+                <label><span>我的頻道匯入資料保留</span><select value={settingsDraft.creator_retention_days} onChange={(event) => setSettingsDraft({ ...settingsDraft, creator_retention_days: Number(event.target.value) })}>{settingsDraft.creator_retention_options.map((value) => <option value={value} key={value}>{retentionLabel(value)}</option>)}</select><small>只影響自行匯入的 Studio 報表與手動補充資料；預設永久保存。</small></label>
+              </div>
+              <div className="settings-footer"><p>同接頻率越高，API 請求越多；長期私人資料請定期備份並妥善保護。</p><div className="settings-actions"><button className="button ghost" type="button" onClick={cancelSettings} disabled={savingSettings}>取消</button><button className="button primary" type="submit" disabled={savingSettings}>{savingSettings ? "儲存中…" : "儲存規則"}</button></div></div>
+            </form>
+          ) : (
+            <section className="rules-section" aria-labelledby="editable-rules-title">
+              <div className="rules-section-heading editable"><strong id="editable-rules-title">可修改設定摘要</strong><span>按右上角「編輯」就地調整</span></div>
+              <dl className="rules-list">
+                <div><dt>自述字樣</dt><dd>{data.settings.discovery_terms.join("、")}</dd></div>
+                <div><dt>最低訂閱</dt><dd>{fullNumber(data.settings.min_subscribers)}</dd></div>
+                <div><dt>同接頻率</dt><dd>{data.settings.live_poll_seconds} 秒／批次 50 支</dd></div>
+                <div><dt>頻道更新</dt><dd>每 {data.settings.channel_refresh_hours} 小時</dd></div>
+                <div><dt>完整上傳掃描</dt><dd>每 {data.settings.upload_scan_hours} 小時</dd></div>
+                <div><dt>公開快照保留</dt><dd>{retentionLabel(data.settings.retention_days)}{data.settings.edition === "personal" ? "（私人版）" : "（最長 30 天）"}</dd></div>
+                <div><dt>我的頻道資料</dt><dd>{retentionLabel(data.settings.creator_retention_days)}</dd></div>
+              </dl>
+            </section>
+          )}
+          <section className="rules-system-section" aria-labelledby="readonly-rules-title">
+            <div className="rules-section-heading readonly"><strong id="readonly-rules-title">系統資訊（唯讀）</strong><span>不由這份表單修改</span></div>
+            <dl className="rules-list system-rules-list">
+              <div><dt>分時開台偵測</dt><dd>{data.settings.enhanced_live_scan_times.join("、")}（台北時間）</dd></div>
+              <div><dt>執行模式</dt><dd>{data.settings.edition === "personal" ? "私人本機版" : "對外發布版"}</dd></div>
+              <div><dt>手動排除</dt><dd>{data.excluded_channels} 個黑名單頻道</dd></div>
+            </dl>
+          </section>
+          <div className="rule-note"><strong>配額友善的開台加強偵測已啟用</strong><p>台北時間 18:05～01:05 每小時輕量檢查一次所有已收錄頻道，另於 08:05、12:05、15:05 補掃；「我的頻道」固定優先。發現預告或直播後改由每 {data.settings.live_poll_seconds} 秒更新同接；一般配額接近安全線時，其他頻道會暫停這項加強掃描。</p></div>
+          <div className="rule-note"><strong>{data.settings.edition === "personal" ? "私人版長期保存已開啟" : "公開資料與私人資料分開保存"}</strong><p>{data.settings.edition === "personal" ? "這是你本機專用的設定，不會寫入對外發布版；可自行選擇長期或永久保留公開快照。" : "對外發布版的 YouTube 公開 API 快照最長保留 30 天；較長期限只套用於使用者自行匯入或手動補充的資料。"}</p></div>
+        </aside>
+      </section>
+
+      {showRetentionWarning && <div className="modal-backdrop" role="presentation"><section className="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="retention-warning-title"><p className="section-kicker">LOCAL DATA RETENTION</p><h2 id="retention-warning-title">確認私人版長期保存設定</h2><p>公開快照將保存 {retentionLabel(settingsDraft.retention_days)}；Studio／手動資料將保存 {retentionLabel(settingsDraft.creator_retention_days)}。</p><ul><li>這項設定只套用於你的私人本機版，不會帶進未來的對外發布版。</li><li>期限越長，資料庫容量、備份與隱私保護責任越高。</li><li>日後縮短期限時，排程清理的舊資料無法復原，請先備份。</li></ul><label className="consent-check"><input type="checkbox" checked={retentionAcknowledged} onChange={(event) => setRetentionAcknowledged(event.target.checked)} /><span>我了解並要在私人本機版使用這項長期保存設定</span></label><div className="dialog-actions"><button className="button ghost" type="button" onClick={() => setShowRetentionWarning(false)}>返回調整</button><button className="button primary" type="button" disabled={!retentionAcknowledged || savingSettings} onClick={() => { setShowRetentionWarning(false); void persistSettings(); }}>{savingSettings ? "儲存中…" : "確認並儲存"}</button></div></section></div>}
 
       {classificationChannel && <div className="modal-backdrop" role="presentation"><section className="confirmation-dialog classification-dialog" role="dialog" aria-modal="true" aria-labelledby="classification-title"><p className="section-kicker">CHANNEL CLASSIFICATION</p><h2 id="classification-title">設定 {classificationChannel.title} 的頻道資料</h2><p>這些欄位是本機分析用，不會寫回 YouTube，也不會消耗 API 配額。勢別與活動狀態分開保存，例如企業勢仍可同時標記為活動中或已確認畢業。</p><form onSubmit={(event) => void saveClassification(event)}><div className="classification-grid"><label><span>勢別分類</span><select value={classificationCategory} onChange={(event) => setClassificationCategory(event.target.value)}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select></label><label><span>活動狀態</span><select value={classificationActivity} onChange={(event) => setClassificationActivity(event.target.value)}><option>自動判斷</option><option>活動中</option><option>休止中</option><option>疑似已畢業</option><option>已確認畢業</option><option>狀態不明</option></select></label><label><span>所屬企業／團體</span><input value={classificationOrganization} onChange={(event) => setClassificationOrganization(event.target.value)} placeholder="例如：子午計畫" maxLength={80} /></label><label><span>自訂標籤</span><input value={classificationTags} onChange={(event) => setClassificationTags(event.target.value)} placeholder="例如：歌勢、遊戲、同期生" /></label></div><div className="dialog-actions"><button className="button ghost" type="button" onClick={() => setClassificationChannel(null)}>稍後分類</button><button className="button primary" type="submit" disabled={actingChannelId === classificationChannel.channel_id}>{actingChannelId === classificationChannel.channel_id ? "儲存中…" : "儲存分類"}</button></div></form></section></div>}
 
@@ -839,6 +1003,47 @@ export default function Dashboard() {
             <td>{number(channel.subscriber_count)}</td><td>{number(channel.view_count)}</td><td>{number(channel.video_count)}</td><td><span className="evidence">{channel.match_term ?? "待確認"}</span><small className="excerpt">{channel.match_excerpt ?? "—"}</small></td><td>{ago(channel.updated_at)}</td><td><button className="danger-button" type="button" onClick={() => void excludeChannel(channel)} disabled={actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中" : "排除"}</button></td>
           </tr>)}
         </tbody></table></div>
+      </section>
+
+      <section className={`panel public-transfer-panel${publicTransferExpanded ? " expanded" : ""}`} aria-labelledby="public-transfer-title">
+        <div className="panel-heading public-transfer-summary"><div><p className="section-kicker">PUBLIC DATA TRANSFER</p><h2 id="public-transfer-title">公開監測資料搬遷</h2><p>低頻進階工具 · 版本化 ZIP，匯入前先檢查</p></div><button className="text-button" type="button" aria-expanded={publicTransferExpanded} aria-controls="public-transfer-content" onClick={() => setShowPublicTransfer((value) => !value)} disabled={publicTransferMustStayOpen}>{publicTransferMustStayOpen ? "目前需保持展開" : publicTransferExpanded ? "收合" : "展開搬遷工具"}</button></div>
+        {publicTransferExpanded && <div id="public-transfer-content" className="public-transfer-content">
+          <div className="public-transfer-grid">
+            <article className="transfer-column">
+              <div className="transfer-heading"><strong>匯出公開監測資料</strong><span>只輸出明確白名單，不是整份 SQLite</span></div>
+              <p>包含已收錄頻道、頻道快照、影片、影片快照、直播同接樣本，以及分類／遊戲名稱人工修正。</p>
+              <div className="transfer-options" aria-label="公開資料匯出選項">
+                <label><input type="checkbox" checked={includeTransferBlacklist} onChange={(event) => setIncludeTransferBlacklist(event.target.checked)} /><span><strong>包含黑名單</strong><small>搬移手動排除的 Channel ID、標題、原因與時間。</small></span></label>
+                <label><input type="checkbox" checked={includeTransferEvidence} onChange={(event) => setIncludeTransferEvidence(event.target.checked)} /><span><strong>包含收錄來源證據</strong><small>包含已收錄頻道的命中字樣、欄位與公開文字摘錄。</small></span></label>
+              </div>
+              <button className="button primary" type="button" onClick={() => void exportPublicData()} disabled={!connected || exportingPublicData}>{exportingPublicData ? "建立資料包中…" : "匯出公開監測 ZIP"}</button>
+              <div className="transfer-boundary"><strong>絕不包含</strong><p>.env／API Key、OAuth JSON／token、work/oauth、私人 OAuth Analytics、Studio 匯入、手動補值、工作區選擇、個人設定或候選審核紀錄。</p></div>
+            </article>
+
+            <article className="transfer-column">
+              <div className="transfer-heading"><strong>預覽並匯入</strong><span>上限 256 MB；先驗證版本、筆數、SHA-256 與資料關聯</span></div>
+              <label className="transfer-file-input"><span>選擇台V Pulse 公開監測 ZIP</span><input type="file" accept=".zip,application/zip" disabled={!connected || previewingPublicData || importingPublicData} onChange={(event) => { const file = event.target.files?.[0]; if (file) void previewPublicData(file); }} /><small>不支援整個 work/、SQLite、診斷 ZIP 或其他匯出格式。</small></label>
+              {previewingPublicData && <div className="transfer-progress">正在讀取 manifest 並執行完整性檢查…</div>}
+              {publicDataPreview && <div className="transfer-preview">
+                <div className="preview-meta"><span>格式版本 <strong>v{publicDataPreview.format_version}</strong></span><span>建立時間 <strong>{time(publicDataPreview.created_at)}</strong></span><span>來源程式 <strong>{publicDataPreview.producer_version}</strong></span></div>
+                <div className="preview-counts">
+                  <span><strong>{fullNumber(publicDataPreview.counts.channels)}</strong>頻道</span><span><strong>{fullNumber(publicDataPreview.counts.videos)}</strong>影片</span><span><strong>{fullNumber(publicDataPreview.counts.channel_snapshots)}</strong>頻道快照</span><span><strong>{fullNumber(publicDataPreview.counts.video_snapshots)}</strong>影片快照</span><span><strong>{fullNumber(publicDataPreview.counts.concurrency_samples)}</strong>同接樣本</span><span><strong>{fullNumber(publicDataPreview.counts.video_classification_overrides)}</strong>人工修正</span><span><strong>{publicDataPreview.options.include_blacklist ? fullNumber(publicDataPreview.counts.excluded_channels) : "未包含"}</strong>黑名單</span><span><strong>{publicDataPreview.options.include_source_evidence ? "已包含" : "未包含"}</strong>來源證據</span>
+                </div>
+                <ul className="integrity-checks">{publicDataPreview.checks.map((check) => <li key={check.key}><span aria-hidden="true">✓</span>{check.message}</li>)}</ul>
+                {publicDataPreview.warnings.map((warning) => <p className="transfer-warning" key={warning}>{warning}</p>)}
+              </div>}
+              <fieldset className="transfer-modes" disabled={!publicDataPreview?.valid || importingPublicData}>
+                <legend>選擇匯入方式</legend>
+                <label className={publicDataMode === "merge" ? "selected" : ""}><input type="radio" name="public-data-mode" value="merge" checked={publicDataMode === "merge"} onChange={() => { setPublicDataMode("merge"); setReplacePublicDataAcknowledged(false); }} /><span><strong>合併（建議）</strong><small>新增缺少資料；相同頻道／影片保留更新時間較新的版本，歷史快照依 ID 與時間去重。</small></span></label>
+                <label className={publicDataMode === "replace" ? "selected danger" : ""}><input type="radio" name="public-data-mode" value="replace" checked={publicDataMode === "replace"} onChange={() => { setPublicDataMode("replace"); setReplacePublicDataAcknowledged(false); }} /><span><strong>取代本機公開監測資料</strong><small>清除本機公開快照、影片、同接、人工影片分類及已收錄公開頻道，再寫入此包；不刪私人 OAuth／Studio／手動補值、工作區選擇或個人設定。</small></span></label>
+              </fieldset>
+              {publicDataMode === "replace" && publicDataPreview && <label className="consent-check transfer-consent"><input type="checkbox" checked={replacePublicDataAcknowledged} onChange={(event) => setReplacePublicDataAcknowledged(event.target.checked)} /><span>我了解取代只針對公開監測資料；資料包未含黑名單時會保留本機黑名單，有私人資料引用的頻道也會保留為工作區基礎資料。</span></label>}
+              <button className={`button ${publicDataMode === "replace" ? "danger-button" : "primary"}`} type="button" onClick={() => void importPublicData()} disabled={!publicDataPreview?.valid || !publicDataFile || importingPublicData || (publicDataMode === "replace" && !replacePublicDataAcknowledged)}>{importingPublicData ? "匯入中，請勿關閉…" : publicDataMode === "merge" ? "合併公開監測資料" : "取代本機公開監測資料"}</button>
+              <p className="transfer-api-note">匯入既有公開歷史不需要來源電腦的憑證；後續更新仍須在這台電腦自行設定 YouTube API Key。</p>
+            </article>
+          </div>
+          {publicDataMessage && <div className="inline-message transfer-message" role="status">{publicDataMessage}</div>}
+        </div>}
       </section>
 
       <LegalFooter context="僅在你的電腦運作" note="資料來源：YouTube Data API" />

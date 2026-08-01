@@ -7,6 +7,8 @@ $startScript = Join-Path $projectRoot 'start-local.ps1'
 $requirementsPath = Join-Path $projectRoot 'requirements.txt'
 $uninstallScript = Join-Path $projectRoot 'uninstall.ps1'
 $launcherSource = Join-Path $projectRoot 'windows\TaiVPulseLauncher.cs'
+$installerSource = Join-Path $projectRoot 'windows\TaiVPulseInstaller.cs'
+$installerBuildScript = Join-Path $projectRoot 'scripts\build-windows-installer.ps1'
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("tai-v-pulse-startup-test-$([Guid]::NewGuid().ToString('N'))")
 $originalPythonPath = [System.Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
 
@@ -49,13 +51,22 @@ try {
     Assert-True -Condition ($uninstallParseErrors.Count -eq 0) -Message 'uninstall.ps1 無法由 Windows PowerShell parser 解析。'
     $uninstallSource = Get-Content -LiteralPath $uninstallScript -Raw -Encoding UTF8
     $launcherText = Get-Content -LiteralPath $launcherSource -Raw -Encoding UTF8
+    $installerText = Get-Content -LiteralPath $installerSource -Raw -Encoding UTF8
+    $installerBuildText = Get-Content -LiteralPath $installerBuildScript -Raw -Encoding UTF8
     Assert-True -Condition $uninstallSource.Contains('[switch]$RemoveData') -Message '解除安裝腳本缺少永久刪除資料選項。'
     Assert-True -Condition $uninstallSource.Contains('PreservedData-') -Message '解除安裝腳本缺少資料保留路徑。'
     Assert-True -Condition $launcherText.Contains('解除安裝') -Message 'Windows 啟動器缺少解除安裝入口。'
     Assert-True -Condition $launcherText.Contains('UseShellExecute = true') -Message 'Windows 啟動器未使用 Shell 開啟預設瀏覽器。'
     Assert-True -Condition $launcherText.Contains('HandleStartupOutput') -Message 'Windows 啟動器未在服務就緒訊息出現時開啟網頁。'
     Assert-True -Condition $launcherText.Contains('後台動態：') -Message 'Windows 啟動器缺少後台工作狀態。'
+    Assert-True -Condition $launcherText.Contains('hourly-live-scan') -Message 'Windows 啟動器缺少整點開台偵測工作標籤。'
     Assert-True -Condition (-not $launcherText.Contains('UseWaitCursor = value')) -Message 'Windows 啟動器仍會把整個介面切成等待游標。'
+    Assert-True -Condition $launcherText.Contains('while (!process.WaitForExit(250))') -Message 'Windows 啟動器未使用有限等待確認啟動腳本結束。'
+    Assert-True -Condition (-not $launcherText.Contains('process.WaitForExit();')) -Message 'Windows 啟動器仍可能無期限等待長時間服務保留的輸出管線。'
+    Assert-True -Condition $launcherText.Contains('process.CancelOutputRead()') -Message 'Windows 啟動器未在腳本結束後釋放標準輸出讀取。'
+    Assert-True -Condition $installerText.Contains('"TaiVPulse-" + Version + ".ico"') -Message 'Windows 安裝器未使用版本化的最新版捷徑圖示。'
+    Assert-True -Condition $installerText.Contains('iconPath + ",0"') -Message 'Windows 捷徑未明確指定最新版圖示檔。'
+    Assert-True -Condition $installerBuildText.Contains('$installedIconName = "TaiVPulse-$version.ico"') -Message 'Windows 安裝包未帶入版本化的最新版圖示檔。'
 
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $fakePython = Join-Path $testRoot 'fake-python.cmd'

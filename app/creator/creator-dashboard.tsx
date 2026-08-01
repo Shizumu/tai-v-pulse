@@ -110,6 +110,8 @@ type AnalyticsRow = {
   content_format: string;
   content_topic: string;
   classification_source: string;
+  classification_evidence: string;
+  game_name: string;
 };
 
 type AnalyticsPayload = {
@@ -185,7 +187,7 @@ type OAuthData = {
   };
   summary: { date_start: string; date_end: string; synced_at: string; metrics: OAuthMetrics } | null;
   daily: { event_date: string; synced_at: string; metrics: OAuthMetrics }[];
-  videos: { video_id: string; title: string | null; thumbnail_url: string | null; published_at: string | null; synced_at: string; metrics: OAuthMetrics }[];
+  videos: { video_id: string; title: string | null; thumbnail_url: string | null; published_at: string | null; live_at: string | null; content_date: string | null; synced_at: string; metrics: OAuthMetrics }[];
 };
 
 type CreatorData = {
@@ -310,6 +312,10 @@ function dateTime(value: string | null | undefined) {
   return new Intl.DateTimeFormat("zh-TW", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Taipei" }).format(new Date(value));
 }
 
+function openYouTubeVideo(videoId: string) {
+  window.open(`https://www.youtube.com/watch?v=${videoId}`, "_blank", "noopener,noreferrer");
+}
+
 async function filePayload(file: File) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   let binary = "";
@@ -362,6 +368,8 @@ export default function CreatorDashboard() {
   const [analyticsDirection, setAnalyticsDirection] = useState<"asc" | "desc">("desc");
   const [analyticsPage, setAnalyticsPage] = useState(1);
   const [analyticsPageSize, setAnalyticsPageSize] = useState(50);
+  const [workspaceMode, setWorkspaceMode] = useState<"personal" | "team">("personal");
+  const [oauthManagerOpen, setOauthManagerOpen] = useState(false);
   const [oauthBusy, setOauthBusy] = useState(false);
   const [oauthSyncing, setOauthSyncing] = useState(false);
 
@@ -378,6 +386,9 @@ export default function CreatorDashboard() {
       ]);
       setSummary(summaryPayload);
       setCreator(creatorPayload);
+      if (creatorPayload.oauth.status.last_error || creatorPayload.oauth.status.last_error_help) {
+        setOauthManagerOpen(true);
+      }
       setConnected(true);
       setAnalyticsRevision((current) => current + 1);
     } catch (error) {
@@ -405,6 +416,9 @@ export default function CreatorDashboard() {
         const payload = await response.json() as CreatorData;
         if (stopped) return;
         setCreator(payload);
+        if (payload.oauth.status.last_error || payload.oauth.status.last_error_help) {
+          setOauthManagerOpen(true);
+        }
         if (payload.oauth.status.syncing) {
           timer = window.setTimeout(() => void poll(), 2000);
           return;
@@ -887,7 +901,12 @@ export default function CreatorDashboard() {
       videos: current.videos + Number(channel.video_count ?? 0),
       subscriberDelta: current.subscriberDelta + Number(channel.subscriber_count_delta_30d ?? 0),
     }), { subscribers: 0, views: 0, videos: 0, subscriberDelta: 0 });
-    return { ...totals, subscriberDelta: channels.length > 0 && channels.every((channel) => channel.month_ready) ? totals.subscriberDelta : null };
+    return {
+      subscribers: channels.length > 0 && channels.every((channel) => channel.subscriber_count !== null) ? totals.subscribers : null,
+      views: channels.length > 0 && channels.every((channel) => channel.view_count !== null) ? totals.views : null,
+      videos: channels.length > 0 && channels.every((channel) => channel.video_count !== null) ? totals.videos : null,
+      subscriberDelta: channels.length > 0 && channels.every((channel) => channel.month_ready) ? totals.subscriberDelta : null,
+    };
   }, [creator?.workspace_channels]);
   const publicDelta = useMemo(() => {
     const snapshots = creator?.public?.snapshots ?? [];
@@ -911,31 +930,42 @@ export default function CreatorDashboard() {
       {message && <section className="inline-message">{message}</section>}
       {loading && <section className="panel creator-placeholder">正在整理你的頻道資料…</section>}
 
-      {!loading && creator && <section className="panel oauth-connect-panel">
-        <div className="panel-heading"><div><p className="section-kicker">DIRECT READ-ONLY CONNECTION</p><h2>直接連結我的 YouTube 頻道</h2></div><span>{oauthSyncing || creator.oauth.status.syncing ? "同步中…" : creator.oauth.status.connected ? "已連線 · 每日自動同步" : creator.oauth.status.configured ? "等待 Google 授權" : "尚未設定"}</span></div>
-        <div className="oauth-security-note"><strong>只讀取，不代替你操作頻道</strong><p>只申請 YouTube 帳戶唯讀與 Analytics 唯讀權限；不能上傳、刪除、修改影片，也不讀取收益。OAuth 設定與 token 只在這台 Windows 電腦以 DPAPI 加密保存。</p></div>
-        {!creator.oauth.status.configured && <div className="oauth-setup-grid"><div><strong>1. 建立自己的桌面應用程式 OAuth</strong><p>在 Google Cloud 啟用 YouTube Data API v3 與 YouTube Analytics API，建立「桌面應用程式」OAuth 用戶端，再下載 JSON。</p><a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">開啟 Google Cloud 憑證頁 ↗</a></div><label className="oauth-file-button"><span>2. 匯入 OAuth JSON</span><input type="file" accept=".json,application/json" onChange={(event) => void configureOAuth(event)} disabled={oauthBusy} /><strong>{oauthBusy ? "加密保存中…" : "選擇 JSON 檔"}</strong></label></div>}
-        {creator.oauth.status.configured && !creator.oauth.status.connected && <div className="oauth-actions"><div><strong>OAuth 設定已加密保存</strong><p>下一步會在 Google 官方頁面登入並確認兩項唯讀權限。完成後 Google 將導回本機服務。</p></div><button className="button primary" type="button" onClick={connectOAuth} disabled={oauthBusy}>連結我的 YouTube 頻道</button><button className="button ghost" type="button" onClick={() => void deleteOAuthClient()} disabled={oauthBusy}>刪除設定</button></div>}
-        {creator.oauth.status.connected && <div className="oauth-connected-row"><div className="oauth-channel"><span className="state-badge">已連線</span><div><strong>{creator.oauth.status.channel?.title}</strong><p>{oauthSyncing || creator.oauth.status.syncing ? `同步開始：${dateTime(creator.oauth.status.sync_started_at)}` : `最近同步：${dateTime(creator.oauth.status.last_sync_at)} · 資料到 ${creator.oauth.status.last_data_date ?? "尚未取得"}`}</p></div></div><div className="oauth-action-buttons"><button className="button primary" type="button" onClick={() => void syncOAuth()} disabled={oauthBusy || oauthSyncing || creator.oauth.status.syncing}>{oauthSyncing || creator.oauth.status.syncing ? "同步中…" : "立即同步"}</button><button className="danger-button" type="button" onClick={() => void disconnectOAuth()} disabled={oauthBusy || oauthSyncing || creator.oauth.status.syncing}>中斷並刪除同步資料</button></div></div>}
-        {creator.oauth.status.last_error_help && <section className="oauth-error" role="status"><strong>{creator.oauth.status.last_error_help.title}</strong><p>{creator.oauth.status.last_error_help.message}</p><ol>{creator.oauth.status.last_error_help.steps.map((step) => <li key={step}>{step}</li>)}</ol>{creator.oauth.status.last_error_help.help_url && creator.oauth.status.last_error_help.help_label && <a href={creator.oauth.status.last_error_help.help_url} target="_blank" rel="noreferrer">{creator.oauth.status.last_error_help.help_label} ↗</a>}<details><summary>查看 Google 技術細節</summary><code>{creator.oauth.status.last_error}</code></details></section>}
-        <details className="oauth-troubleshooting"><summary><span><strong>連線或同步遇到問題？</strong><small>403、API 未啟用、七天後失效、沒資料與按鈕狀態</small></span><i>查看解法</i></summary><div className="oauth-troubleshooting-grid"><article><strong>403：應用程式未完成驗證</strong><p>在建立 OAuth JSON 的同一個專案，進入 Google Auth Platform「目標對象」，把目前登入的完整 Google 帳號加入測試使用者。專案擁有者也不一定會自動加入。</p><a href="https://console.cloud.google.com/auth/audience" target="_blank" rel="noreferrer">設定測試使用者 ↗</a></article><article><strong>Analytics API 尚未啟用</strong><p>OAuth 成功不代表 Analytics API 已啟用。確認同一專案同時啟用 YouTube Data API v3 與 YouTube Analytics API，等待 1～5 分鐘再同步。</p><a href="https://console.cloud.google.com/apis/library/youtubeanalytics.googleapis.com" target="_blank" rel="noreferrer">啟用 Analytics API ↗</a></article><article><strong>七天後突然失效</strong><p>Google OAuth 若仍是「測試」發布狀態，refresh token 通常七天後失效。重新連線可暫時恢復；長期每日同步需將發布狀態改為正式環境。</p></article><article><strong>已連線但沒有資料</strong><p>先等待目前同步完成；Google 尚未產生可用報表列、頻道較新或期間沒有活動時可能仍顯示「—」。這不是 0，也不會用猜測值補上。</p></article><article><strong>匯入了錯誤專案的 JSON</strong><p>先中斷連線，再刪除 OAuth 設定，改匯入已啟用兩個 YouTube API 的正確桌面應用程式 JSON。不要編輯 JSON 或把它傳給別人。</p></article><article><strong>按立即同步像沒反應</strong><p>按下後會持續顯示「同步中…」並每兩秒確認狀態；完成後顯示資料日期，失敗則顯示繁中原因、操作步驟與可展開的技術原文。</p></article></div></details>
-        <p className="panel-footnote">若 Google OAuth 同意畫面仍為「測試」狀態，refresh token 通常會在 7 天後失效；個人使用請在 Google Cloud 將應用程式發布到正式環境。不要把下載的 OAuth JSON 分享或放進 Git。</p>
+      {!loading && creator && <section className="panel workspace-mode-panel">
+        <div><p className="section-kicker">WORKSPACE VIEW</p><h2>先看個人頻道，或切到團隊總覽</h2><p>模式只切換上方公開摘要；目前選取頻道、篩選條件與下方展開內容都會保留。</p></div>
+        <div className="workspace-mode-switch" role="group" aria-label="工作區檢視模式">
+          <button className={workspaceMode === "personal" ? "active" : ""} type="button" aria-pressed={workspaceMode === "personal"} onClick={() => setWorkspaceMode("personal")}><strong>個人</strong><span>目前頻道資料</span></button>
+          <button className={workspaceMode === "team" ? "active" : ""} type="button" aria-pressed={workspaceMode === "team"} onClick={() => setWorkspaceMode("team")}><strong>團隊</strong><span>{creator.workspace_channels.length} 個管理頻道</span></button>
+        </div>
+      </section>}
+
+      {!loading && creator && workspaceMode === "personal" && (creator.channel ? <>
+        <section className="panel creator-profile">
+          <div className="creator-identity">{creator.channel.thumbnail_url ? <img src={creator.channel.thumbnail_url} alt="" /> : <span>V</span>}<div><p className="section-kicker">{creator.channel.category}{creator.channel.organization_name ? ` · ${creator.channel.organization_name}` : ""}</p><h2>{creator.channel.title}</h2><p>{creator.channel.handle ?? creator.channel.channel_id}</p><div className="tag-row">{creator.channel.manual_tags.map((tag) => <i key={tag}>#{tag}</i>)}</div></div></div>
+          <a className="button external-button" href={creator.channel.handle ? `https://www.youtube.com/${creator.channel.handle}` : `https://www.youtube.com/channel/${creator.channel.channel_id}`} target="_blank" rel="noreferrer">開啟 YouTube ↗</a>
+        </section>
+        <section className="creator-public-grid">
+          <article className="insight-hero primary"><span>公開訂閱</span><strong>{compact(creator.channel.subscriber_count)}</strong><p>監測首頁 · {dateTime(creator.channel.last_stats_at)}</p></article>
+          <article className="insight-hero"><span>頻道總觀看</span><strong>{compact(creator.channel.view_count)}</strong><p>公開累積值</p></article>
+          <article className="insight-hero"><span>公開影片數</span><strong>{compact(creator.channel.video_count)}</strong><p>目前 YouTube API 統計</p></article>
+          <article className="insight-hero"><span>歷史最高同接</span><strong>{compact(creator.public?.peak_concurrent)}</strong><p>{exact(creator.public?.concurrency_sample_count)} 個同接資料點</p></article>
+        </section>
+      </> : <section className="panel workspace-mode-empty"><strong>尚未選定個人頻道</strong><p>從下方管理區加入監測中的頻道，或使用私人 Analytics 連線自動辨識自己的頻道。</p><button className="button primary" type="button" onClick={() => document.getElementById("creator-channel-management")?.scrollIntoView({ behavior: "smooth", block: "start" })}>前往加入頻道</button></section>)}
+
+      {!loading && creator && workspaceMode === "team" && <section className="panel workspace-overview-panel">
+        <div className="panel-heading"><div><p className="section-kicker">MANAGED CHANNELS</p><h2>管理頻道與團隊比較</h2></div><span>{creator.workspace_channels.length} 個頻道 · 全部為公開監測統計</span></div>
+        {creator.workspace_channels.length > 0 && <><div className="workspace-total-grid"><article><span>合計訂閱</span><strong>{compact(workspaceTotals.subscribers)}</strong><small>30天 {signed(workspaceTotals.subscriberDelta)}</small></article><article><span>合計觀看</span><strong>{compact(workspaceTotals.views)}</strong><small>公開累積值</small></article><article><span>合計影片</span><strong>{compact(workspaceTotals.videos)}</strong><small>包含直播存檔</small></article></div>
+        <div className="workspace-channel-grid">{creator.workspace_channels.map((channel) => <article className={channel.channel_id === creator.owned_channel_id ? "active" : ""} key={channel.channel_id}><button className="workspace-channel-main" type="button" onClick={() => void selectWorkspaceChannel(channel.channel_id)} disabled={savingChannel}>{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="workspace-avatar">V</span>}<span><b>{channel.title}</b><small>{channel.organization_name || channel.category} · {channel.activity_status ?? "狀態不明"}</small></span>{channel.channel_id === creator.owned_channel_id && <i>目前查看</i>}</button><dl><div><dt>訂閱</dt><dd>{compact(channel.subscriber_count)}</dd></div><div><dt>30天變化</dt><dd>{signed(channel.subscriber_count_delta_30d)}</dd></div><div><dt>近30天內容</dt><dd>{exact(channel.recent_content_count_30d)}</dd></div><div><dt>最高同接</dt><dd>{compact(channel.peak_concurrent)}</dd></div></dl><button className="workspace-remove" type="button" onClick={() => void removeWorkspaceChannel(channel)} disabled={savingChannel}>移出工作區</button></article>)}</div>
+        <div className="table-wrap workspace-comparison-table"><table><thead><tr><th>頻道</th><th>訂閱</th><th>30天訂閱</th><th>總觀看</th><th>30天觀看</th><th>近30天內容</th><th>最高同接</th><th>資料點</th></tr></thead><tbody>{creator.workspace_channels.map((channel) => <tr key={channel.channel_id}><td><strong>{channel.title}</strong><small className="table-subline">{channel.organization_name || channel.category}</small></td><td>{exact(channel.subscriber_count)}</td><td>{signed(channel.subscriber_count_delta_30d)}</td><td>{compact(channel.view_count)}</td><td>{signed(channel.view_count_delta_30d)}</td><td>{exact(channel.recent_content_count_30d)}</td><td>{exact(channel.peak_concurrent)}</td><td>{exact(channel.concurrency_sample_count)}</td></tr>)}</tbody></table></div></>}
+        <div className="workspace-team-add"><div><strong>{creator.workspace_channels.length === 0 ? "先加入第一個管理頻道" : "繼續擴充團隊"}</strong><p>新增只沿用公開監測資料；私人 OAuth、Studio 與手動補值仍各自綁定選取頻道。</p></div><button className="button primary" type="button" onClick={() => document.getElementById("creator-channel-management")?.scrollIntoView({ behavior: "smooth", block: "start" })}>加入管理頻道</button></div>
       </section>}
 
       {!loading && summary && (creator?.workspace_channels.length ?? 0) === 0 && <section className="panel creator-onboarding">
-        <div className="onboarding-heading"><p className="section-kicker">START HERE</p><h2>先連結自己的頻道，或加入團隊管理頻道</h2><p>個人可用上方 OAuth 唯讀連線自動辨識自己的頻道；企業 STAFF 仍可加入多位藝人。工作區沿用監測首頁同一筆公開紀錄，私人來源各自分開保存。</p></div>
+        <div className="onboarding-heading"><p className="section-kicker">START HERE</p><h2>先連結自己的頻道，或加入團隊管理頻道</h2><p>個人可用下方 OAuth 唯讀連線自動辨識自己的頻道；企業 STAFF 仍可加入多位藝人。工作區沿用監測首頁同一筆公開紀錄，私人來源各自分開保存。</p></div>
         <ol><li><strong>1</strong><span>連結自己或加入管理頻道</span></li><li><strong>2</strong><span>立即沿用公開監測與歷史快照</span></li><li><strong>3</strong><span>每日同步自己的私人 Analytics</span></li></ol>
         <div className="data-flow"><span>公開監測資料</span><b>＋</b><span>OAuth 私人 Analytics</span><b>→</b><strong>團隊比較與個別分析</strong></div>
       </section>}
 
-      {!loading && creator && creator.workspace_channels.length > 0 && <section className="panel workspace-overview-panel">
-        <div className="panel-heading"><div><p className="section-kicker">MANAGED CHANNELS</p><h2>管理頻道與團隊比較</h2></div><span>{creator.workspace_channels.length} 個頻道 · 點選卡片切換詳細資料</span></div>
-        <div className="workspace-total-grid"><article><span>合計訂閱</span><strong>{compact(workspaceTotals.subscribers)}</strong><small>30天 {signed(workspaceTotals.subscriberDelta)}</small></article><article><span>合計觀看</span><strong>{compact(workspaceTotals.views)}</strong><small>公開累積值</small></article><article><span>合計影片</span><strong>{compact(workspaceTotals.videos)}</strong><small>包含直播存檔</small></article></div>
-        <div className="workspace-channel-grid">{creator.workspace_channels.map((channel) => <article className={channel.channel_id === creator.owned_channel_id ? "active" : ""} key={channel.channel_id}><button className="workspace-channel-main" type="button" onClick={() => void selectWorkspaceChannel(channel.channel_id)} disabled={savingChannel}>{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="workspace-avatar">V</span>}<span><b>{channel.title}</b><small>{channel.organization_name || channel.category} · {channel.activity_status ?? "狀態不明"}</small></span>{channel.channel_id === creator.owned_channel_id && <i>目前查看</i>}</button><dl><div><dt>訂閱</dt><dd>{compact(channel.subscriber_count)}</dd></div><div><dt>30天變化</dt><dd>{signed(channel.subscriber_count_delta_30d)}</dd></div><div><dt>近30天內容</dt><dd>{exact(channel.recent_content_count_30d)}</dd></div><div><dt>最高同接</dt><dd>{compact(channel.peak_concurrent)}</dd></div></dl><button className="workspace-remove" type="button" onClick={() => void removeWorkspaceChannel(channel)} disabled={savingChannel}>移出工作區</button></article>)}</div>
-        <div className="table-wrap workspace-comparison-table"><table><thead><tr><th>頻道</th><th>訂閱</th><th>30天訂閱</th><th>總觀看</th><th>30天觀看</th><th>近30天內容</th><th>最高同接</th><th>資料點</th></tr></thead><tbody>{creator.workspace_channels.map((channel) => <tr key={channel.channel_id}><td><strong>{channel.title}</strong><small className="table-subline">{channel.organization_name || channel.category}</small></td><td>{exact(channel.subscriber_count)}</td><td>{signed(channel.subscriber_count_delta_30d)}</td><td>{compact(channel.view_count)}</td><td>{signed(channel.view_count_delta_30d)}</td><td>{exact(channel.recent_content_count_30d)}</td><td>{exact(channel.peak_concurrent)}</td><td>{exact(channel.concurrency_sample_count)}</td></tr>)}</tbody></table></div>
-      </section>}
-
-      {!loading && summary && <section className="panel creator-channel-picker">
+      {!loading && summary && <section className="panel creator-channel-picker" id="creator-channel-management">
         <div><p className="section-kicker">ADD MANAGED CHANNEL</p><h2>從監測首頁加入管理頻道</h2><p>已經收錄的頻道會直接沿用現有數據，不會複製或重新消耗 API；加入後可在上方卡片切換。</p></div>
         <label><span>尚未加入工作區的頻道</span><select value={channelChoice} onChange={(event) => setChannelChoice(event.target.value)}><option value="">請選擇頻道</option>{availableChannels.map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)} 訂閱</option>)}</select></label>
         <button className="button primary" type="button" onClick={() => void saveOwnedChannel()} disabled={!channelChoice || savingChannel}>{savingChannel ? "加入中…" : "加入工作區"}</button>
@@ -948,19 +978,24 @@ export default function CreatorDashboard() {
         <p className="panel-footnote">你也可以回到 <Link href="/">監測首頁</Link> 先確認公開資料。URL、@handle 與 Channel ID 不使用搜尋配額。</p>
       </section>}
 
+      {!loading && creator && <section className={`panel oauth-connect-panel${creator.oauth.status.last_error ? " has-error" : ""}`}>
+        <div className="panel-heading"><div><p className="section-kicker">PRIVATE ANALYTICS CONNECTION</p><h2>私人 Analytics 連線</h2></div><span>{oauthSyncing || creator.oauth.status.syncing ? "同步中…" : creator.oauth.status.connected ? "已連線 · 每日自動同步" : creator.oauth.status.configured ? "等待 Google 授權" : "尚未設定"}</span></div>
+        <div className="oauth-connection-summary">
+          <div className="oauth-channel"><span className={creator.oauth.status.last_error ? "error-badge" : creator.oauth.status.connected ? "state-badge" : "muted-badge"}>{creator.oauth.status.last_error ? "需要處理" : creator.oauth.status.connected ? "已連線" : "未連線"}</span><div><strong>{creator.oauth.status.channel?.title ?? "直接連結我的 YouTube 頻道"}</strong><p>{creator.oauth.status.connected ? `${creator.oauth.status.last_data_date ? `資料到 ${creator.oauth.status.last_data_date}` : "資料累積中"} · 每日自動同步${creator.oauth.status.last_sync_at ? ` · 最近同步 ${dateTime(creator.oauth.status.last_sync_at)}` : ""}` : creator.oauth.status.configured ? "OAuth JSON 已加密保存，可繼續 Google 唯讀授權。" : "設定自己的 OAuth JSON 後，才會讀取私人 Analytics。"}</p></div></div>
+          <div className="oauth-action-buttons">{creator.oauth.status.connected && <button className="button primary" type="button" onClick={() => void syncOAuth()} disabled={oauthBusy || oauthSyncing || creator.oauth.status.syncing}>{oauthSyncing || creator.oauth.status.syncing ? "同步中…" : "立即同步"}</button>}{creator.oauth.status.configured && !creator.oauth.status.connected && <button className="button primary" type="button" onClick={connectOAuth} disabled={oauthBusy}>繼續 Google 授權</button>}<button className="button ghost" type="button" aria-expanded={oauthManagerOpen} aria-controls="oauth-connection-management" onClick={() => setOauthManagerOpen((current) => !current)}>{oauthManagerOpen ? "收合連線管理" : creator.oauth.status.configured ? "管理連線" : "設定私人分析連線"}</button></div>
+        </div>
+        {oauthManagerOpen && <div className="oauth-management" id="oauth-connection-management">
+          <div className="oauth-security-note"><strong>只讀取，不代替你操作頻道</strong><p>只申請 YouTube 帳戶唯讀與 Analytics 唯讀權限；不能上傳、刪除、修改影片，也不讀取收益。OAuth 設定與 token 只在這台 Windows 電腦以 DPAPI 加密保存。</p></div>
+          {!creator.oauth.status.configured && <div className="oauth-setup-grid"><div><strong>1. 建立自己的桌面應用程式 OAuth</strong><p>在 Google Cloud 啟用 YouTube Data API v3 與 YouTube Analytics API，建立「桌面應用程式」OAuth 用戶端，再下載 JSON。</p><a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">開啟 Google Cloud 憑證頁 ↗</a></div><label className="oauth-file-button"><span>2. 匯入 OAuth JSON</span><input type="file" accept=".json,application/json" onChange={(event) => void configureOAuth(event)} disabled={oauthBusy} /><strong>{oauthBusy ? "加密保存中…" : "選擇 JSON 檔"}</strong></label></div>}
+          {creator.oauth.status.configured && !creator.oauth.status.connected && <div className="oauth-actions"><div><strong>OAuth 設定已加密保存</strong><p>下一步會在 Google 官方頁面登入並確認兩項唯讀權限。完成後 Google 將導回本機服務。</p></div><div className="oauth-action-buttons"><button className="button primary" type="button" onClick={connectOAuth} disabled={oauthBusy}>連結我的 YouTube 頻道</button><button className="button ghost" type="button" onClick={() => void deleteOAuthClient()} disabled={oauthBusy}>刪除設定</button></div></div>}
+          {creator.oauth.status.connected && <div className="oauth-actions"><div><strong>已連結 {creator.oauth.status.channel?.title}</strong><p>私人資料只屬於這個頻道，不會加入團隊公開合計或其他頻道比較。</p></div><button className="danger-button" type="button" onClick={() => void disconnectOAuth()} disabled={oauthBusy || oauthSyncing || creator.oauth.status.syncing}>中斷並刪除同步資料</button></div>}
+          {creator.oauth.status.last_error_help && <section className="oauth-error" role="status"><strong>{creator.oauth.status.last_error_help.title}</strong><p>{creator.oauth.status.last_error_help.message}</p><ol>{creator.oauth.status.last_error_help.steps.map((step) => <li key={step}>{step}</li>)}</ol>{creator.oauth.status.last_error_help.help_url && creator.oauth.status.last_error_help.help_label && <a href={creator.oauth.status.last_error_help.help_url} target="_blank" rel="noreferrer">{creator.oauth.status.last_error_help.help_label} ↗</a>}<details><summary>查看 Google 技術細節</summary><code>{creator.oauth.status.last_error}</code></details></section>}
+          <details className="oauth-troubleshooting"><summary><span><strong>連線或同步遇到問題？</strong><small>403、API 未啟用、七天後失效、沒資料與按鈕狀態</small></span><i>查看解法</i></summary><div className="oauth-troubleshooting-grid"><article><strong>403：應用程式未完成驗證</strong><p>在建立 OAuth JSON 的同一個專案，進入 Google Auth Platform「目標對象」，把目前登入的完整 Google 帳號加入測試使用者。專案擁有者也不一定會自動加入。</p><a href="https://console.cloud.google.com/auth/audience" target="_blank" rel="noreferrer">設定測試使用者 ↗</a></article><article><strong>Analytics API 尚未啟用</strong><p>OAuth 成功不代表 Analytics API 已啟用。確認同一專案同時啟用 YouTube Data API v3 與 YouTube Analytics API，等待 1～5 分鐘再同步。</p><a href="https://console.cloud.google.com/apis/library/youtubeanalytics.googleapis.com" target="_blank" rel="noreferrer">啟用 Analytics API ↗</a></article><article><strong>七天後突然失效</strong><p>Google OAuth 若仍是「測試」發布狀態，refresh token 通常七天後失效。重新連線可暫時恢復；長期每日同步需將發布狀態改為正式環境。</p></article><article><strong>已連線但沒有資料</strong><p>先等待目前同步完成；Google 尚未產生可用報表列、頻道較新或期間沒有活動時可能仍顯示「—」。這不是 0，也不會用猜測值補上。</p></article><article><strong>匯入了錯誤專案的 JSON</strong><p>先中斷連線，再刪除 OAuth 設定，改匯入已啟用兩個 YouTube API 的正確桌面應用程式 JSON。不要編輯 JSON 或把它傳給別人。</p></article><article><strong>按立即同步像沒反應</strong><p>按下後會持續顯示「同步中…」並每兩秒確認狀態；完成後顯示資料日期，失敗則顯示繁中原因、操作步驟與可展開的技術原文。</p></article></div></details>
+          <p className="panel-footnote">若 Google OAuth 同意畫面仍為「測試」狀態，refresh token 通常會在 7 天後失效；個人使用請在 Google Cloud 將應用程式發布到正式環境。不要把下載的 OAuth JSON 分享或放進 Git。</p>
+        </div>}
+      </section>}
+
       {creator?.channel && <>
-        <section className="panel creator-profile">
-          <div className="creator-identity">{creator.channel.thumbnail_url ? <img src={creator.channel.thumbnail_url} alt="" /> : <span>V</span>}<div><p className="section-kicker">{creator.channel.category}{creator.channel.organization_name ? ` · ${creator.channel.organization_name}` : ""}</p><h2>{creator.channel.title}</h2><p>{creator.channel.handle ?? creator.channel.channel_id}</p><div className="tag-row">{creator.channel.manual_tags.map((tag) => <i key={tag}>#{tag}</i>)}</div></div></div>
-          <a className="button external-button" href={creator.channel.handle ? `https://www.youtube.com/${creator.channel.handle}` : `https://www.youtube.com/channel/${creator.channel.channel_id}`} target="_blank" rel="noreferrer">開啟 YouTube ↗</a>
-        </section>
-
-        <section className="creator-public-grid">
-          <article className="insight-hero primary"><span>公開訂閱</span><strong>{compact(creator.channel.subscriber_count)}</strong><p>監測首頁 · {dateTime(creator.channel.last_stats_at)}</p></article>
-          <article className="insight-hero"><span>頻道總觀看</span><strong>{compact(creator.channel.view_count)}</strong><p>公開累積值</p></article>
-          <article className="insight-hero"><span>公開影片數</span><strong>{compact(creator.channel.video_count)}</strong><p>目前 YouTube API 統計</p></article>
-          <article className="insight-hero"><span>歷史最高同接</span><strong>{compact(creator.public?.peak_concurrent)}</strong><p>{exact(creator.public?.concurrency_sample_count)} 個同接資料點</p></article>
-        </section>
-
         <section className="panel public-monitor-panel">
           <div className="panel-heading"><div><p className="section-kicker">PUBLIC MONITOR SYNC</p><h2>已自動沿用監測首頁資料</h2></div><span>{creator.public?.snapshots.length ?? 0} 個頻道快照 · {creator.public?.videos.length ?? 0} 筆內容</span></div>
           <div className="public-source-note"><strong>不另存一份副本</strong><p>這裡直接讀取監測首頁的同一筆頻道、影片與同接紀錄；監測更新後，工作區會同步顯示。私人 Analytics 會另以 OAuth、Studio 匯入或手動補值標示來源。</p></div>
@@ -979,7 +1014,7 @@ export default function CreatorDashboard() {
           <div className="creator-private-grid oauth-summary-grid">{overviewCards.filter(([key]) => !["impressions", "impressions_ctr", "returning_viewers"].includes(key)).map(([key, label, formatter]) => <article key={key}><span>{label}</span><strong>{creator.oauth.summary?.metrics[key as keyof OAuthMetrics] === undefined ? "—" : formatter(creator.oauth.summary.metrics[key as keyof OAuthMetrics]!)}</strong><p>Google Analytics API 唯讀同步</p></article>)}</div>
           <div className="oauth-data-columns">
             <article><div className="panel-heading"><div><h3>最近每日資料</h3></div><span>最新 14 天</span></div><div className="table-wrap"><table><thead><tr><th>日期</th><th>觀看</th><th>觀看時數</th><th>訂閱淨變化</th><th>不重複觀眾</th></tr></thead><tbody>{creator.oauth.daily.length === 0 ? <tr><td colSpan={5} className="table-empty">尚未取得每日 Analytics。</td></tr> : creator.oauth.daily.slice(0, 14).map((row) => <tr key={row.event_date}><td>{row.event_date}</td><td>{exact(row.metrics.views)}</td><td>{exact(row.metrics.watch_time_hours, 1)}</td><td>{signed(row.metrics.subscribers_net)}</td><td>{exact(row.metrics.unique_viewers)}</td></tr>)}</tbody></table></div></article>
-            <article><div className="panel-heading"><div><h3>期間觀看最高內容</h3></div><span>前 10 筆</span></div><div className="table-wrap"><table><thead><tr><th>內容</th><th>觀看</th><th>觀看時數</th><th>訂閱淨變化</th></tr></thead><tbody>{creator.oauth.videos.length === 0 ? <tr><td colSpan={4} className="table-empty">尚未取得內容 Analytics。</td></tr> : creator.oauth.videos.slice(0, 10).map((row) => <tr key={row.video_id}><td><strong>{row.title ?? row.video_id}</strong>{row.title && <small className="table-subline">{row.video_id}</small>}</td><td>{exact(row.metrics.views)}</td><td>{exact(row.metrics.watch_time_hours, 1)}</td><td>{signed(row.metrics.subscribers_net)}</td></tr>)}</tbody></table></div></article>
+            <article><div className="panel-heading"><div><h3>期間觀看最高內容</h3></div><span>前 10 筆</span></div><div className="table-wrap oauth-video-table"><table><thead><tr><th>內容與發布日期</th><th>觀看</th><th>觀看時數</th><th>訂閱淨變化</th></tr></thead><tbody>{creator.oauth.videos.length === 0 ? <tr><td colSpan={4} className="table-empty">尚未取得內容 Analytics。</td></tr> : creator.oauth.videos.slice(0, 10).map((row) => <tr className="oauth-video-row" key={row.video_id} tabIndex={0} aria-label={`在新分頁開啟 ${row.title ?? "這支影片"}`} onClick={(event) => { if ((event.target as HTMLElement).closest?.("a")) return; openYouTubeVideo(row.video_id); }} onKeyDown={(event) => { if (event.target !== event.currentTarget || !["Enter", " "].includes(event.key)) return; event.preventDefault(); openYouTubeVideo(row.video_id); }}><td><a className="oauth-video-link" href={`https://www.youtube.com/watch?v=${row.video_id}`} target="_blank" rel="noreferrer">{row.thumbnail_url ? <img src={row.thumbnail_url} alt="" /> : <span className="oauth-video-thumb-fallback">V</span>}<span><strong>{row.title ?? "影片標題尚未取得"}</strong><small>{creator.channel?.title ?? creator.oauth.status.channel?.title ?? "頻道名稱尚未取得"}</small><small>發布／直播日期：{dateTime(row.content_date)}</small></span></a></td><td>{exact(row.metrics.views)}</td><td>{exact(row.metrics.watch_time_hours, 1)}</td><td>{signed(row.metrics.subscribers_net)}</td></tr>)}</tbody></table></div></article>
           </div>
         </section>}
 
@@ -1056,7 +1091,7 @@ export default function CreatorDashboard() {
             <SortHeader field="likes" label="喜歡" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
             <SortHeader field="comments" label="留言" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
             <SortHeader field="conflict_status" label="狀態" sort={analyticsSort} direction={analyticsDirection} onSort={changeAnalyticsSort} />
-          </tr></thead><tbody>{!analytics || analytics.rows.length === 0 ? <tr><td colSpan={17} className="table-empty">{analyticsLoading ? "正在讀取解析資料…" : "目前沒有符合篩選條件的資料。"}</td></tr> : analytics.rows.map((row) => <tr key={row.id}><td><strong>{row.display_date ?? (row.row_kind === "total" ? "報表總計" : "無日期")}</strong><small className="table-subline">{row.date_source}</small></td><td><strong>{row.video_title ?? row.video_id ?? "整體報表"}</strong>{row.video_title && row.video_id && <small className="table-subline">{row.video_id}</small>}</td><td><strong>{row.content_topic}</strong><small className="table-subline">{row.classification_source}</small></td><td>{row.content_format}</td><td>{row.report_name}</td><td>{exact(row.views)}</td><td>{exact(row.engaged_views)}</td><td>{exact(row.watch_time_hours, 1)}</td><td>{row.average_view_duration_seconds === null ? "—" : `${exact(row.average_view_duration_seconds)} 秒`}</td><td>{row.average_percentage_viewed === null ? "—" : `${exact(row.average_percentage_viewed, 2)}%`}</td><td>{exact(row.impressions)}</td><td>{row.impressions_ctr === null ? "—" : `${exact(row.impressions_ctr, 2)}%`}</td><td>{exact(row.unique_viewers)}</td><td>{exact(row.returning_viewers)}</td><td>{exact(row.likes)}</td><td>{exact(row.comments)}</td><td>{row.conflict_status ? <span className="conflict-badge">待核對</span> : <span className="state-badge">正常</span>}</td></tr>)}</tbody></table></div>
+          </tr></thead><tbody>{!analytics || analytics.rows.length === 0 ? <tr><td colSpan={17} className="table-empty">{analyticsLoading ? "正在讀取解析資料…" : "目前沒有符合篩選條件的資料。"}</td></tr> : analytics.rows.map((row) => <tr key={row.id}><td><strong>{row.display_date ?? (row.row_kind === "total" ? "報表總計" : "無日期")}</strong><small className="table-subline">{row.date_source}</small></td><td><strong>{row.video_title ?? row.video_id ?? "整體報表"}</strong>{row.video_title && row.video_id && <small className="table-subline">{row.video_id}</small>}</td><td><strong>{row.content_topic}</strong><small className="table-subline">{row.classification_source}{row.game_name ? ` · ${row.game_name}` : ""}{row.classification_evidence ? ` · ${row.classification_evidence}` : ""}</small></td><td>{row.content_format}</td><td>{row.report_name}</td><td>{exact(row.views)}</td><td>{exact(row.engaged_views)}</td><td>{exact(row.watch_time_hours, 1)}</td><td>{row.average_view_duration_seconds === null ? "—" : `${exact(row.average_view_duration_seconds)} 秒`}</td><td>{row.average_percentage_viewed === null ? "—" : `${exact(row.average_percentage_viewed, 2)}%`}</td><td>{exact(row.impressions)}</td><td>{row.impressions_ctr === null ? "—" : `${exact(row.impressions_ctr, 2)}%`}</td><td>{exact(row.unique_viewers)}</td><td>{exact(row.returning_viewers)}</td><td>{exact(row.likes)}</td><td>{exact(row.comments)}</td><td>{row.conflict_status ? <span className="conflict-badge">待核對</span> : <span className="state-badge">正常</span>}</td></tr>)}</tbody></table></div>
           <div className="analytics-pagination"><span>{analytics?.result_count ? `第 ${analytics.page} / ${analytics.page_count} 頁` : "0 筆結果"}</span><div><button className="button ghost" type="button" onClick={() => setAnalyticsPage((current) => Math.max(1, current - 1))} disabled={!analytics || analytics.page <= 1 || analyticsLoading}>上一頁</button><button className="button ghost" type="button" onClick={() => setAnalyticsPage((current) => Math.min(analytics?.page_count ?? current, current + 1))} disabled={!analytics || analytics.page >= analytics.page_count || analyticsLoading}>下一頁</button></div></div>
         </section>
 

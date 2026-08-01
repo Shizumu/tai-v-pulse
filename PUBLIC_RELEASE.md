@@ -1,6 +1,6 @@
-# 台V Pulse 0.8.4 Windows 對外測試版
+# 台V Pulse 0.9.0 Windows 對外測試版
 
-本版提供單檔 Windows 安裝程式 `tai-v-pulse-0.8.4-setup.exe`。程式仍只在使用者自己的電腦執行；YouTube API Key、OAuth 設定／token、本機 SQLite 資料庫及私人 Analytics 不會傳給專案作者。
+本版提供單檔 Windows 安裝程式 `tai-v-pulse-0.9.0-setup.exe`。程式仍只在使用者自己的電腦執行；YouTube API Key、OAuth 設定／token、本機 SQLite 資料庫及私人 Analytics 不會傳給專案作者。
 
 ## 使用前準備
 
@@ -13,7 +13,7 @@
 
 ## 安裝與啟動
 
-1. 核對安裝程式旁 `.sha256` 檔中的 SHA-256，再雙擊 `tai-v-pulse-0.8.4-setup.exe`。
+1. 核對安裝程式旁 `.sha256` 檔中的 SHA-256，再雙擊 `tai-v-pulse-0.9.0-setup.exe`。
 2. 閱讀並勾選非商用授權及本機資料說明，按「安裝並啟動」。程式會安裝到目前使用者的 `%LOCALAPPDATA%\Programs\TaiVPulse`，不要求管理員權限。
 3. 啟動器會檢查 Node.js、Python、Python 時區資料、npm 前端套件、資料服務與網頁服務。若缺少 Node.js 或 Python，會提供 WinGet 自動安裝、開啟官方下載頁或取消三種選項；若 Windows 缺少 IANA 時區資料，會把固定版本的 `tzdata` 安裝到台V Pulse 自己的 `work/python-packages`。
 4. 第一次缺少 API Key 時會建立並開啟 `.env`；將自己的 Key 填入 `YOUTUBE_API_KEY=`，儲存後回到啟動器再按一次「啟動」。
@@ -36,6 +36,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 這只影響目前 PowerShell 視窗。
 
+## 0.9.0 重點
+
+- 監測首頁可匯出／匯入版本化的公開監測資料包；匯入前會驗證 manifest、SHA-256、筆數與資料關聯，再由使用者選擇合併或取代公開資料。資料包不包含 API Key、OAuth、Studio、手動補值、工作區設定或候選紀錄，也不應以整個 `work/` 或 SQLite 代替。
+- 內容環境新增可點擊的直播時段熱圖、統計範圍說明、混合主題與人工分類／遊戲名稱修正；這些分類屬於台V Pulse 的可檢查規則，不是 YouTube Analytics 官方分類。
+- 趨勢圖表新增 7～365 天與自訂期間、比較群組／組織範圍、四項市場排行、熱門內容主題及固定頻道比較；頻道工作區改為清楚區分個人、團隊、公開監測與私人 OAuth／Studio 資料。
+- 全頻道開台加強掃描改為台北時間 `00:05`、`01:05`、`08:05`、`12:05`、`15:05`、`18:05`～`23:05`，降低冷清時段的 API 消耗；已知預告／直播仍依設定輪詢同接，完整上傳掃描仍每 4 小時執行。
+- 上傳播放清單失效時會略過該頻道並保留既有資料，不再讓單一 404 中止整批更新；監測首頁會顯示可理解的警示，技術識別資訊只留在本機診斷紀錄。
+
 ## 對外版限制
 
 - 執行模式固定預設為 `public`。
@@ -44,6 +52,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 - OAuth 直接連線只申請 `youtube.readonly` 與 `yt-analytics.readonly`；不能上傳、刪除或修改頻道內容，也不讀取收益。同步最多取最近 365 天，不包含曝光、曝光點閱率或回訪觀眾。
 - 每位使用者必須使用自己的 Google OAuth 桌面應用程式。若 OAuth 同意畫面仍為測試狀態，Google 的 refresh token 通常會在 7 天後失效。
 - 關機、睡眠、斷網或程式停止期間的即時同接無法回填。
+- 分時加強掃描以台北時間固定執行；冷清時段仍可能遇到未預告且兩次掃描之間直接開播的頻道，無法保證零漏接。
 - 安裝程式未經程式碼簽章，Windows SmartScreen 可能顯示未知發行者；發布時必須同時提供 SHA-256。
 - 尚未在另一台乾淨電腦完成 Node.js／Python 自動安裝、長時間運作、升級及備份還原的整條實機驗收。
 
