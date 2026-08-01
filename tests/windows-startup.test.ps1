@@ -85,6 +85,10 @@ try {
     Assert-True -Condition $installerBuildText.Contains("Join-Path `$releaseRoot 'TaiVPulseUpdater.exe'") -Message 'Windows 安裝包未編譯獨立更新輔助程式。'
     Assert-True -Condition $publicPackageText.Contains("@('.github', 'app'") -Message '公開原始碼白名單未包含 GitHub Release workflow。'
     Assert-True -Condition $releaseWorkflowText.Contains('tags:') -Message 'GitHub Release workflow 未限制由版本標籤觸發。'
+    $pythonDependencyInstallIndex = $releaseWorkflowText.IndexOf('python -m pip install -r requirements.txt', [System.StringComparison]::Ordinal)
+    $collectorTestIndex = $releaseWorkflowText.IndexOf('python -m unittest tests.test_collector', [System.StringComparison]::Ordinal)
+    Assert-True -Condition ($pythonDependencyInstallIndex -ge 0) -Message 'GitHub Release workflow 未安裝 Python requirements。'
+    Assert-True -Condition ($collectorTestIndex -gt $pythonDependencyInstallIndex) -Message 'GitHub Release workflow 必須先安裝 Python requirements，再執行 collector 測試。'
     Assert-True -Condition $releaseWorkflowText.Contains('scripts\package-public.ps1') -Message 'GitHub Release workflow 未使用公開白名單打包流程。'
     Assert-True -Condition $releaseWorkflowText.Contains('scripts\build-windows-installer.ps1') -Message 'GitHub Release workflow 未建立 Windows 安裝程式。'
     Assert-True -Condition $releaseWorkflowText.Contains('gh release create') -Message 'GitHub Release workflow 未發布驗證後成品。'
