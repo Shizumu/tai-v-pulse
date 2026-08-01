@@ -9,6 +9,7 @@
 - 全頻道加強掃描改為台北時間 `00:05`、`01:05`、`08:05`、`12:05`、`15:05`、`18:05`～`23:05`，每日由 72 次降為 11 次。每 4 小時完整上傳掃描、已知預告／直播的同接輪詢、一般配額安全線及「我的頻道」優先均維持不變。
 - 正式公開 ZIP：`outputs/tai-v-pulse-0.9.0-public.zip`；SHA-256 `73431e447d8eed98c778b660a2f0861b0e9a4acd3c086ff7389092016d8439b8`。
 - 正式 Windows 安裝程式：`outputs/tai-v-pulse-0.9.0-setup.exe`；SHA-256 `43e415bb7c66bf9c68e8d4d615501687b7d4046aab03b4f5116375e169b8b2d0`；檔案版本 `0.9.0.0`、產品版本 `0.9.0`。
+- 公開原始碼 commit `630a56c` 已推送至 `codex/tai-v-pulse-0.9.0`，GitHub 草稿 PR #3 已建立；`main` 尚未合併或改寫。
 - ZIP 有 52 個 entry（51 個 manifest 管理項目加 manifest 本身），版本為 `0.9.0`、`TAI_V_PULSE_EDITION=public`、`YOUTUBE_API_KEY=` 空白；獨立檢查未發現 `.env`、`work/`、SQLite／DB、OAuth JSON／token、Studio CSV／TSV、相依套件、LOG、建置快取或 Git metadata。
 - 安裝程式建置流程已驗證解壓內容、覆蓋升級保留 `.env`／SQLite／`node_modules`、清除淘汰程式檔、捷徑圖示、PowerShell 5.1 parser 與啟動器版本資訊；此隔離安裝驗證不等於另一台乾淨電腦的實機驗收。
 
