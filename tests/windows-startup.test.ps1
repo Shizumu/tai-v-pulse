@@ -7,8 +7,12 @@ $startScript = Join-Path $projectRoot 'start-local.ps1'
 $requirementsPath = Join-Path $projectRoot 'requirements.txt'
 $uninstallScript = Join-Path $projectRoot 'uninstall.ps1'
 $launcherSource = Join-Path $projectRoot 'windows\TaiVPulseLauncher.cs'
+$updaterSource = Join-Path $projectRoot 'windows\TaiVPulseUpdater.cs'
 $installerSource = Join-Path $projectRoot 'windows\TaiVPulseInstaller.cs'
 $installerBuildScript = Join-Path $projectRoot 'scripts\build-windows-installer.ps1'
+$publicPackageScript = Join-Path $projectRoot 'scripts\package-public.ps1'
+$diagnosticScript = Join-Path $projectRoot 'export-diagnostics.ps1'
+$releaseWorkflow = Join-Path $projectRoot '.github\workflows\release.yml'
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("tai-v-pulse-startup-test-$([Guid]::NewGuid().ToString('N'))")
 $originalPythonPath = [System.Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
 
@@ -51,8 +55,12 @@ try {
     Assert-True -Condition ($uninstallParseErrors.Count -eq 0) -Message 'uninstall.ps1 無法由 Windows PowerShell parser 解析。'
     $uninstallSource = Get-Content -LiteralPath $uninstallScript -Raw -Encoding UTF8
     $launcherText = Get-Content -LiteralPath $launcherSource -Raw -Encoding UTF8
+    $updaterText = Get-Content -LiteralPath $updaterSource -Raw -Encoding UTF8
     $installerText = Get-Content -LiteralPath $installerSource -Raw -Encoding UTF8
     $installerBuildText = Get-Content -LiteralPath $installerBuildScript -Raw -Encoding UTF8
+    $publicPackageText = Get-Content -LiteralPath $publicPackageScript -Raw -Encoding UTF8
+    $diagnosticText = Get-Content -LiteralPath $diagnosticScript -Raw -Encoding UTF8
+    $releaseWorkflowText = Get-Content -LiteralPath $releaseWorkflow -Raw -Encoding UTF8
     Assert-True -Condition $uninstallSource.Contains('[switch]$RemoveData') -Message '解除安裝腳本缺少永久刪除資料選項。'
     Assert-True -Condition $uninstallSource.Contains('PreservedData-') -Message '解除安裝腳本缺少資料保留路徑。'
     Assert-True -Condition $launcherText.Contains('解除安裝') -Message 'Windows 啟動器缺少解除安裝入口。'
@@ -64,9 +72,23 @@ try {
     Assert-True -Condition $launcherText.Contains('while (!process.WaitForExit(250))') -Message 'Windows 啟動器未使用有限等待確認啟動腳本結束。'
     Assert-True -Condition (-not $launcherText.Contains('process.WaitForExit();')) -Message 'Windows 啟動器仍可能無期限等待長時間服務保留的輸出管線。'
     Assert-True -Condition $launcherText.Contains('process.CancelOutputRead()') -Message 'Windows 啟動器未在腳本結束後釋放標準輸出讀取。'
+    Assert-True -Condition $launcherText.Contains('api.github.com/repos/Shizumu/tai-v-pulse/releases/latest') -Message 'Windows 啟動器缺少正式 GitHub Release 更新來源。'
+    Assert-True -Condition $launcherText.Contains('SHA-256 驗證失敗') -Message 'Windows 啟動器未拒絕 SHA-256 不符的更新。'
+    Assert-True -Condition $launcherText.Contains('MessageBoxButtons.YesNo') -Message 'Windows 啟動器更新前未要求使用者確認。'
+    Assert-True -Condition $launcherText.Contains('activity.CurrentJob') -Message 'Windows 啟動器未避開正在執行的背景資料工作。'
+    Assert-True -Condition $updaterText.Contains('WaitForLauncher') -Message '獨立更新輔助程式未等待舊啟動器結束。'
+    Assert-True -Condition $updaterText.Contains('--silent --no-launch --install-dir') -Message '獨立更新輔助程式未沿用安全覆蓋安裝流程。'
+    Assert-True -Condition $updaterText.Contains('VersionMatches') -Message '獨立更新輔助程式未驗證安裝後版本。'
     Assert-True -Condition $installerText.Contains('"TaiVPulse-" + Version + ".ico"') -Message 'Windows 安裝器未使用版本化的最新版捷徑圖示。'
     Assert-True -Condition $installerText.Contains('iconPath + ",0"') -Message 'Windows 捷徑未明確指定最新版圖示檔。'
     Assert-True -Condition $installerBuildText.Contains('$installedIconName = "TaiVPulse-$version.ico"') -Message 'Windows 安裝包未帶入版本化的最新版圖示檔。'
+    Assert-True -Condition $installerBuildText.Contains("Join-Path `$releaseRoot 'TaiVPulseUpdater.exe'") -Message 'Windows 安裝包未編譯獨立更新輔助程式。'
+    Assert-True -Condition $publicPackageText.Contains("@('.github', 'app'") -Message '公開原始碼白名單未包含 GitHub Release workflow。'
+    Assert-True -Condition $releaseWorkflowText.Contains('tags:') -Message 'GitHub Release workflow 未限制由版本標籤觸發。'
+    Assert-True -Condition $releaseWorkflowText.Contains('scripts\package-public.ps1') -Message 'GitHub Release workflow 未使用公開白名單打包流程。'
+    Assert-True -Condition $releaseWorkflowText.Contains('scripts\build-windows-installer.ps1') -Message 'GitHub Release workflow 未建立 Windows 安裝程式。'
+    Assert-True -Condition $releaseWorkflowText.Contains('gh release create') -Message 'GitHub Release workflow 未發布驗證後成品。'
+    Assert-True -Condition $diagnosticText.Contains("`$_.Name -like 'updater-*.log'") -Message '診斷報告未白名單收錄更新器 LOG。'
 
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $fakePython = Join-Path $testRoot 'fake-python.cmd'

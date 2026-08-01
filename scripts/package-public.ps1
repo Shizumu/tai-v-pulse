@@ -64,7 +64,7 @@ $topLevelFiles = @(
     '啟動台V Pulse.cmd'
 )
 
-$sourceDirectories = @('app', 'build', 'collector', 'public', 'windows', 'worker')
+$sourceDirectories = @('.github', 'app', 'build', 'collector', 'public', 'windows', 'worker')
 $blockedDirectoryNames = @(
     '.git', '.next', '.vinext', '.wrangler', '_sites-preview',
     '__pycache__', 'dist', 'node_modules', 'outputs', 'work'
@@ -188,7 +188,7 @@ try {
         throw "發佈目錄含有禁止檔案：$($forbiddenFiles.FullName -join ', ')"
     }
 
-    $textExtensions = @('.cmd', '.cs', '.css', '.d.ts', '.example', '.json', '.md', '.mjs', '.ps1', '.py', '.ts', '.tsx')
+    $textExtensions = @('.cmd', '.cs', '.css', '.d.ts', '.example', '.json', '.md', '.mjs', '.ps1', '.py', '.ts', '.tsx', '.yml', '.yaml')
     $textFiles = @($releaseFiles | Where-Object {
         $_.Extension.ToLowerInvariant() -in $textExtensions -or $_.Name -in @('LICENSE', 'NOTICE')
     })
