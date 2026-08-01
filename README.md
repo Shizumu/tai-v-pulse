@@ -8,7 +8,7 @@
 
 1. 在 Google Cloud 建立專案並啟用 YouTube Data API v3。
 2. 建立 API Key，但不要把 Key 貼到聊天、診斷報告或版本控制。
-3. 核對隨附 SHA-256 後，雙擊 `tai-v-pulse-0.9.0-setup.exe`，閱讀說明並按「安裝並啟動」。安裝位置是目前使用者的 `%LOCALAPPDATA%\Programs\TaiVPulse`，不需要管理員權限。
+3. 核對隨附 SHA-256 後，雙擊 `tai-v-pulse-0.10.0-setup.exe`，閱讀說明並按「安裝並啟動」。安裝位置是目前使用者的 `%LOCALAPPDATA%\Programs\TaiVPulse`，不需要管理員權限。
 4. 若缺少 Node.js 22.13.0 以上或 Python 3.11 以上，啟動器會提供 WinGet 自動安裝、開啟官方下載頁或取消三種選項；安裝完成後重新開啟啟動器。
 5. 啟動器會在台V Pulse 自己的 `work/python-packages` 準備 Windows 所需的 Python 時區資料，並在尚未安裝前端套件時詢問是否自動安裝；使用者不需要自行輸入 pip 或 npm 指令。
 6. 只要 `.env` 不存在或 `YOUTUBE_API_KEY` 尚未填寫，程式就會建立並開啟設定檔。填入自己的 Key 並儲存，再回到啟動器按一次「啟動」。
@@ -18,7 +18,7 @@
 
 若 `.env` 中有多個 `YOUTUBE_API_KEY`，程式會採用最後一行；等號前後空白、單／雙引號及 `export YOUTUBE_API_KEY=...` 皆可辨識。可執行 `start-local.ps1 -CheckEnv` 檢查設定格式，輸出只會顯示是否辨識成功，不會顯示金鑰內容。
 
-平常從桌面或開始功能表的「台V Pulse」開啟啟動器，即可啟動、停止、開啟網頁、編輯 API Key、匯出診斷報告或解除安裝。啟動完成後不需要關閉重開啟動器，「停止」與執行狀態會直接恢復可用並持續更新。啟動器的「後台動態」會顯示正在探索頻道、更新直播同接、掃描最新上傳、更新頻道公開數據或手動新增頻道，工作結束後也會保留最近完成／未完成的項目。覆蓋安裝新版會保留 `.env`、`work/`、SQLite 與本機分析資料，清除已由新版淘汰的程式檔，並以安裝包內的最新版圖示重建桌面與開始功能表捷徑。解除安裝時可選擇保留資料，或在再次確認後永久刪除所有台V Pulse 本機資料。原始碼測試包仍可使用 `啟動台V Pulse.cmd`、`停止台V Pulse.cmd`、`start-local.ps1` 與 `stop-local.ps1`。
+平常從桌面或開始功能表的「台V Pulse」開啟啟動器，即可啟動、停止、開啟網頁、編輯 API Key、檢查更新、匯出診斷報告或解除安裝。啟動器每天至多自動向正式 GitHub Releases 檢查一次，也可手動檢查；發現新版後會先顯示版本與更新內容，只有使用者確認才會下載。下載檔必須符合正式 Release 的 HTTPS 位置、檔案大小與 SHA-256，且目前沒有背景資料工作時才會交由獨立更新程序覆蓋安裝。更新會保留 `.env`、`work/`、SQLite、OAuth、Studio 與既有 `node_modules`，並清除新版已淘汰的受管理程式檔。0.9.0 與更早版本尚無更新器，必須先手動安裝一次 0.10.0；之後才可使用一鍵更新。啟動完成後不需要關閉重開啟動器，「停止」與執行狀態會直接恢復可用並持續更新。解除安裝時可選擇保留資料，或在再次確認後永久刪除所有台V Pulse 本機資料。原始碼測試包仍可使用 `啟動台V Pulse.cmd`、`停止台V Pulse.cmd`、`start-local.ps1` 與 `stop-local.ps1`。
 
 ## 問題回報與 LOG
 
@@ -30,9 +30,10 @@
 - `TVP-E401`／`TVP-E402`：npm 或前端套件安裝問題。
 - `TVP-E403`：Python 時區資料安裝問題。
 - `TVP-E501`／`TVP-E502`：資料服務或網頁服務未能啟動。
+- `TVP-E801`／`TVP-E802`：無法取得、驗證或執行正式更新。
 - `TVP-D001`：診斷報告建立失敗。
 
-按啟動器的「匯出診斷報告」，桌面會產生 `TaiVPulse-diagnostics-日期時間.zip`。報告包含最近的安裝、啟動、前端與後端 LOG，以及 Windows、Node.js、Python 和本機埠的基本狀態；它不包含 `.env`、API Key、OAuth JSON／token、SQLite 資料庫或 Studio 原始檔，並會遮蔽 Windows 使用者名稱與電腦名稱。回報時請提供錯誤代碼及這個 ZIP。
+按啟動器的「匯出診斷報告」，桌面會產生 `TaiVPulse-diagnostics-日期時間.zip`。報告包含最近的安裝、更新、啟動、前端與後端 LOG，以及 Windows、Node.js、Python 和本機埠的基本狀態；它不包含 `.env`、API Key、OAuth JSON／token、SQLite 資料庫或 Studio 原始檔，並會遮蔽 Windows 使用者名稱與電腦名稱。回報時請提供錯誤代碼及這個 ZIP。
 
 目前安裝程式未經程式碼簽章，Windows SmartScreen 可能顯示「未知發行者」。正式對外提供時應同時發布 `.sha256` 檔供核對；這只能驗證下載內容一致，不能取代程式碼簽章。
 
@@ -215,6 +216,8 @@ node --test tests/rendered-html.test.mjs
 ```
 
 腳本會以白名單複製必要執行檔案，在 `outputs/` 產生版本化 ZIP 與 SHA-256 校驗檔；若同名輸出已存在則停止，不會覆寫既有套件。
+
+正式 GitHub repository 內的 `.github/workflows/release.yml` 會在推送與 `package.json` 相符的 `vX.Y.Z` 標籤時，自動執行後端、型別、lint、production build、渲染及 Windows 啟動檢查，再使用上述兩個白名單腳本建立 ZIP、EXE 與校驗檔；全部通過後才發布 GitHub Release。不要用未經白名單驗證的 repository 自動 ZIP 取代正式成品。
 
 本工具僅使用官方 YouTube Data API v3 與 YouTube Analytics API，不爬取 YouTube 網頁，也不是 YouTube 官方產品。對外發布模式首次使用會要求閱讀並同意本機資料、YouTube 平台條款與非商用授權聲明；作者私人本機模式不顯示這個發布版確認視窗。每頁頁尾會顯示「靜靜子Shizumum Ch. 製作」，完整內容可從「使用、隱私與授權聲明」開啟。
 

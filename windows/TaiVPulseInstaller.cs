@@ -247,7 +247,7 @@ namespace TaiVPulse.WindowsInstaller
         private int CleanStaleManagedFiles(HashSet<string> currentFiles)
         {
             string root = Path.GetFullPath(options.InstallDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            string[] managedDirectories = { ".openai", "app", "build", "collector", "public", "windows", "worker" };
+            string[] managedDirectories = { ".github", ".openai", "app", "build", "collector", "public", "windows", "worker" };
             int removedFiles = 0;
 
             foreach (string directoryName in managedDirectories)

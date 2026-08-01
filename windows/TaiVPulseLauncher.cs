@@ -1,11 +1,14 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 namespace TaiVPulse.Windows
@@ -37,11 +40,52 @@ namespace TaiVPulse.Windows
         public string LastJobStatus;
     }
 
+    internal sealed class GitHubReleaseAsset
+    {
+        public string name { get; set; }
+        public string browser_download_url { get; set; }
+        public string digest { get; set; }
+        public long size { get; set; }
+    }
+
+    internal sealed class GitHubReleaseResponse
+    {
+        public string tag_name { get; set; }
+        public string html_url { get; set; }
+        public string body { get; set; }
+        public bool draft { get; set; }
+        public bool prerelease { get; set; }
+        public List<GitHubReleaseAsset> assets { get; set; }
+    }
+
+    internal sealed class AvailableUpdate
+    {
+        public string Version;
+        public string DownloadUrl;
+        public string ExpectedSha256;
+        public long ExpectedSize;
+        public string ReleaseUrl;
+        public string Notes;
+    }
+
+    internal sealed class TimeoutWebClient : WebClient
+    {
+        protected override WebRequest GetWebRequest(Uri address)
+        {
+            WebRequest request = base.GetWebRequest(address);
+            request.Timeout = 15000;
+            var http = request as HttpWebRequest;
+            if (http != null) http.ReadWriteTimeout = 30000;
+            return request;
+        }
+    }
+
     internal sealed class LauncherForm : Form
     {
         private static readonly Encoding Utf8WithoutBom = new UTF8Encoding(false);
         private static readonly Encoding Utf8WithBom = new UTF8Encoding(true);
         private const string WebUrl = "http://127.0.0.1:3000";
+        private const string UpdateApiUrl = "https://api.github.com/repos/Shizumu/tai-v-pulse/releases/latest";
         private readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
         private readonly TextBox outputBox = new TextBox();
         private readonly Label stateLabel = new Label();
@@ -51,6 +95,7 @@ namespace TaiVPulse.Windows
         private readonly Button openButton = new Button();
         private readonly Button configButton = new Button();
         private readonly Button exportButton = new Button();
+        private readonly Button updateButton = new Button();
         private readonly Button uninstallButton = new Button();
         private readonly Timer statusTimer = new Timer();
         private bool busy;
@@ -58,13 +103,14 @@ namespace TaiVPulse.Windows
         private bool browserOpenedForStart;
         private string lastObservedJob;
         private string lastReportedCompletionAt;
+        private AvailableUpdate availableUpdate;
 
         public LauncherForm()
         {
             Text = "台V Pulse";
-            Width = 720;
+            Width = 760;
             Height = 520;
-            MinimumSize = new Size(640, 460);
+            MinimumSize = new Size(720, 460);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(246, 250, 247);
             Font = new Font("Microsoft JhengHei UI", 10F, FontStyle.Regular, GraphicsUnit.Point);
@@ -90,17 +136,19 @@ namespace TaiVPulse.Windows
             Controls.Add(activityLabel);
 
             ConfigureButton(startButton, "啟動", 24, 108, Color.FromArgb(47, 125, 91), Color.White);
-            ConfigureButton(stopButton, "停止", 132, 108, Color.FromArgb(229, 236, 232), Color.FromArgb(35, 83, 66));
-            ConfigureButton(openButton, "開啟網頁", 240, 108, Color.FromArgb(229, 236, 232), Color.FromArgb(35, 83, 66));
-            ConfigureButton(configButton, "編輯 API Key", 348, 108, Color.FromArgb(229, 236, 232), Color.FromArgb(35, 83, 66));
-            ConfigureButton(exportButton, "匯出診斷", 456, 108, Color.FromArgb(255, 239, 196), Color.FromArgb(98, 72, 7));
-            ConfigureButton(uninstallButton, "解除安裝", 564, 108, Color.FromArgb(244, 226, 226), Color.FromArgb(135, 55, 55));
+            ConfigureButton(stopButton, "停止", 124, 108, Color.FromArgb(229, 236, 232), Color.FromArgb(35, 83, 66));
+            ConfigureButton(openButton, "開啟網頁", 224, 108, Color.FromArgb(229, 236, 232), Color.FromArgb(35, 83, 66));
+            ConfigureButton(configButton, "編輯 Key", 324, 108, Color.FromArgb(229, 236, 232), Color.FromArgb(35, 83, 66));
+            ConfigureButton(exportButton, "匯出診斷", 424, 108, Color.FromArgb(255, 239, 196), Color.FromArgb(98, 72, 7));
+            ConfigureButton(updateButton, "檢查更新", 524, 108, Color.FromArgb(226, 235, 247), Color.FromArgb(45, 75, 118));
+            ConfigureButton(uninstallButton, "解除安裝", 624, 108, Color.FromArgb(244, 226, 226), Color.FromArgb(135, 55, 55));
 
             startButton.Click += async delegate { await StartApplication(); };
             stopButton.Click += async delegate { await StopApplication(); };
             openButton.Click += delegate { OpenTarget(WebUrl); };
             configButton.Click += delegate { EditConfiguration(); };
             exportButton.Click += async delegate { await ExportDiagnostics(); };
+            updateButton.Click += async delegate { await HandleUpdateButton(); };
             uninstallButton.Click += delegate { BeginUninstall(); };
 
             var logLabel = new Label();
@@ -126,6 +174,7 @@ namespace TaiVPulse.Windows
             {
                 await RefreshStatus();
                 statusTimer.Start();
+                await CheckForUpdates(false);
             };
         }
 
@@ -133,7 +182,7 @@ namespace TaiVPulse.Windows
         {
             button.Text = text;
             button.Location = new Point(x, y);
-            button.Size = new Size(100, 36);
+            button.Size = new Size(92, 36);
             button.FlatStyle = FlatStyle.Flat;
             button.FlatAppearance.BorderSize = 0;
             button.BackColor = back;
@@ -196,6 +245,288 @@ namespace TaiVPulse.Windows
                 "台V Pulse", MessageBoxButtons.OK, MessageBoxIcon.Information);
             if (File.Exists(zipPath)) OpenTarget("/select," + Quote(zipPath), "explorer.exe");
             else OpenTarget(desktop);
+        }
+
+        private async Task HandleUpdateButton()
+        {
+            if (busy) return;
+            if (availableUpdate == null)
+            {
+                await CheckForUpdates(true);
+                return;
+            }
+            await DownloadAndInstallUpdate(availableUpdate);
+        }
+
+        private async Task CheckForUpdates(bool manual)
+        {
+            if (busy || (!manual && !AutomaticUpdateCheckDue())) return;
+            AvailableUpdate installAfterCheck = null;
+            if (manual) SetBusy(true, "正在向 GitHub Releases 檢查新版…");
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                string json;
+                using (var client = new TimeoutWebClient())
+                {
+                    client.Encoding = Utf8WithoutBom;
+                    client.Headers[HttpRequestHeader.UserAgent] = "TaiVPulse-Updater/" + CurrentVersion();
+                    client.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json";
+                    json = await client.DownloadStringTaskAsync(new Uri(UpdateApiUrl));
+                }
+
+                var serializer = new JavaScriptSerializer();
+                serializer.MaxJsonLength = 4 * 1024 * 1024;
+                GitHubReleaseResponse release = serializer.Deserialize<GitHubReleaseResponse>(json);
+                AvailableUpdate candidate = ValidateRelease(release);
+                if (candidate == null || CompareVersions(candidate.Version, CurrentVersion()) <= 0)
+                {
+                    availableUpdate = null;
+                    updateButton.Text = "檢查更新";
+                    RecordSuccessfulNoUpdateCheck();
+                    if (manual)
+                    {
+                        MessageBox.Show(
+                            this,
+                            "目前已是最新版（" + CurrentVersion() + "）。",
+                            "台V Pulse 更新",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information
+                        );
+                    }
+                    return;
+                }
+
+                availableUpdate = candidate;
+                updateButton.Text = "更新 " + candidate.Version;
+                updateButton.BackColor = Color.FromArgb(255, 225, 141);
+                updateButton.ForeColor = Color.FromArgb(98, 72, 7);
+                AppendLine("發現台V Pulse " + candidate.Version + "；按「更新」查看並確認。", false);
+                if (manual) installAfterCheck = candidate;
+            }
+            catch (Exception error)
+            {
+                if (manual)
+                    ShowProblem("TVP-E801", "無法檢查更新：" + error.Message, "");
+                else
+                    AppendLine("目前無法檢查 GitHub 更新；不影響本機功能。", true);
+            }
+            finally
+            {
+                if (manual && !IsDisposed) SetBusy(false, "更新檢查完成");
+            }
+            if (installAfterCheck != null && !IsDisposed)
+                await DownloadAndInstallUpdate(installAfterCheck);
+        }
+
+        private AvailableUpdate ValidateRelease(GitHubReleaseResponse release)
+        {
+            if (release == null || release.draft || release.prerelease)
+                throw new InvalidDataException("GitHub 最新版本資訊不完整。");
+            string version = CleanVersion(release.tag_name);
+            Version parsed;
+            if (!Version.TryParse(version, out parsed))
+                throw new InvalidDataException("GitHub Release 版本格式不正確。");
+
+            string expectedName = "tai-v-pulse-" + version + "-setup.exe";
+            GitHubReleaseAsset installer = null;
+            foreach (GitHubReleaseAsset asset in release.assets ?? new List<GitHubReleaseAsset>())
+            {
+                if (String.Equals(asset.name, expectedName, StringComparison.OrdinalIgnoreCase))
+                {
+                    installer = asset;
+                    break;
+                }
+            }
+            if (installer == null)
+                throw new InvalidDataException("最新版 Release 缺少正式 Windows 安裝程式。");
+
+            Uri downloadUri;
+            if (!Uri.TryCreate(installer.browser_download_url, UriKind.Absolute, out downloadUri) ||
+                !String.Equals(downloadUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(downloadUri.Host, "github.com", StringComparison.OrdinalIgnoreCase) ||
+                !downloadUri.AbsolutePath.StartsWith(
+                    "/Shizumu/tai-v-pulse/releases/download/",
+                    StringComparison.OrdinalIgnoreCase
+                ))
+                throw new InvalidDataException("最新版安裝程式不是預期的 GitHub HTTPS 下載位置。");
+
+            string digest = (installer.digest ?? "").Trim();
+            if (digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
+                digest = digest.Substring("sha256:".Length);
+            if (!Regex.IsMatch(digest, "^[0-9a-fA-F]{64}$"))
+                throw new InvalidDataException("最新版 Release 未提供可驗證的 SHA-256。");
+            if (installer.size <= 0)
+                throw new InvalidDataException("最新版安裝程式檔案大小無效。");
+
+            return new AvailableUpdate
+            {
+                Version = version,
+                DownloadUrl = downloadUri.AbsoluteUri,
+                ExpectedSha256 = digest.ToLowerInvariant(),
+                ExpectedSize = installer.size,
+                ReleaseUrl = release.html_url ?? "",
+                Notes = release.body ?? ""
+            };
+        }
+
+        private async Task DownloadAndInstallUpdate(AvailableUpdate update)
+        {
+            if (update == null || busy) return;
+            BackendActivity activity = await Task.Run(delegate { return FetchBackendActivity(); });
+            if (!String.IsNullOrWhiteSpace(activity.CurrentJob))
+            {
+                MessageBox.Show(
+                    this,
+                    "目前正在「" + JobLabel(activity.CurrentJob) + "」。為避免中斷資料交易，請等工作完成後再更新。",
+                    "台V Pulse 正在處理資料",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning
+                );
+                return;
+            }
+
+            string notes = Regex.Replace(update.Notes ?? "", "\\r?\\n{3,}", "\r\n\r\n").Trim();
+            if (notes.Length > 700) notes = notes.Substring(0, 700) + "…";
+            string message =
+                "目前版本：" + CurrentVersion() + "\r\n" +
+                "可用版本：" + update.Version + "\r\n\r\n" +
+                "更新會停止本機服務並覆蓋程式檔，但保留 .env、work、SQLite、OAuth、Studio 與 node_modules。" +
+                "下載後會核對 GitHub 提供的 SHA-256。\r\n\r\n" +
+                (String.IsNullOrWhiteSpace(notes) ? "" : "更新內容：\r\n" + notes + "\r\n\r\n") +
+                "要下載並安裝嗎？";
+            if (MessageBox.Show(
+                this,
+                message,
+                "更新台V Pulse",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information
+            ) != DialogResult.Yes) return;
+
+            SetBusy(true, "正在下載並驗證台V Pulse " + update.Version + "…");
+            try
+            {
+                string updateRoot = Path.Combine(
+                    Path.GetTempPath(),
+                    "TaiVPulse-update-" + update.Version + "-" + Guid.NewGuid().ToString("N")
+                );
+                Directory.CreateDirectory(updateRoot);
+                string installerPath = Path.Combine(updateRoot, "tai-v-pulse-" + update.Version + "-setup.exe");
+                using (var client = new TimeoutWebClient())
+                {
+                    client.Headers[HttpRequestHeader.UserAgent] = "TaiVPulse-Updater/" + CurrentVersion();
+                    Task download = client.DownloadFileTaskAsync(new Uri(update.DownloadUrl), installerPath);
+                    Task completed = await Task.WhenAny(download, Task.Delay(2 * 60 * 1000));
+                    if (completed != download)
+                    {
+                        client.CancelAsync();
+                        throw new TimeoutException("下載超過 2 分鐘，已停止本次更新。");
+                    }
+                    await download;
+                }
+
+                var downloaded = new FileInfo(installerPath);
+                if (!downloaded.Exists || downloaded.Length != update.ExpectedSize)
+                    throw new InvalidDataException("下載檔案大小與 GitHub Release 不一致。");
+                string actualHash = FileSha256(installerPath);
+                if (!String.Equals(actualHash, update.ExpectedSha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("下載檔案 SHA-256 驗證失敗，未執行安裝。");
+
+                string installedUpdater = Path.Combine(root, "TaiVPulseUpdater.exe");
+                if (!File.Exists(installedUpdater))
+                    throw new FileNotFoundException("缺少獨立更新輔助程式，無法安全關閉舊啟動器。", installedUpdater);
+                string temporaryUpdater = Path.Combine(updateRoot, "TaiVPulseUpdater.exe");
+                File.Copy(installedUpdater, temporaryUpdater, true);
+
+                AppendLine("下載與 SHA-256 驗證完成；啟動獨立更新程序。", false);
+                var startInfo = new ProcessStartInfo();
+                startInfo.FileName = temporaryUpdater;
+                startInfo.Arguments =
+                    "--wait-pid " + Process.GetCurrentProcess().Id +
+                    " --installer " + Quote(installerPath) +
+                    " --install-dir " + Quote(root) +
+                    " --expected-version " + Quote(update.Version);
+                startInfo.WorkingDirectory = updateRoot;
+                startInfo.UseShellExecute = false;
+                startInfo.CreateNoWindow = true;
+                Process.Start(startInfo);
+                statusTimer.Stop();
+                Application.Exit();
+            }
+            catch (Exception error)
+            {
+                SetBusy(false, "更新未完成");
+                ShowProblem("TVP-E802", "無法下載或安裝更新：" + error.Message, "");
+            }
+        }
+
+        private string CurrentVersion()
+        {
+            string value = FileVersionInfo.GetVersionInfo(Application.ExecutablePath).ProductVersion;
+            return CleanVersion(String.IsNullOrWhiteSpace(value) ? Application.ProductVersion : value);
+        }
+
+        private static string CleanVersion(string value)
+        {
+            string cleaned = (value ?? "").Trim();
+            if (cleaned.StartsWith("v", StringComparison.OrdinalIgnoreCase)) cleaned = cleaned.Substring(1);
+            int metadata = cleaned.IndexOf('+');
+            if (metadata >= 0) cleaned = cleaned.Substring(0, metadata);
+            int prerelease = cleaned.IndexOf('-');
+            if (prerelease >= 0) cleaned = cleaned.Substring(0, prerelease);
+            return cleaned.Trim();
+        }
+
+        private static int CompareVersions(string left, string right)
+        {
+            Version leftVersion;
+            Version rightVersion;
+            if (!Version.TryParse(CleanVersion(left), out leftVersion) ||
+                !Version.TryParse(CleanVersion(right), out rightVersion))
+                throw new InvalidDataException("無法比較更新版本。");
+            var normalizedLeft = new Version(leftVersion.Major, leftVersion.Minor, Math.Max(0, leftVersion.Build));
+            var normalizedRight = new Version(rightVersion.Major, rightVersion.Minor, Math.Max(0, rightVersion.Build));
+            return normalizedLeft.CompareTo(normalizedRight);
+        }
+
+        private static string FileSha256(string path)
+        {
+            using (FileStream stream = File.OpenRead(path))
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(stream);
+                var builder = new StringBuilder(hash.Length * 2);
+                foreach (byte value in hash) builder.Append(value.ToString("x2"));
+                return builder.ToString();
+            }
+        }
+
+        private bool AutomaticUpdateCheckDue()
+        {
+            try
+            {
+                string statePath = Path.Combine(root, "work", "last-update-check.txt");
+                if (!File.Exists(statePath)) return true;
+                DateTimeOffset checkedAt;
+                if (!DateTimeOffset.TryParse(File.ReadAllText(statePath, Utf8WithoutBom), out checkedAt)) return true;
+                return DateTimeOffset.UtcNow - checkedAt.ToUniversalTime() >= TimeSpan.FromHours(24);
+            }
+            catch { return true; }
+        }
+
+        private void RecordSuccessfulNoUpdateCheck()
+        {
+            try
+            {
+                string work = Path.Combine(root, "work");
+                Directory.CreateDirectory(work);
+                File.WriteAllText(
+                    Path.Combine(work, "last-update-check.txt"),
+                    DateTimeOffset.UtcNow.ToString("o"),
+                    Utf8WithoutBom
+                );
+            }
+            catch { }
         }
 
         private void EditConfiguration()
@@ -495,6 +826,7 @@ namespace TaiVPulse.Windows
             openButton.Enabled = true;
             configButton.Enabled = true;
             exportButton.Enabled = !value;
+            updateButton.Enabled = !value;
             uninstallButton.Enabled = !value;
             activityLabel.Text = state;
             activityLabel.ForeColor = value ? Color.FromArgb(181, 115, 10) : Color.FromArgb(86, 96, 91);

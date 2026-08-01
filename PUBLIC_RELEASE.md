@@ -1,6 +1,6 @@
-# 台V Pulse 0.9.0 Windows 對外測試版
+# 台V Pulse 0.10.0 Windows 對外測試版
 
-本版提供單檔 Windows 安裝程式 `tai-v-pulse-0.9.0-setup.exe`。程式仍只在使用者自己的電腦執行；YouTube API Key、OAuth 設定／token、本機 SQLite 資料庫及私人 Analytics 不會傳給專案作者。
+本版提供單檔 Windows 安裝程式 `tai-v-pulse-0.10.0-setup.exe`。程式仍只在使用者自己的電腦執行；YouTube API Key、OAuth 設定／token、本機 SQLite 資料庫及私人 Analytics 不會傳給專案作者。
 
 ## 使用前準備
 
@@ -13,14 +13,16 @@
 
 ## 安裝與啟動
 
-1. 核對安裝程式旁 `.sha256` 檔中的 SHA-256，再雙擊 `tai-v-pulse-0.9.0-setup.exe`。
+1. 核對安裝程式旁 `.sha256` 檔中的 SHA-256，再雙擊 `tai-v-pulse-0.10.0-setup.exe`。0.9.0 與更早版本沒有內建更新器，必須先手動完成這次覆蓋安裝。
 2. 閱讀並勾選非商用授權及本機資料說明，按「安裝並啟動」。程式會安裝到目前使用者的 `%LOCALAPPDATA%\Programs\TaiVPulse`，不要求管理員權限。
 3. 啟動器會檢查 Node.js、Python、Python 時區資料、npm 前端套件、資料服務與網頁服務。若缺少 Node.js 或 Python，會提供 WinGet 自動安裝、開啟官方下載頁或取消三種選項；若 Windows 缺少 IANA 時區資料，會把固定版本的 `tzdata` 安裝到台V Pulse 自己的 `work/python-packages`。
 4. 第一次缺少 API Key 時會建立並開啟 `.env`；將自己的 Key 填入 `YOUTUBE_API_KEY=`，儲存後回到啟動器再按一次「啟動」。
-5. 之後可從桌面或開始功能表的「台V Pulse」啟動、停止、開啟網頁、編輯 Key、查看「後台動態」、匯出診斷報告或解除安裝。服務就緒時會立即以 Windows 預設瀏覽器開啟本機網頁；不需要關閉重開啟動器，「停止」與執行狀態會直接恢復可用並持續更新。啟動期間仍可手動按「開啟網頁」或「編輯 API Key」。
+5. 之後可從桌面或開始功能表的「台V Pulse」啟動、停止、開啟網頁、編輯 Key、檢查更新、查看「後台動態」、匯出診斷報告或解除安裝。服務就緒時會立即以 Windows 預設瀏覽器開啟本機網頁；不需要關閉重開啟動器，「停止」與執行狀態會直接恢復可用並持續更新。啟動期間仍可手動按「開啟網頁」或「編輯 Key」。
 6. 若要直接同步自己的頻道，在「頻道工作區」匯入自備的 OAuth JSON，按「連結我的 YouTube 頻道」，再於 Google 官方頁面確認 YouTube 與 Analytics 兩項唯讀權限。Studio 檔案匯入仍保留為進階備援。
 
 直接執行新版安裝程式即可覆蓋升級；安裝器會保留 `.env`、`work/`、SQLite 與本機分析資料，清除新版已淘汰的程式檔，並以安裝包內版本化的最新版圖示重建桌面與開始功能表捷徑，避免沿用舊圖示快取。解除安裝時可選擇把資料移至 `%LOCALAPPDATA%\TaiVPulse\PreservedData-時間`，或在第二次確認後永久刪除所有台V Pulse 本機資料。
+
+從 0.10.0 起，啟動器每天至多自動向 `Shizumu/tai-v-pulse` 的正式 GitHub Releases 檢查一次，也可按「檢查更新」立即確認。檢查請求只會帶入台V Pulse 版本與一般 HTTP 資訊，不會上傳 API Key、資料庫、OAuth、Studio 或監測內容。發現新版時會顯示版本與更新內容，只有使用者確認才會下載；下載檔必須符合預期的 GitHub HTTPS 位置、Release 檔案大小及 SHA-256。若正在執行背景資料工作，啟動器會要求稍後再更新。驗證完成後由暫存的獨立更新程序等待舊啟動器關閉，再沿用上述覆蓋升級流程並重新啟動新版。
 
 自動安裝只會要求 Windows Package Manager 安裝 `OpenJS.NodeJS.LTS` 與 `Python.Python.3.13`；如果 WinGet 不存在或安裝失敗，程式只會開啟 Node.js 與 Python 官方下載頁，不會從其他網站下載執行檔。
 
@@ -36,13 +38,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 這只影響目前 PowerShell 視窗。
 
-## 0.9.0 重點
+## 0.10.0 重點
 
-- 監測首頁可匯出／匯入版本化的公開監測資料包；匯入前會驗證 manifest、SHA-256、筆數與資料關聯，再由使用者選擇合併或取代公開資料。資料包不包含 API Key、OAuth、Studio、手動補值、工作區設定或候選紀錄，也不應以整個 `work/` 或 SQLite 代替。
-- 內容環境新增可點擊的直播時段熱圖、統計範圍說明、混合主題與人工分類／遊戲名稱修正；這些分類屬於台V Pulse 的可檢查規則，不是 YouTube Analytics 官方分類。
-- 趨勢圖表新增 7～365 天與自訂期間、比較群組／組織範圍、四項市場排行、熱門內容主題及固定頻道比較；頻道工作區改為清楚區分個人、團隊、公開監測與私人 OAuth／Studio 資料。
-- 全頻道開台加強掃描改為台北時間 `00:05`、`01:05`、`08:05`、`12:05`、`15:05`、`18:05`～`23:05`，降低冷清時段的 API 消耗；已知預告／直播仍依設定輪詢同接，完整上傳掃描仍每 4 小時執行。
-- 上傳播放清單失效時會略過該頻道並保留既有資料，不再讓單一 404 中止整批更新；監測首頁會顯示可理解的警示，技術識別資訊只留在本機診斷紀錄。
+- Windows 啟動器新增非強制的更新檢查、一鍵下載、GitHub Release 來源限制、檔案大小與 SHA-256 驗證，以及避開背景資料工作的更新確認。
+- 新增獨立 `TaiVPulseUpdater.exe`，從暫存位置等待舊啟動器關閉，再執行既有覆蓋升級並驗證安裝後版本，避免執行中的 EXE 自行覆寫。
+- 正式 GitHub repository 可在推送 `vX.Y.Z` 標籤後，由 GitHub Actions 自動執行測試、公開白名單打包、Windows 安裝程式建置、校驗檔核對及 GitHub Release 發布。
+- 修正 0.9.0 匯出的公開監測資料若含舊影片 `tags=null`，會被同版本匯入預覽錯誤拒絕；既有 ZIP 不需重做，更新目的端後即可直接匯入。
 
 ## 對外版限制
 
@@ -54,6 +55,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 - 關機、睡眠、斷網或程式停止期間的即時同接無法回填。
 - 分時加強掃描以台北時間固定執行；冷清時段仍可能遇到未預告且兩次掃描之間直接開播的頻道，無法保證零漏接。
 - 安裝程式未經程式碼簽章，Windows SmartScreen 可能顯示未知發行者；發布時必須同時提供 SHA-256。
+- 自動更新目前信任 GitHub HTTPS 與 Release API 提供的 SHA-256，尚未加入 Authenticode 或專案自己的離線簽章；因此仍會先顯示版本並要求使用者確認，不做強制靜默更新。
 - 尚未在另一台乾淨電腦完成 Node.js／Python 自動安裝、長時間運作、升級及備份還原的整條實機驗收。
 
 ## 錯誤代碼與診斷報告
@@ -64,9 +66,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 - `TVP-E401`／`TVP-E402`：npm 或前端套件安裝失敗。
 - `TVP-E403`：Python 時區資料安裝失敗。
 - `TVP-E501`／`TVP-E502`：本機資料服務或網頁服務啟動失敗。
+- `TVP-E801`：無法取得或解析正式 GitHub Release 更新資訊。
+- `TVP-E802`：更新下載、檔案大小、SHA-256 或獨立更新程序驗證失敗。
 - `TVP-D001`：診斷報告建立失敗。
 
-啟動器的「匯出診斷報告」會在桌面建立 `TaiVPulse-diagnostics-日期時間.zip`。內容只取最近的啟動、前端、後端與安裝 LOG，並遮蔽 API Key、Windows 使用者名稱及電腦名稱；不會收錄 `.env`、OAuth JSON／token、SQLite、`work/` 內其他資料或 Studio 原始檔。回報問題時請同時提供畫面上的錯誤代碼與這個 ZIP。
+啟動器的「匯出診斷報告」會在桌面建立 `TaiVPulse-diagnostics-日期時間.zip`。內容只取最近的啟動、前端、後端、安裝與更新 LOG，並遮蔽 API Key、Windows 使用者名稱及電腦名稱；不會收錄 `.env`、OAuth JSON／token、SQLite、`work/` 內其他資料或 Studio 原始檔。回報問題時請同時提供畫面上的錯誤代碼與這個 ZIP。
 
 OAuth 常見問題可直接在「頻道工作區 → 連線或同步遇到問題？」查看：403 測試使用者、Analytics API 未啟用、測試 token 七天後失效、scope 不完整、錯誤 OAuth JSON、Google 尚無資料、配額與網路問題均附繁中處理步驟。按「立即同步」後會維持「同步中…」並自動等待結果，不需要重複點擊；Google 英文原文只放在可展開的技術細節。
 
