@@ -1,8 +1,22 @@
 # 台V Pulse 目前狀態
 
 更新日期：2026-08-01
-版本：`0.9.0`
-狀態：`0.9.0` 正式公開 ZIP、Windows 安裝程式與 SHA-256 已建立；包含公開監測資料搬遷、直播熱圖／分類、監測首頁與趨勢資訊層級、失效上傳播放清單容錯、頻道工作區個人／團隊分段，以及配額友善的分時開台加強掃描。自動化與隔離安裝驗證已通過，另一台乾淨 Windows、真實 Google OAuth、兩台電腦資料搬遷及長時間實機驗收仍待確認。
+版本：`0.10.0`
+狀態：`0.10.0` 已實作 0.9.0 公開資料匯入相容修正、Windows 非強制一鍵更新與 GitHub 標籤自動建置／Release 流程；本機正式 ZIP、Windows 安裝程式與 SHA-256 已建立並通過隔離安裝驗證。0.9.0 使用者仍須先手動安裝一次 0.10.0，之後才可使用內建更新器；GitHub 尚未推送 0.10.0 標籤或建立 Release。
+
+## `0.10.0` 更新與資料搬遷修正
+
+- `collector/public_transfer.py` 現在接受 SQLite schema 原本就允許的舊影片 `tags=null`。使用 2026-08-01 實際由 0.9.0 匯出的 2.28 MB 公開監測 ZIP 重跑，預覽已通過，辨識 152 個頻道與 1,756 支影片；原始 ZIP 未修改，目的端更新後可直接匯入。
+- Windows 啟動器新增「檢查更新」。每天最多自動查詢一次 `Shizumu/tai-v-pulse` 正式 GitHub Release，也可手動檢查；只接受非草稿、非預發佈的語意版本，以及符合預期檔名與 GitHub HTTPS Release 路徑的安裝程式。
+- 下載前由使用者確認版本與 Release 說明；下載後核對 GitHub Release API 的資產大小及 SHA-256，失敗不執行。背景資料工作仍在執行時會要求稍後更新，不中斷正在進行的匯入或同步。
+- 新增 `TaiVPulseUpdater.exe`。啟動器把它複製到獨立暫存目錄後關閉；更新器等待舊程序結束，再以 `--silent --no-launch` 執行既有安裝器、驗證安裝後版本並重新啟動。`.env`、`work/`、SQLite、OAuth、Studio、個人設定與 `node_modules` 沿用既有覆蓋升級保留規則。
+- `.github/workflows/release.yml` 只在 `vX.Y.Z` 標籤推送時執行，先確認標籤與 `package.json` 相符，再跑 collector、TypeScript、lint、production build、rendered HTML 與 Windows 測試；通過後呼叫正式白名單 ZIP／EXE 腳本、核對 sidecar 並建立 GitHub Release。
+- `scripts/package-public.ps1` 白名單新增 `.github` workflow 與 YAML 絕對路徑檢查；`scripts/build-windows-installer.ps1` 會編譯、封裝並驗證更新輔助程式。`export-diagnostics.ps1` 僅增加最近 updater LOG，仍套用遮蔽且不收錄私人資料。
+- 自動更新目前沒有 Authenticode 或專案自己的離線簽章；SHA-256 與 HTTPS 可驗證本次下載和 GitHub Release 一致，但不能取代發行者簽章。因此本版不強制靜默更新，仍由使用者確認。
+- 0.9.0 及更早版本沒有更新檢查程式碼，無法被遠端補上；首次必須手動覆蓋安裝 0.10.0。GitHub Actions 真實標籤執行、正式 Release 查詢、跨版本下載／程序交接與另一台 Windows 實機更新仍需發布後驗收。
+- 正式公開 ZIP：`outputs/tai-v-pulse-0.10.0-public.zip`；307,430 bytes；SHA-256 `f580d473154e375f974bf975e4de59b4713535f1a93c2aa34efb2035211d3cbf`。ZIP 共 54 個檔案，包含 release workflow、更新器原始碼與搬遷修正；未發現 `.env`、`work/`、SQLite／DB、OAuth、Studio 檔、依賴、LOG、EXE 或 Git metadata，`.env.example` 的 API Key 為空白，所有 PowerShell 腳本含 UTF-8 BOM。
+- 正式 Windows 安裝程式：`outputs/tai-v-pulse-0.10.0-setup.exe`；403,968 bytes；SHA-256 `b3fb451b05d2974188f134f006155dd2646f903aa730780f492b510124a7d2a1`；檔案版本 `0.10.0.0`、產品版本 `0.10.0`。隔離安裝後 `TaiVPulse.exe` 與 `TaiVPulseUpdater.exe` 均為 `0.10.0`，沒有產生 `.env` 或 SQLite；建置流程另已驗證覆蓋升級保留 `.env`、SQLite、`node_modules` 並清除淘汰程式檔。
+- 測試：`python -m unittest tests.test_collector` 42 項通過；實際 0.9.0 公開 ZIP 的預覽、合併、取代均成功並保留 7 筆 `tags=null`；TypeScript 通過；rendered HTML 7 項通過；Windows 啟動／更新結構及 UTF-8 測試通過；production build 通過六個 route；lint 0 errors、64 個既有 `<img>` 警告。GitHub workflow YAML 已解析，但未在 GitHub Actions 實際執行。
 
 ## `0.9.0` 正式發佈結果
 

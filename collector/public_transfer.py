@@ -87,6 +87,10 @@ JSON_LIST_COLUMNS = {
     ("video_classification_overrides", "content_topics"),
 }
 
+NULLABLE_JSON_LIST_COLUMNS = {
+    ("videos", "tags"),
+}
+
 REQUIRED_TEXT_COLUMNS = {
     "channels": ("channel_id", "title", "created_at", "updated_at"),
     "channel_snapshots": ("channel_id", "captured_at"),
@@ -279,6 +283,8 @@ def _validate_record(table: str, row: dict[str, Any], columns: tuple[str, ...], 
         if json_table != table:
             continue
         value = row.get(column)
+        if value is None and (table, column) in NULLABLE_JSON_LIST_COLUMNS:
+            continue
         if not isinstance(value, str):
             raise ValueError(f"{TABLE_LABELS[table]}第 {row_number} 筆的 {column} 不是 JSON 文字")
         try:

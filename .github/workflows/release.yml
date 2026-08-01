@@ -1,0 +1,119 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify tag matches package version
+        shell: pwsh
+        run: |
+          $version = [string](Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match package.json version $version."
+          }
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run collector tests
+        run: python -m unittest tests.test_collector
+
+      - name: Run TypeScript and lint checks
+        shell: pwsh
+        run: |
+          npx tsc --noEmit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run lint
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and verify rendered HTML
+        shell: pwsh
+        run: |
+          $env:WRANGLER_LOG_PATH = '.wrangler/release-build.log'
+          npx vinext build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test tests/rendered-html.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run Windows launcher checks
+        shell: powershell
+        run: |
+          .\tests\windows-startup.test.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\tests\windows-encoding.test.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build public ZIP and Windows installer
+        shell: powershell
+        run: |
+          .\scripts\package-public.ps1
+          .\scripts\build-windows-installer.ps1
+
+      - name: Verify release assets and checksums
+        shell: pwsh
+        run: |
+          $version = [string](Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+          $assets = @(
+            "outputs/tai-v-pulse-$version-public.zip",
+            "outputs/tai-v-pulse-$version-public.zip.sha256",
+            "outputs/tai-v-pulse-$version-setup.exe",
+            "outputs/tai-v-pulse-$version-setup.exe.sha256"
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing release asset: $asset" }
+          }
+          foreach ($payload in @($assets[0], $assets[2])) {
+            $sidecar = Get-Content -LiteralPath "$payload.sha256" -Raw
+            $expected = ($sidecar -split '\s+')[0].Trim().ToLowerInvariant()
+            $actual = (Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) { throw "SHA-256 mismatch: $payload" }
+          }
+
+      - name: Retain verified assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: tai-v-pulse-${{ github.ref_name }}
+          path: |
+            outputs/tai-v-pulse-*-public.zip
+            outputs/tai-v-pulse-*-public.zip.sha256
+            outputs/tai-v-pulse-*-setup.exe
+            outputs/tai-v-pulse-*-setup.exe.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = [string](Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+          $assets = @(
+            "outputs/tai-v-pulse-$version-public.zip",
+            "outputs/tai-v-pulse-$version-public.zip.sha256",
+            "outputs/tai-v-pulse-$version-setup.exe",
+            "outputs/tai-v-pulse-$version-setup.exe.sha256"
+          )
+          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --generate-notes --title "台V Pulse $version"

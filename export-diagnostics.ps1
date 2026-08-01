@@ -141,8 +141,9 @@ try {
 
     $installerLogRoot = Join-Path $env:LOCALAPPDATA 'TaiVPulse\logs'
     if (Test-Path -LiteralPath $installerLogRoot -PathType Container) {
-        Get-ChildItem -LiteralPath $installerLogRoot -Filter 'installer-*.log' -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
+        Get-ChildItem -LiteralPath $installerLogRoot -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'installer-*.log' -or $_.Name -like 'updater-*.log' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 4 | ForEach-Object {
                 $text = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                 if ($null -eq $text) { $text = '' }
                 Set-Content -LiteralPath (Join-Path $stagingRoot $_.Name) -Value (Protect-DiagnosticText $text) -Encoding UTF8

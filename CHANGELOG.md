@@ -2,9 +2,37 @@
 
 本檔記錄可由實際程式碼與專案文件確認、且會影響使用者的變更；尚未建立版本產物的內容先放在「未發佈」，正式打包後再移入對應版本。
 
-`0.7.0` 至 `0.9.0` 的日期依 `outputs/` 內同版本產物的建立日期記錄；若正式對外發布日期不同，需再人工更正。
+`0.7.0` 至 `0.10.0` 的日期依 `outputs/` 內同版本產物的建立日期記錄；若正式對外發布日期不同，需再人工更正。
 
 ## [未發佈]
+
+## [0.10.0] - 2026-08-01
+
+### 新增
+
+- Windows 啟動器新增「檢查更新」及每日最多一次的非強制背景檢查；只讀取 `Shizumu/tai-v-pulse` 正式 GitHub Release，發現新版時顯示版本與更新內容，由使用者確認後才下載。
+- 更新下載限定預期的 GitHub HTTPS Release 路徑，並逐一驗證資產檔名、檔案大小與 GitHub Release API 提供的 SHA-256；不相符時不執行安裝。
+- 新增獨立 `TaiVPulseUpdater.exe`，從暫存位置等待舊啟動器關閉，再呼叫既有覆蓋升級、驗證安裝後版本並重新啟動，避免執行中的 EXE 自行覆寫。
+- 新增 `.github/workflows/release.yml`：推送與 `package.json` 相符的 `vX.Y.Z` 標籤時，自動執行後端、型別、lint、production build、渲染及 Windows 啟動檢查，再經正式白名單流程建立並發布 ZIP、EXE 與 SHA-256。
+
+### 安全性
+
+- 更新前會確認目前沒有背景資料工作；覆蓋升級繼續保留 `.env`、`work/`、SQLite、OAuth、Studio、個人設定與既有 `node_modules`，更新檢查不會上傳這些內容。
+- 更新不是強制執行；現階段仍未提供 Authenticode 或專案離線簽章，因此保留使用者確認，並以 GitHub HTTPS、正式 Release 資產與 SHA-256 作為必要驗證。
+- 診斷匯出白名單新增最近的更新器 LOG，沿用既有 API Key、Windows 使用者名稱及電腦名稱遮蔽，仍不包含 `.env`、SQLite、OAuth 或 Studio 原始檔。
+
+### 修正
+
+- 修正 0.9.0 公開監測 ZIP 中合法的舊影片 `tags=null` 會被同版本匯入預覽錯誤拒絕；既有資料包不需重做，0.10.0 可直接預覽並以合併或取代方式匯入。
+
+### 發佈產物
+
+- 已於 2026-08-01 依正式白名單流程建立本機 `tai-v-pulse-0.10.0-public.zip` 與 `tai-v-pulse-0.10.0-setup.exe`；ZIP SHA-256 為 `f580d473154e375f974bf975e4de59b4713535f1a93c2aa34efb2035211d3cbf`，Windows 安裝程式 SHA-256 為 `b3fb451b05d2974188f134f006155dd2646f903aa730780f492b510124a7d2a1`，均已獨立重算並與 sidecar 一致。GitHub 尚未推送標籤或建立 0.10.0 Release。
+
+### 已知限制
+
+- 0.9.0 與更早版本沒有內建更新器，必須先手動覆蓋安裝一次 0.10.0；後續正式 GitHub Release 才能由啟動器一鍵更新。
+- GitHub 標籤發布流程與跨版本一鍵更新仍需在正式 repository 及另一台 Windows 電腦實際驗收；本機測試不等同 GitHub Actions 或實機更新成功。
 
 ## [0.9.0] - 2026-08-01
 

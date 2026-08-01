@@ -219,6 +219,7 @@ using System.Reflection;
         "/win32icon:$iconPath",
         "/reference:$(Join-Path $frameworkRoot 'System.dll')",
         "/reference:$(Join-Path $frameworkRoot 'System.Drawing.dll')",
+        "/reference:$(Join-Path $frameworkRoot 'System.Web.Extensions.dll')",
         "/reference:$(Join-Path $frameworkRoot 'System.Windows.Forms.dll')"
     )
     Invoke-CSharpCompiler -Compiler $compiler -Label '啟動器' -Arguments ($commonCompilerArguments + @(
@@ -229,6 +230,16 @@ using System.Reflection;
 
     if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
         throw '[TVP-B007] 啟動器編譯完成後找不到 TaiVPulse.exe。'
+    }
+
+    $updaterPath = Join-Path $releaseRoot 'TaiVPulseUpdater.exe'
+    Invoke-CSharpCompiler -Compiler $compiler -Label '更新輔助程式' -Arguments ($commonCompilerArguments + @(
+        "/out:$updaterPath",
+        $assemblyInfoPath,
+        (Join-Path $projectRoot 'windows\TaiVPulseUpdater.cs')
+    ))
+    if (-not (Test-Path -LiteralPath $updaterPath -PathType Leaf)) {
+        throw '[TVP-B014] 更新輔助程式編譯完成後找不到 TaiVPulseUpdater.exe。'
     }
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -262,7 +273,7 @@ using System.Reflection;
     if ($validation.ExitCode -ne 0) {
         throw "[TVP-B008] 安裝程式解壓縮驗證失敗，結束碼：$($validation.ExitCode)"
     }
-    foreach ($required in @('.tai-v-pulse-manifest.txt', 'TaiVPulse.exe', $installedIconName, 'start-local.ps1', 'requirements.txt', 'export-diagnostics.ps1', 'LICENSE', 'NOTICE')) {
+    foreach ($required in @('.tai-v-pulse-manifest.txt', 'TaiVPulse.exe', 'TaiVPulseUpdater.exe', $installedIconName, 'start-local.ps1', 'requirements.txt', 'export-diagnostics.ps1', 'LICENSE', 'NOTICE')) {
         if (-not (Test-Path -LiteralPath (Join-Path $validationRoot $required) -PathType Leaf)) {
             throw "[TVP-B008] 安裝驗證缺少檔案：$required"
         }
@@ -319,6 +330,10 @@ using System.Reflection;
     $installedLauncherVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $validationRoot 'TaiVPulse.exe')).FileVersion
     if ($installedLauncherVersion -ne $assemblyVersion) {
         throw "[TVP-B011] 啟動器檔案版本錯誤：$installedLauncherVersion"
+    }
+    $installedUpdaterVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $validationRoot 'TaiVPulseUpdater.exe')).FileVersion
+    if ($installedUpdaterVersion -ne $assemblyVersion) {
+        throw "[TVP-B014] 更新輔助程式檔案版本錯誤：$installedUpdaterVersion"
     }
 
     Copy-Item -LiteralPath $tempInstaller -Destination $installerPath

@@ -1674,6 +1674,9 @@ class CollectorTests(unittest.TestCase):
             )
             database.upsert_video(self.public_video_item())
             database.execute(
+                "UPDATE videos SET tags=NULL WHERE video_id='video-public'"
+            )
+            database.execute(
                 """INSERT INTO video_classification_overrides
                    (video_id,content_topics,game_name,note,updated_at) VALUES (?,?,?,?,?)""",
                 ("video-public", '["遊戲"]', "測試遊戲", "使用者已確認", utc_now()),
@@ -1741,6 +1744,15 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(preview["counts"]["videos"], 1)
             self.assertEqual(preview["counts"]["video_classification_overrides"], 1)
             self.assertEqual(preview["counts"]["excluded_channels"], 0)
+
+            destination = Database(Path(directory) / "nullable-tags-destination.sqlite3")
+            destination.import_public_monitoring(package_bytes, "merge")
+            self.assertIsNone(
+                destination.scalar(
+                    "SELECT tags FROM videos WHERE video_id='video-public'"
+                )
+            )
+            destination.close()
 
             _, full_package, _ = database.export_public_monitoring(
                 include_blacklist=True,
