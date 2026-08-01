@@ -1,7 +1,8 @@
 "use client";
 /* eslint-disable react-hooks/set-state-in-effect */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import LegalFooter from "../legal-footer";
 import SiteHeader from "../site-header";
 
@@ -93,6 +94,10 @@ type Trends = {
       median_stickiness: number | null;
     }[];
   };
+  organization_coverage?: {
+    scope_channels: number;
+    named_channels: number;
+  };
   series: {
     channel_id: string;
     title: string;
@@ -117,6 +122,8 @@ const TIERS: Record<string, [number, number, string]> = {
 };
 
 const COLORS = ["#2ca981", "#ce6f93", "#4c8ecb", "#8b72ca", "#c18a2d"];
+const PERIOD_OPTIONS = [7, 14, 30, 90, 365] as const;
+const TOPIC_OPTIONS = ["全部", "遊戲", "雜談", "歌回", "ASMR", "音樂作品", "紀念／重大活動", "其他"] as const;
 
 type HistoryField = "subscriber_count" | "view_count" | "video_count";
 type ChartMetric = "subscribers" | "subscriber_growth" | "views" | "view_growth" | "videos";
@@ -144,13 +151,145 @@ function percent(value: number | null | undefined) {
   return `${value.toFixed(Math.abs(value) < 10 ? 1 : 0)}%`;
 }
 
+function matchesContentTopic(video: RankedVideo, topic: string) {
+  if (topic === "全部") return true;
+  return video.content_type.split("+").some((part) => part.trim() === topic);
+}
+
 function DeltaBadge({ delta, label, collectedDays }: { delta: Delta; label: string; collectedDays: number }) {
-  if (!delta.ready || delta.change === null) {
-    return <button className="delta-badge pending" type="button" aria-label={`${label}歷史資料累積中`}><span>◷</span><i><strong>資料累積中</strong><small>已累積 {collectedDays.toFixed(1)}／{delta.period_days} 天</small><small>累積完成後自動顯示漲跌</small></i></button>;
-  }
-  const state = delta.change > 0 ? "up" : delta.change < 0 ? "down" : "flat";
-  const arrow = state === "up" ? "↑" : state === "down" ? "↓" : "→";
-  return <button className={`delta-badge ${state}`} type="button" aria-label={`${label}${state === "up" ? "上升" : state === "down" ? "下降" : "持平"}`}><span>{arrow}</span><i><strong>與 {delta.period_days} 天前比較</strong><small>目前：{exact(delta.current)}</small><small>先前：{exact(delta.previous)}</small><small>變化：{delta.change > 0 ? "+" : ""}{exact(delta.change)}（{delta.percent_change !== null && delta.percent_change > 0 ? "+" : ""}{percent(delta.percent_change)}）</small>{delta.basis_at && <small>基準：{new Date(delta.basis_at).toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })}</small>}</i></button>;
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  const suppressFocusOpenRef = useRef(false);
+  const popoverId = useId();
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<{ top: number; left: number; placement: "up" | "down" } | null>(null);
+  const ready = delta.ready && delta.change !== null;
+  const state = !ready ? "pending" : delta.change! > 0 ? "up" : delta.change! < 0 ? "down" : "flat";
+  const arrow = state === "pending" ? "◷" : state === "up" ? "↑" : state === "down" ? "↓" : "→";
+  const stateLabel = state === "pending" ? "歷史資料累積中" : state === "up" ? "上升" : state === "down" ? "下降" : "持平";
+
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+  }, []);
+
+  const openPopover = useCallback(() => {
+    clearCloseTimer();
+    setOpen(true);
+  }, [clearCloseTimer]);
+
+  const closePopover = useCallback((restoreFocus = false) => {
+    clearCloseTimer();
+    setOpen(false);
+    setPosition(null);
+    if (restoreFocus) {
+      suppressFocusOpenRef.current = true;
+      window.requestAnimationFrame(() => {
+        triggerRef.current?.focus();
+        suppressFocusOpenRef.current = false;
+      });
+    }
+  }, [clearCloseTimer]);
+
+  const scheduleClose = useCallback(() => {
+    clearCloseTimer();
+    closeTimerRef.current = window.setTimeout(() => {
+      const active = document.activeElement;
+      if (triggerRef.current?.matches(":hover") || popoverRef.current?.matches(":hover") || triggerRef.current?.contains(active) || popoverRef.current?.contains(active)) return;
+      setOpen(false);
+      setPosition(null);
+    }, 160);
+  }, [clearCloseTimer]);
+
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const popover = popoverRef.current;
+    if (!trigger || !popover) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const popoverWidth = popover.offsetWidth;
+    const popoverHeight = popover.offsetHeight;
+    const margin = 12;
+    const gap = 9;
+    const spaceAbove = triggerRect.top - margin - gap;
+    const spaceBelow = window.innerHeight - triggerRect.bottom - margin - gap;
+    const placement = spaceBelow >= popoverHeight || spaceBelow >= spaceAbove ? "down" : "up";
+    const preferredTop = placement === "down" ? triggerRect.bottom + gap : triggerRect.top - popoverHeight - gap;
+    const top = Math.min(Math.max(margin, preferredTop), Math.max(margin, window.innerHeight - popoverHeight - margin));
+    const left = Math.min(Math.max(margin, triggerRect.right - popoverWidth), Math.max(margin, window.innerWidth - popoverWidth - margin));
+    setPosition({ top, left, placement });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    updatePosition();
+    const frame = window.requestAnimationFrame(updatePosition);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closePopover(true);
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node) || triggerRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
+      closePopover();
+    };
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [closePopover, open, updatePosition]);
+
+  useEffect(() => () => clearCloseTimer(), [clearCloseTimer]);
+
+  return <>
+    <button
+      ref={triggerRef}
+      className={`delta-badge ${state}`}
+      type="button"
+      aria-label={`${label}${stateLabel}`}
+      aria-expanded={open}
+      aria-controls={open ? popoverId : undefined}
+      aria-haspopup="dialog"
+      onMouseEnter={openPopover}
+      onMouseLeave={scheduleClose}
+      onFocus={() => { if (!suppressFocusOpenRef.current) openPopover(); }}
+      onBlur={scheduleClose}
+      onClick={openPopover}
+    ><span>{arrow}</span></button>
+    {open && typeof document !== "undefined" && createPortal(
+      <div
+        ref={popoverRef}
+        id={popoverId}
+        className="delta-popover"
+        data-placement={position?.placement ?? "down"}
+        role="dialog"
+        aria-label={`${label}詳細比較`}
+        style={position ? { top: position.top, left: position.left } : { top: 0, left: 0, visibility: "hidden" }}
+        onMouseEnter={clearCloseTimer}
+        onMouseLeave={scheduleClose}
+        onFocusCapture={clearCloseTimer}
+        onBlurCapture={scheduleClose}
+      >
+        <div className="delta-popover-heading"><strong>{ready ? `與 ${delta.period_days} 天前比較` : "資料累積中"}</strong><button type="button" onClick={() => closePopover(true)} aria-label="關閉比較跳卡">×</button></div>
+        {ready ? <>
+          <small>目前：{exact(delta.current)}</small>
+          <small>先前：{exact(delta.previous)}</small>
+          <small>變化：{delta.change! > 0 ? "+" : ""}{exact(delta.change)}（{delta.percent_change !== null && delta.percent_change > 0 ? "+" : ""}{percent(delta.percent_change)}）</small>
+          {delta.basis_at && <small>基準：{new Date(delta.basis_at).toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })}</small>}
+        </> : <>
+          <small>已累積 {collectedDays.toFixed(1)}／{delta.period_days} 天</small>
+          <small>累積完成後自動顯示漲跌</small>
+        </>}
+      </div>,
+      document.body,
+    )}
+  </>;
 }
 
 function ComparisonChart({ series, peerSeries, metric }: { series: Trends["series"]; peerSeries: Trends["peer_series"]; metric: ChartMetric }) {
@@ -239,7 +378,9 @@ export default function TrendsDashboard() {
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [days, setDays] = useState(30);
+  const [days, setDays] = useState(7);
+  const [periodMode, setPeriodMode] = useState("7");
+  const [customDays, setCustomDays] = useState("30");
   const [mode, setMode] = useState("all");
   const [tier, setTier] = useState("5k-10k");
   const [customMin, setCustomMin] = useState(1000);
@@ -249,9 +390,11 @@ export default function TrendsDashboard() {
   const [cohortIds, setCohortIds] = useState<string[]>([]);
   const [comparisonIds, setComparisonIds] = useState<string[]>([]);
   const [formatType, setFormatType] = useState("主要內容");
+  const [contentTopic, setContentTopic] = useState("全部");
+  const [organizationScope, setOrganizationScope] = useState<"peer" | "all">("peer");
   const [includeGraduated, setIncludeGraduated] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [ranking, setRanking] = useState<"growth_30" | "growth_7" | "subscribers" | "median_views" | "stickiness" | "ccv_rate">("growth_30");
+  const [ranking, setRanking] = useState<"subscribers" | "median_views" | "stickiness" | "ccv_rate">("subscribers");
   const [chartMetric, setChartMetric] = useState<ChartMetric>("subscribers");
   const [savedGroups, setSavedGroups] = useState<{ name: string; ids: string[] }[]>([]);
   const [groupName, setGroupName] = useState("");
@@ -317,7 +460,7 @@ export default function TrendsDashboard() {
       return;
     }
     const controller = new AbortController();
-    const params = new URLSearchParams({ days: String(days), min_subscribers: String(range[0]), max_subscribers: String(range[1]), category, format_type: formatType, include_graduated: String(includeGraduated) });
+    const params = new URLSearchParams({ days: String(days), min_subscribers: String(range[0]), max_subscribers: String(range[1]), category, format_type: formatType, content_topic: contentTopic, organization_scope: organizationScope, include_graduated: String(includeGraduated) });
     if (referenceId) params.set("reference_channel_id", referenceId);
     if (mode === "channels") params.set("channel_ids", cohortKey);
     if (comparisonKey) params.set("comparison_ids", comparisonKey);
@@ -334,7 +477,13 @@ export default function TrendsDashboard() {
       })
       .finally(() => setLoading(false));
     return () => controller.abort();
-  }, [category, cohortKey, comparisonKey, days, formatType, includeGraduated, mode, range, referenceAvailable, referenceId, refreshKey, summaryReady]);
+  }, [category, cohortKey, comparisonKey, contentTopic, days, formatType, includeGraduated, mode, organizationScope, range, referenceAvailable, referenceId, refreshKey, summaryReady]);
+
+  function commitCustomDays() {
+    const normalized = Math.max(7, Math.min(365, Number.parseInt(customDays, 10) || 7));
+    setCustomDays(String(normalized));
+    setDays(normalized);
+  }
 
   function addId(setter: (value: string[] | ((current: string[]) => string[])) => void, id: string) {
     if (!id || id === referenceId) return;
@@ -350,10 +499,22 @@ export default function TrendsDashboard() {
   }
 
   const rankingRows = trends?.rankings[ranking] ?? [];
-  const rankingMetric = (row: TrendChannel) => ranking === "subscribers" ? row.subscriber_count : ranking === "median_views" ? row.median_views : ranking === "stickiness" ? row.stickiness : ranking === "ccv_rate" ? row.ccv_rate : ranking === "growth_7" ? row.subscriber_delta_7.percent_change : row.subscriber_delta_30.percent_change;
-  const rankingDelta = (row: TrendChannel) => ranking === "growth_7" ? row.subscriber_delta_7 : ranking === "growth_30" || ranking === "subscribers" ? row.subscriber_delta_30 : ranking === "median_views" ? row.median_views_delta : ranking === "stickiness" ? row.stickiness_delta : row.ccv_rate_delta;
-  const metricLabel = ranking === "subscribers" ? "訂閱數" : ranking === "median_views" ? "觀看中位數" : ranking === "stickiness" ? "公開觀看黏著度" : ranking === "ccv_rate" ? "同接／訂閱比" : ranking === "growth_7" ? "7 日訂閱成長" : "30 日訂閱成長";
-  const metricFormatter = (value: number | null) => ["stickiness", "ccv_rate", "growth_7", "growth_30"].includes(ranking) ? percent(value) : compact(value);
+  const organizationCoverage = trends?.organization_coverage ?? {
+    scope_channels: trends?.overview.peer_channels ?? 0,
+    named_channels: 0,
+  };
+  const visibleTopVideos = trends?.rankings.top_videos.filter((video) => matchesContentTopic(video, contentTopic)) ?? [];
+  const rankingMetric = (row: TrendChannel) => ranking === "subscribers" ? row.subscriber_count : ranking === "median_views" ? row.median_views : ranking === "stickiness" ? row.stickiness : row.ccv_rate;
+  const rankingDelta = (row: TrendChannel) => ranking === "subscribers" ? row.subscriber_delta_30 : ranking === "median_views" ? row.median_views_delta : ranking === "stickiness" ? row.stickiness_delta : row.ccv_rate_delta;
+  const metricLabel = ranking === "subscribers" ? "訂閱數" : ranking === "median_views" ? "觀看中位數" : ranking === "stickiness" ? "公開觀看黏著度" : "同接／訂閱比";
+  const metricFormatter = (value: number | null) => ["stickiness", "ccv_rate"].includes(ranking) ? percent(value) : compact(value);
+  const rankingExplanation = ranking === "subscribers"
+    ? "依目前公開訂閱數排序；頻道隱藏訂閱數時顯示缺值並排在後方。這是頻道級指標，不受內容形式篩選影響。"
+    : ranking === "median_views"
+      ? `依最近 30 日${formatType === "全部" ? "全部內容" : `符合「${formatType}」的內容`}公開觀看中位數排序；沒有可用內容時顯示缺值。`
+      : ranking === "stickiness"
+        ? `公開觀看黏著度＝最近 30 日${formatType === "全部" ? "全部內容" : `符合「${formatType}」的內容`}觀看中位數／目前訂閱數；缺少內容或訂閱數時不計算，也不是 Studio 回訪觀眾或留存率。`
+        : `同接／訂閱比＝最近 30 日${formatType === "全部" ? "直播" : `符合「${formatType}」且有同接樣本的直播`}最高同接中位數／目前訂閱數；沒有同接樣本或訂閱數時不計算。`;
   const maxMetric = Math.max(1, ...rankingRows.slice(0, 15).map((row) => Math.max(0, Number(rankingMetric(row) ?? 0))));
 
   return <main className="app-shell trends-shell">
@@ -364,37 +525,34 @@ export default function TrendsDashboard() {
     <section className="panel trend-controls">
       <div className="control-intro"><p className="section-kicker">COMPARISON BUILDER</p><h2>以我的頻道建立比較</h2><p>基準頻道不納入同級中位數；公開資料可公平比較，Studio 私人指標只顯示在自己的區塊。</p></div>
       <div className="trend-control-grid">
-        <label><span>期間</span><select value={days} onChange={(event) => setDays(Number(event.target.value))}><option value={7}>7 天</option><option value={30}>30 天</option><option value={90}>90 天</option><option value={365}>1 年</option></select></label>
-        <label><span>比較群組</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">全部頻道</option><option value="relative">基準頻道 0.5～2 倍</option><option value="tier">固定量級</option><option value="range">自訂量級</option><option value="channels">指定頻道群組</option></select></label>
-        {mode === "tier" && <label><span>訂閱級距</span><select value={tier} onChange={(event) => setTier(event.target.value)}>{Object.entries(TIERS).map(([key, value]) => <option value={key} key={key}>{value[2]}</option>)}</select></label>}
-        {mode === "range" && <div className="range-controls"><label><span>最低訂閱</span><input type="number" min={0} value={customMin} onChange={(event) => setCustomMin(Number(event.target.value))} /></label><label><span>最高訂閱</span><input type="number" min={customMin} value={customMax} onChange={(event) => setCustomMax(Number(event.target.value))} /></label></div>}
-        {mode === "channels" && <label><span>加入群組</span><select value="" onChange={(event) => addId(setCohortIds, event.target.value)}><option value="">選擇頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !cohortIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}</option>)}</select></label>}
+        <div className="trend-filter-stack period-filter-stack"><label><span>圖表觀察期間</span><select value={periodMode} onChange={(event) => { const value = event.target.value; setPeriodMode(value); if (value !== "custom") { const nextDays = Number(value); setDays(nextDays); setCustomDays(String(nextDays)); } }}>{PERIOD_OPTIONS.map((option) => <option value={option} key={option}>{option} 天</option>)}<option value="custom">自訂天數…</option></select></label>{periodMode === "custom" && <label className="custom-period-control"><span>自訂 7～365 天</span><input type="number" min={7} max={365} step={1} value={customDays} onChange={(event) => setCustomDays(event.target.value)} onBlur={commitCustomDays} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} /></label>}<small>只調整歷史折線；熱門內容與摘要固定最近 30 天。</small></div>
+        <div className="trend-filter-stack"><label><span>比較群組</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">全部頻道</option><option value="relative">基準頻道 0.5～2 倍</option><option value="tier">固定量級</option><option value="range">自訂量級</option><option value="channels">指定頻道群組</option></select></label><label className="graduated-toggle"><input type="checkbox" checked={includeGraduated} onChange={(event) => setIncludeGraduated(event.target.checked)} /><span>包含已確認畢業頻道</span></label>{mode === "tier" && <label className="cohort-mode-control"><span>訂閱級距</span><select value={tier} onChange={(event) => setTier(event.target.value)}>{Object.entries(TIERS).map(([key, value]) => <option value={key} key={key}>{value[2]}</option>)}</select></label>}{mode === "range" && <div className="range-controls cohort-mode-control"><label><span>最低訂閱</span><input type="number" min={0} value={customMin} onChange={(event) => setCustomMin(Number(event.target.value))} /></label><label><span>最高訂閱</span><input type="number" min={customMin} value={customMax} onChange={(event) => setCustomMax(Number(event.target.value))} /></label></div>}{mode === "channels" && <label className="cohort-mode-control"><span>加入群組</span><select value="" onChange={(event) => addId(setCohortIds, event.target.value)}><option value="">選擇頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !cohortIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}</option>)}</select></label>}</div>
         <label><span>頻道分類</span><select value={category} onChange={(event) => setCategory(event.target.value)}><option>全部</option>{summary?.categories.map((item) => <option value={item.category} key={item.category}>{item.category}</option>)}</select></label>
         <label><span>內容形式</span><select value={formatType} onChange={(event) => setFormatType(event.target.value)}><option>主要內容</option><option>直播</option><option value="影片">一般影片</option><option>Shorts</option><option>全部</option></select></label>
         <label className="reference-control"><span>基準頻道</span><select value={referenceId} onChange={(event) => setReferenceId(event.target.value)}><option value="">不設定基準</option>{summary?.owned_channel && !summary.channels.some((channel) => channel.channel_id === summary.owned_channel?.channel_id) && <option value={summary.owned_channel.channel_id}>我的頻道：{summary.owned_channel.title}</option>}{summary?.channels.map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)}</option>)}</select></label>
-        <label><span>固定比較線（最多 5 個）</span><select value="" onChange={(event) => addId(setComparisonIds, event.target.value)}><option value="">加入頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !comparisonIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}</option>)}</select></label>
-        <label className="graduated-toggle"><input type="checkbox" checked={includeGraduated} onChange={(event) => setIncludeGraduated(event.target.checked)} /><span>包含已確認畢業頻道</span></label>
+        <label className="comparison-control"><span>加入固定比較頻道（最多 5 個）</span><select value="" onChange={(event) => addId(setComparisonIds, event.target.value)}><option value="">加入頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !comparisonIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}</option>)}</select></label>
       </div>
-      {mode === "channels" && <div className="cohort-channel-chips"><span>指定群組</span><div className="selected-channel-chips">{cohortIds.map((id) => <button type="button" onClick={() => setCohortIds((current) => current.filter((value) => value !== id))} key={id}>{summary?.channels.find((channel) => channel.channel_id === id)?.title ?? id}<span>×</span></button>)}</div></div>}
-      <div className="comparison-builder-footer"><div><span>圖表固定比較線</span><div className="selected-channel-chips">{comparisonIds.map((id) => <button type="button" onClick={() => setComparisonIds((current) => current.filter((value) => value !== id))} key={id}>{summary?.channels.find((channel) => channel.channel_id === id)?.title ?? id}<span>×</span></button>)}</div></div><div className="save-group-row"><input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="儲存比較組合" /><button type="button" onClick={saveGroup} disabled={!groupName.trim() || comparisonIds.length === 0}>儲存</button>{savedGroups.length > 0 && <select value="" onChange={(event) => { const group = savedGroups.find((item) => item.name === event.target.value); if (group) setComparisonIds(group.ids.slice(0, 5)); }}><option value="">載入組合…</option>{savedGroups.map((group) => <option value={group.name} key={group.name}>{group.name}</option>)}</select>}</div></div>
       <div className="cohort-summary"><span>{referenceId === summary?.owned_channel_id ? "以我的頻道為基準" : "目前比較"}</span><strong>{mode === "relative" && reference ? `${reference.title} 的 0.5～2 倍` : mode === "tier" ? TIERS[tier][2] : mode === "range" ? `${exact(range[0])}～${exact(range[1])}` : mode === "channels" ? `${cohortIds.length} 個指定頻道` : "全部已收錄頻道"}</strong><small>{mode === "channels" ? "指定群組" : `${exact(range[0])}～${range[1] >= 100000000 ? "不限上限" : exact(range[1])} 訂閱`}</small></div>
+      {mode === "channels" && <div className="cohort-channel-chips"><span>指定群組</span><div className="selected-channel-chips">{cohortIds.map((id) => <button type="button" onClick={() => setCohortIds((current) => current.filter((value) => value !== id))} key={id}>{summary?.channels.find((channel) => channel.channel_id === id)?.title ?? id}<span>×</span></button>)}</div></div>}
+      <div className="comparison-selection-strip"><span>圖表固定比較線</span><div className="selected-channel-chips">{comparisonIds.length === 0 ? <small>尚未加入額外頻道</small> : comparisonIds.map((id) => <button type="button" onClick={() => setComparisonIds((current) => current.filter((value) => value !== id))} key={id}>{summary?.channels.find((channel) => channel.channel_id === id)?.title ?? id}<span>×</span></button>)}</div></div>
+      <div className="saved-comparison-toolbar"><span>儲存固定比較組合</span><div className="save-group-row"><input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="組合名稱" aria-label="固定比較組合名稱" /><button type="button" onClick={saveGroup} disabled={!groupName.trim() || comparisonIds.length === 0}>儲存</button>{savedGroups.length > 0 && <select value="" aria-label="載入固定比較組合" onChange={(event) => { const group = savedGroups.find((item) => item.name === event.target.value); if (group) setComparisonIds(group.ids.slice(0, 5)); }}><option value="">載入組合…</option>{savedGroups.map((group) => <option value={group.name} key={group.name}>{group.name}</option>)}</select>}</div></div>
     </section>
 
     {loading && !trends && <section className="panel insight-placeholder">正在整理趨勢資料…</section>}
     {!loading && mode === "channels" && cohortIds.length === 0 && <section className="panel insight-placeholder"><div><strong>先加入要比較的頻道</strong><p>可指定最多 5 個頻道形成自訂比較群組。</p></div></section>}
     {trends && <>
-      {!trends.readiness.month_ready && <section className="notice trend-readiness"><span className="notice-icon">◷</span><div><strong>30 天趨勢正在累積</strong><p>目前已累積 {trends.readiness.collected_days.toFixed(1)} 天；訂閱排行與目前觀看表現可先使用，週／月漲跌會在資料成熟後自動解鎖。</p></div></section>}
+      {!trends.readiness.month_ready && <section className="notice trend-readiness"><span className="notice-icon">◷</span><div><strong>30 天摘要與變化正在累積</strong><p>目前已累積 {trends.readiness.collected_days.toFixed(1)} 天；圖表仍依上方 {days} 天期間顯示已有快照，固定 30 天的觀看摘要與月變化會在資料成熟後解鎖。</p></div></section>}
       <section className="trend-overview-grid">
         <article className="insight-hero primary"><span>同級頻道</span><strong>{trends.overview.peer_channels}</strong><p>{trends.overview.active_channels} 個近 30 天有內容</p></article>
         <article className="insight-hero"><span>同級訂閱中位數</span><strong>{compact(trends.overview.median_subscribers)}</strong><p>不包含基準頻道</p></article>
-        <article className="insight-hero"><span>同級觀看中位數</span><strong>{compact(trends.overview.median_views)}</strong><p>{formatType === "主要內容" ? "不包含 Shorts" : formatType}</p></article>
-        <article className="insight-hero"><span>同級公開黏著度</span><strong>{percent(trends.overview.median_stickiness)}</strong><p>觀看中位數／訂閱數</p></article>
+        <article className="insight-hero"><span>近 30 日觀看中位數</span><strong>{compact(trends.overview.median_views)}</strong><p>{formatType === "主要內容" ? "不包含 Shorts" : formatType}</p></article>
+        <article className="insight-hero"><span>近 30 日公開黏著度</span><strong>{percent(trends.overview.median_stickiness)}</strong><p>觀看中位數／訂閱數</p></article>
         {trends.reference && <article className="insight-hero owned-trend-card"><span>我的公開訂閱</span><div className="metric-with-delta"><strong>{compact(trends.reference.subscriber_count)}</strong><DeltaBadge delta={trends.reference.subscriber_delta_30} label="訂閱數" collectedDays={trends.readiness.collected_days} /></div><p>{trends.reference.title}</p></article>}
         {trends.reference && <article className="insight-hero"><span>我的公開黏著度</span><div className="metric-with-delta"><strong>{percent(trends.reference.stickiness)}</strong><DeltaBadge delta={trends.reference.stickiness_delta} label="公開觀看黏著度" collectedDays={trends.readiness.collected_days} /></div><p>不是 Studio 回訪觀眾</p></article>}
       </section>
 
       <section className="panel trend-chart-panel">
-        <div className="panel-heading"><div><p className="section-kicker">MULTI-METRIC HISTORY</p><h2>固定頻道趨勢比較</h2></div><span>實線為指定頻道 · 灰色虛線為同級中位數</span></div>
+        <div className="panel-heading"><div><p className="section-kicker">MULTI-METRIC HISTORY</p><h2>最近 {days} 天固定頻道趨勢</h2></div><span>此期間只套用歷史折線 · 實線為指定頻道 · 灰色虛線為同級中位數</span></div>
         <div className="chart-metric-toolbar"><div className="format-tabs chart-metric-tabs">{(Object.keys(CHART_METRICS) as ChartMetric[]).map((key) => <button type="button" className={chartMetric === key ? "active" : ""} onClick={() => setChartMetric(key)} key={key}>{CHART_METRICS[key].label}</button>)}</div><span>{CHART_METRICS[chartMetric].description}</span></div>
         <div className="trend-chart"><ComparisonChart series={trends.series} peerSeries={trends.peer_series} metric={chartMetric} /></div>
         <div className="chart-legend"><span><i className="peer" />同級中位數</span>{trends.series.map((row, index) => <span key={row.channel_id}><i style={{ background: COLORS[index % COLORS.length] }} />{row.title}</span>)}</div>
@@ -407,14 +565,14 @@ export default function TrendsDashboard() {
       </section>
 
       <section className="panel ranking-panel">
-        <div className="panel-heading efficiency-heading"><div><p className="section-kicker">MARKET RANKINGS</p><h2>市場排行</h2></div><div className="format-tabs ranking-tabs">{(["growth_30", "growth_7", "subscribers", "median_views", "stickiness", "ccv_rate"] as const).map((key) => <button className={ranking === key ? "active" : ""} type="button" onClick={() => setRanking(key)} key={key}>{key === "growth_30" ? "30日成長" : key === "growth_7" ? "7日成長" : key === "subscribers" ? "訂閱數" : key === "median_views" ? "觀看中位數" : key === "stickiness" ? "公開黏著度" : "同接／訂閱"}</button>)}</div></div>
-        <p className="efficiency-explainer">公開觀看黏著度＝最近 30 日觀看中位數／目前訂閱數；不是 YouTube Studio 的回訪觀眾或留存率。</p>
+        <div className="panel-heading efficiency-heading"><div><p className="section-kicker">MARKET RANKINGS</p><h2>市場排行</h2></div><div className="format-tabs ranking-tabs">{(["subscribers", "median_views", "stickiness", "ccv_rate"] as const).map((key) => <button className={ranking === key ? "active" : ""} type="button" onClick={() => setRanking(key)} key={key}>{key === "subscribers" ? "訂閱數" : key === "median_views" ? "觀看中位數" : key === "stickiness" ? "公開黏著度" : "同接／訂閱"}</button>)}</div></div>
+        <p className="efficiency-explainer">{rankingExplanation}</p>
         <div className="ranking-layout"><div className="trend-bars">{rankingRows.slice(0, 15).map((row, index) => { const value = rankingMetric(row); return <div className={`trend-bar-row${row.is_reference ? " reference" : ""}`} key={row.channel_id}><span>{index + 1}</span><div><strong>{row.title}{row.is_reference ? "（我的頻道）" : ""}</strong><small>{compact(row.subscriber_count)} 訂閱 · {row.recent_items} 項內容</small></div><div className="trend-bar-track"><i style={{ width: `${Math.max(2, Math.max(0, Number(value ?? 0)) / maxMetric * 100)}%` }} /></div><b>{metricFormatter(value)}</b><DeltaBadge delta={rankingDelta(row)} label={metricLabel} collectedDays={trends.readiness.collected_days} /></div>; })}</div></div>
       </section>
 
       <section className="insight-two-column trend-secondary-grid">
-        <article className="panel"><div className="panel-heading"><div><p className="section-kicker">POPULAR CONTENT</p><h2>近 30 天熱門內容</h2></div><span>{formatType === "主要內容" ? "直播＋一般影片" : formatType}</span></div><div className="top-content-list">{trends.rankings.top_videos.slice(0, 8).map((video, index) => <a className="top-content-row" href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" key={video.video_id}><span className="rank">{index + 1}</span>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <span className="top-thumb-fallback">V</span>}<div><strong>{video.title}</strong><p>{video.channel_title} · {video.content_type} · {video.format_type}{video.attributes.includes("聯動") ? " · 聯動" : ""}</p></div><div className="top-content-metric"><strong>{compact(video.view_count)}</strong><span>{percent(video.view_rate)} 觀看／訂閱</span></div></a>)}</div></article>
-        <aside className="panel"><div className="panel-heading"><div><p className="section-kicker">ORGANIZATION VIEW</p><h2>組織／團體表現</h2></div><span>成員近期觀看中位數加總</span></div><div className="organization-bars">{trends.rankings.organizations.length === 0 ? <div className="insight-placeholder embedded">為更多頻道填入所屬組織後會顯示比較。</div> : trends.rankings.organizations.slice(0, 12).map((organization, index) => <div key={organization.organization_name}><span>{index + 1}</span><strong>{organization.organization_name}</strong><i><b style={{ width: `${organization.median_views_total / Math.max(1, trends.rankings.organizations[0].median_views_total) * 100}%` }} /></i><em>{compact(organization.median_views_total)} · {organization.members} 個頻道</em></div>)}</div></aside>
+        <article className="panel"><div className="panel-heading panel-heading-controls"><div><p className="section-kicker">POPULAR CONTENT</p><h2>近 30 天熱門內容</h2><span>{formatType === "主要內容" ? "直播＋一般影片" : formatType} · 主題篩選只影響本區</span></div><label><span>內容主題</span><select value={contentTopic} onChange={(event) => setContentTopic(event.target.value)}>{TOPIC_OPTIONS.map((topic) => <option value={topic} key={topic}>{topic}</option>)}</select></label></div><div className="top-content-list">{visibleTopVideos.length === 0 ? <div className="insight-placeholder embedded">最近 30 天沒有符合此形式與主題的內容。</div> : visibleTopVideos.slice(0, 8).map((video, index) => <a className="top-content-row" href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" key={video.video_id}><span className="rank">{index + 1}</span>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <span className="top-thumb-fallback">V</span>}<div><strong>{video.title}</strong><p>{video.channel_title} · {video.content_type} · {video.format_type}{video.attributes.includes("聯動") ? " · 聯動" : ""}</p></div><div className="top-content-metric"><strong>{compact(video.view_count)}</strong><span>{percent(video.view_rate)} 觀看／訂閱</span></div></a>)}</div></article>
+        <aside className="panel"><div className="panel-heading organization-heading"><div><p className="section-kicker">ORGANIZATION VIEW</p><h2>組織／團體表現</h2><span>成員近 30 日觀看中位數加總</span></div><div className="format-tabs organization-scope-tabs"><button className={organizationScope === "peer" ? "active" : ""} type="button" onClick={() => setOrganizationScope("peer")}>同級範圍</button><button className={organizationScope === "all" ? "active" : ""} type="button" onClick={() => setOrganizationScope("all")}>全部已收錄</button></div></div><p className="organization-scope-note">{organizationScope === "peer" ? `使用目前 ${exact(range[0])}～${range[1] >= 100000000 ? "不限上限" : exact(range[1])} 訂閱範圍。` : "忽略訂閱級距，仍套用頻道分類與已畢業篩選。"} 已有 {organizationCoverage.named_channels}／{organizationCoverage.scope_channels} 個頻道填寫組織名稱；未填者不納入組織統計。</p><div className="organization-bars">{trends.rankings.organizations.length === 0 ? <div className="insight-placeholder embedded">為頻道填入所屬組織後會顯示比較。</div> : trends.rankings.organizations.slice(0, 12).map((organization, index) => <div key={organization.organization_name}><span>{index + 1}</span><strong>{organization.organization_name}</strong><i><b style={{ width: `${organization.median_views_total / Math.max(1, trends.rankings.organizations[0].median_views_total) * 100}%` }} /></i><em>{compact(organization.median_views_total)} · {organization.members} 個頻道</em></div>)}</div></aside>
       </section>
 
       {trends.private_metrics && Object.values(trends.private_metrics).some((value) => value !== null) && <section className="panel private-trend-panel"><div className="panel-heading"><div><p className="section-kicker">PRIVATE STUDIO OVERLAY</p><h2>我的 Studio 私人指標</h2></div><span>只顯示自己的資料，不與公開頻道硬比</span></div><div className="private-metric-strip"><div><span>觀看</span><strong>{compact(trends.private_metrics.views)}</strong></div><div><span>觀看時數</span><strong>{exact(trends.private_metrics.watch_time_hours)}</strong></div><div><span>曝光</span><strong>{compact(trends.private_metrics.impressions)}</strong></div><div><span>點閱率</span><strong>{percent(trends.private_metrics.impressions_ctr)}</strong></div><div><span>回訪觀眾</span><strong>{compact(trends.private_metrics.returning_viewers)}</strong></div></div></section>}

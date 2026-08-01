@@ -197,6 +197,8 @@ try {
 
     $iconPath = Join-Path $tempRoot 'TaiVPulse.ico'
     New-TaiVPulseIcon -Path $iconPath
+    $installedIconName = "TaiVPulse-$version.ico"
+    Copy-Item -LiteralPath $iconPath -Destination (Join-Path $releaseRoot $installedIconName)
     $versionParts = @($version.Split('.') | ForEach-Object { [int]$_ })
     while ($versionParts.Count -lt 4) { $versionParts += 0 }
     $assemblyVersion = ($versionParts[0..3] -join '.')
@@ -260,10 +262,14 @@ using System.Reflection;
     if ($validation.ExitCode -ne 0) {
         throw "[TVP-B008] 安裝程式解壓縮驗證失敗，結束碼：$($validation.ExitCode)"
     }
-    foreach ($required in @('.tai-v-pulse-manifest.txt', 'TaiVPulse.exe', 'start-local.ps1', 'requirements.txt', 'export-diagnostics.ps1', 'LICENSE', 'NOTICE')) {
+    foreach ($required in @('.tai-v-pulse-manifest.txt', 'TaiVPulse.exe', $installedIconName, 'start-local.ps1', 'requirements.txt', 'export-diagnostics.ps1', 'LICENSE', 'NOTICE')) {
         if (-not (Test-Path -LiteralPath (Join-Path $validationRoot $required) -PathType Leaf)) {
             throw "[TVP-B008] 安裝驗證缺少檔案：$required"
         }
+    }
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $validationRoot $installedIconName)).Hash -ne
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $iconPath).Hash) {
+        throw '[TVP-B013] 安裝後的捷徑圖示與最新版建置圖示不一致。'
     }
     foreach ($forbidden in @('.env', 'work\tai_v_pulse.sqlite3')) {
         if (Test-Path -LiteralPath (Join-Path $validationRoot $forbidden)) {

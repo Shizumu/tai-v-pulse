@@ -1,7 +1,7 @@
 "use client";
 /* eslint-disable react-hooks/set-state-in-effect */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FocusEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FocusEvent, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import LegalFooter from "../legal-footer";
 import SiteHeader from "../site-header";
 
@@ -57,7 +57,11 @@ type RankedVideo = {
   peak_concurrent: number | null;
   ccv_rate: number | null;
   content_type: string;
+  topics: string[];
   attributes: string[];
+  classification_source: string;
+  classification_evidence: string;
+  game_name: string;
   format_type: string;
   published_at: string | null;
 };
@@ -77,6 +81,17 @@ type ContentBreakdown = {
 };
 
 type LandscapeFormat = "主要內容" | "直播" | "影片" | "Shorts" | "全部";
+
+type ScheduleStream = {
+  video_id: string;
+  title: string;
+  channel_id: string;
+  channel_title: string;
+  started_at: string;
+  peak_concurrent: number | null;
+};
+
+type ScheduleCell = { count: number; median_peak: number | null; streams: ScheduleStream[] };
 
 type Insights = {
   generated_at: string;
@@ -103,7 +118,15 @@ type Insights = {
     collaboration: ContentBreakdown;
   }>;
   format_breakdown: { format_type: string; items: number }[];
-  schedule: { count: number; median_peak: number | null }[][];
+  schedule: ScheduleCell[][];
+  schedule_summary: {
+    date_start: string;
+    date_end: string;
+    channel_count: number;
+    stream_count: number;
+    conclusion: string;
+  };
+  classification_guide: { priority: string; representative_ranking: string };
   top_videos: RankedVideo[];
   top_videos_by_format: Record<"綜合" | "影片" | "直播" | "Shorts", RankedVideo[]>;
   top_channels: ChannelMetrics[];
@@ -126,6 +149,7 @@ const TIERS: Record<string, [number, number, string]> = {
 
 const DAYS = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"];
 const BLOCKS = ["00–04", "04–08", "08–12", "12–16", "16–20", "20–24"];
+const TOPIC_OPTIONS = ["紀念／重大活動", "ASMR", "歌回", "音樂作品", "雜談", "遊戲"];
 
 function compact(value: number | null | undefined, digits = 1) {
   if (value === null || value === undefined) return "—";
@@ -150,6 +174,18 @@ function hours(value: number | null | undefined) {
 function signed(value: number | null | undefined) {
   if (value === null || value === undefined) return "—";
   return `${value > 0 ? "+" : ""}${compact(value)}`;
+}
+
+function calendarDate(value: string) {
+  const [year, month, day] = value.split("-");
+  return year && month && day ? `${year}/${month}/${day}` : value;
+}
+
+function streamTime(value: string) {
+  return new Intl.DateTimeFormat("zh-TW", {
+    month: "numeric", day: "numeric", weekday: "short", hour: "2-digit", minute: "2-digit",
+    timeZone: "Asia/Taipei",
+  }).format(new Date(value));
 }
 
 export default function InsightsDashboard() {
@@ -179,6 +215,12 @@ export default function InsightsDashboard() {
     y: number;
     locked: boolean;
   } | null>(null);
+  const [selectedScheduleCell, setSelectedScheduleCell] = useState<{ day: number; block: number } | null>(null);
+  const [classificationVideo, setClassificationVideo] = useState<RankedVideo | null>(null);
+  const [classificationTopics, setClassificationTopics] = useState<string[]>([]);
+  const [classificationGame, setClassificationGame] = useState("");
+  const [classificationNote, setClassificationNote] = useState("");
+  const [classificationSaving, setClassificationSaving] = useState(false);
   const insightsRef = useRef<Insights | null>(null);
   const ownedDefaultApplied = useRef(false);
   const closePopoverTimer = useRef<number | null>(null);
@@ -315,6 +357,70 @@ export default function InsightsDashboard() {
     openPopover(item, rect.right, rect.top + 24);
   }
 
+  function openClassification(video: RankedVideo) {
+    setRepresentativePopover(null);
+    setClassificationVideo(video);
+    setClassificationTopics(
+      (video.topics?.length ? video.topics : video.content_type.split(" + "))
+        .filter((topic) => TOPIC_OPTIONS.includes(topic)),
+    );
+    setClassificationGame(video.game_name ?? "");
+    setClassificationNote("");
+    setError(null);
+  }
+
+  function toggleClassificationTopic(topic: string) {
+    setClassificationTopics((current) => current.includes(topic)
+      ? current.filter((value) => value !== topic)
+      : [...current, topic]);
+  }
+
+  async function saveClassification(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!classificationVideo) return;
+    setClassificationSaving(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/content-classification`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video_id: classificationVideo.video_id,
+          topics: classificationTopics,
+          game_name: classificationGame,
+          note: classificationNote,
+        }),
+      });
+      const payload = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法儲存內容分類");
+      setClassificationVideo(null);
+      setRefreshKey((value) => value + 1);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法儲存內容分類");
+    } finally {
+      setClassificationSaving(false);
+    }
+  }
+
+  async function resetClassification() {
+    if (!classificationVideo) return;
+    setClassificationSaving(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/content-classification/${encodeURIComponent(classificationVideo.video_id)}`, {
+        method: "DELETE",
+      });
+      const payload = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法改回自動分類");
+      setClassificationVideo(null);
+      setRefreshKey((value) => value + 1);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法改回自動分類");
+    } finally {
+      setClassificationSaving(false);
+    }
+  }
+
   const selectedChannelKey = selectedChannelIds.join(",");
 
   useEffect(() => {
@@ -357,12 +463,18 @@ export default function InsightsDashboard() {
       : mode === "range" ? `${exact(cohortRange[0])}～${exact(cohortRange[1])} 訂閱`
         : mode === "channels" ? `${selectedChannelIds.length} 個指定頻道` : "全部已收錄頻道";
   const heatMax = Math.max(1, ...(insights?.schedule.flat().map((cell) => cell.count) ?? [1]));
+  const selectedSchedule = selectedScheduleCell && insights
+    ? insights.schedule[selectedScheduleCell.day]?.[selectedScheduleCell.block] ?? null
+    : null;
   const activeLandscape = insights?.content_landscapes?.[landscapeFormat];
   const landscapeItems = activeLandscape
     ? [...activeLandscape.content_breakdown, ...(activeLandscape.collaboration.items ? [activeLandscape.collaboration] : [])]
     : insights?.content_breakdown ?? [];
   const contentMax = Math.max(1, ...(landscapeItems.map((item) => item.items) ?? [1]));
   const efficientVideos = insights?.top_videos_by_format?.[contentFormat] ?? [];
+  const growthCoverageText = insights && insights.coverage.growth_channels > 0
+    ? `以 ${insights.coverage.growth_channels}/${insights.overview.channels} 個已有期間起點資料的頻道加總`
+    : `尚未累積到 ${days} 天前的頻道資料；累積後顯示`;
 
   const benchmarkRows = [
     ["weekly_frequency", "每週內容數", (value: number | null) => value === null ? "—" : `${value.toFixed(1)} 個`],
@@ -414,15 +526,15 @@ export default function InsightsDashboard() {
             <article className="insight-hero primary"><span>群組頻道</span><strong>{insights.overview.channels}</strong><p>{insights.overview.active_channels} 個在期間內有新內容</p></article>
             <article className="insight-hero"><span>近期內容</span><strong>{compact(insights.overview.recent_items)}</strong><p>{insights.overview.recent_streams} 場直播 · {insights.overview.recent_shorts} 支 Shorts</p></article>
             <article className="insight-hero"><span>直播總時數</span><strong>{insights.overview.live_hours.toFixed(1)}</strong><p>最近 {days} 天已蒐集直播</p></article>
-            <article className="insight-hero"><span>訂閱成長</span><strong>{signed(insights.overview.subscriber_growth)}</strong><p>{insights.coverage.growth_channels}/{insights.overview.channels} 個頻道具備足夠快照</p></article>
-            <article className="insight-hero"><span>觀看成長</span><strong>{signed(insights.overview.view_growth)}</strong><p>頻道累積觀看差值</p></article>
+            <article className="insight-hero"><span>訂閱成長</span><strong>{signed(insights.coverage.growth_channels > 0 ? insights.overview.subscriber_growth : null)}</strong><p>{growthCoverageText}</p></article>
+            <article className="insight-hero"><span>觀看成長</span><strong>{signed(insights.coverage.growth_channels > 0 ? insights.overview.view_growth : null)}</strong><p>{growthCoverageText}</p></article>
             <article className="insight-hero"><span>群組累積觀看</span><strong>{compact(insights.overview.total_channel_views)}</strong><p>目前公開頻道觀看總和</p></article>
           </section>
 
           <section className="insight-two-column">
             <article className="panel benchmark-panel">
               <div className="panel-heading"><div><p className="section-kicker">PEER BENCHMARK</p><h2>同級表現基準</h2></div><span>{reference ? `比較：${reference.title}` : "選參考頻道即可加入個別比較"}</span></div>
-              <div className="table-wrap"><table><thead><tr><th>指標</th>{reference && <th>{reference.title}</th>}<th>同級中位數</th><th>同級前 25%</th></tr></thead><tbody>{benchmarkRows.map(([key, label, formatter]) => <tr key={key}><td><strong>{label}</strong></td>{reference && <td className="reference-value">{formatter(insights.reference?.[key] as number | null)}</td>}<td>{formatter(insights.benchmarks[key]?.median ?? null)}</td><td>{formatter(insights.benchmarks[key]?.p75 ?? null)}</td></tr>)}</tbody></table></div>
+              <div className="table-wrap"><table><thead><tr><th>指標</th>{reference && <th>{reference.title}</th>}<th>同級中位數</th><th>同級前 25%</th></tr></thead><tbody>{benchmarkRows.map(([key, label, formatter]) => <tr key={key}><td><strong>{label}</strong>{(key === "subscriber_growth" || key === "view_growth") && insights.coverage.growth_channels < insights.overview.channels && <small className="benchmark-metric-note">{growthCoverageText}</small>}</td>{reference && <td className="reference-value">{formatter(insights.reference?.[key] as number | null)}</td>}<td>{formatter(insights.benchmarks[key]?.median ?? null)}</td><td>{formatter(insights.benchmarks[key]?.p75 ?? null)}</td></tr>)}</tbody></table></div>
               <p className="panel-footnote">觀看／訂閱比使用目前公開訂閱數計算，適合比較量級，不代表不重複觀眾。</p>
             </article>
 
@@ -435,21 +547,35 @@ export default function InsightsDashboard() {
 
           <section className="panel content-landscape-panel">
             <div className="panel-heading efficiency-heading"><div><p className="section-kicker">CONTENT LANDSCAPE</p><h2>大家都在做什麼</h2></div><div className="format-tabs landscape-tabs" role="group" aria-label="內容環境形式">{(["主要內容", "直播", "影片", "Shorts", "全部"] as const).map((format) => <button className={landscapeFormat === format ? "active" : ""} type="button" onClick={() => setLandscapeFormat(format)} aria-pressed={landscapeFormat === format} key={format}>{format === "主要內容" ? "直播＋一般影片" : format === "影片" ? "一般影片" : format}</button>)}</div></div>
-            <p className="efficiency-explainer">主題、影片形式與聯動屬性分開判斷；移動滑鼠時代表內容會跟隨游標，點一下可固定。現在顯示 {activeLandscape?.items ?? 0} 項{landscapeFormat === "主要內容" ? "非 Shorts 內容" : landscapeFormat}。</p>
+            <p className="efficiency-explainer">主題、影片形式與聯動屬性分開判斷；混合主題會以「歌回 + 雜談」呈現，但每筆內容在總數只計一次。現在顯示 {activeLandscape?.items ?? 0} 項{landscapeFormat === "主要內容" ? "非 Shorts 內容" : landscapeFormat}。</p>
+            <p className="classification-guide"><strong>分類依據：</strong>{insights.classification_guide.priority}<br /><strong>代表內容排序：</strong>{insights.classification_guide.representative_ranking}</p>
             <div className="content-landscape-grid">{landscapeItems.length === 0 ? <div className="insight-placeholder embedded">目前期間內尚無內容資料。</div> : landscapeItems.map((item) => {
               const strong = item.median_view_rate !== null && item.median_view_rate >= (insights.benchmarks.median_view_rate?.p75 ?? Infinity);
               const opportunity = strong && item.share < 15;
               const expanded = representativePopover?.item.content_type === item.content_type;
-              return <article className={`content-type-card${expanded ? " open" : ""}${item.is_attribute ? " attribute-card" : ""}`} key={`${item.content_type}-${item.is_attribute ? "attribute" : "topic"}`} onPointerEnter={(event) => handleCardPointer(event, item)} onPointerMove={(event) => handleCardPointer(event, item)} onPointerLeave={schedulePopoverClose} onFocus={(event) => handleCardFocus(event, item)} onBlur={schedulePopoverClose}><button className="content-card-trigger" type="button" aria-expanded={expanded} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); if (representativePopover?.locked && representativePopover.item.content_type === item.content_type) setRepresentativePopover(null); else openPopover(item, rect.right, rect.top + 30, true); }}><div className="content-type-heading"><strong>{item.content_type}</strong>{item.is_attribute ? <span className="attribute-label">附加標籤</span> : opportunity ? <span className="opportunity">低占比高表現</span> : strong ? <span>表現突出</span> : null}</div><p className="content-definition">{item.description}</p><div className="content-share-track"><i style={{ width: `${item.items / contentMax * 100}%` }} /></div><dl><div><dt>內容數</dt><dd>{item.items}（{item.share.toFixed(1)}%）</dd></div><div><dt>觀看中位數</dt><dd>{compact(item.median_views)}</dd></div><div><dt>觀看／訂閱</dt><dd>{percent(item.median_view_rate)}</dd></div><div><dt>直播同接中位數</dt><dd>{compact(item.median_peak_concurrent)}</dd></div></dl></button></article>;
+              return <article className={`content-type-card${expanded ? " open" : ""}${item.is_attribute ? " attribute-card" : ""}`} key={`${item.content_type}-${item.is_attribute ? "attribute" : "topic"}`} onPointerEnter={(event) => handleCardPointer(event, item)} onPointerMove={(event) => handleCardPointer(event, item)} onPointerLeave={schedulePopoverClose} onFocus={(event) => handleCardFocus(event, item)} onBlur={schedulePopoverClose}><button className="content-card-trigger" type="button" aria-expanded={expanded} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); if (representativePopover?.locked && representativePopover.item.content_type === item.content_type) setRepresentativePopover(null); else openPopover(item, rect.right, rect.top + 30, true); }}><div className="content-type-heading"><strong>{item.content_type}</strong>{item.is_attribute ? <span className="attribute-label">附加標籤</span> : opportunity ? <span className="opportunity">低占比高表現</span> : strong ? <span>表現突出</span> : null}</div><p className="content-definition">{item.description}</p><div className="content-share-track"><i style={{ width: `${item.items / contentMax * 100}%` }} /></div><dl><div><dt>內容數</dt><dd>{item.items}（{item.share.toFixed(1)}%）</dd></div><div><dt>觀看中位數</dt><dd>{compact(item.median_views)}{item.median_views === null && <small className="metric-missing">尚無可用觀看資料</small>}</dd></div><div><dt>觀看／訂閱</dt><dd>{percent(item.median_view_rate)}{item.median_view_rate === null && <small className="metric-missing">缺少觀看或訂閱資料</small>}</dd></div><div><dt>直播同接中位數</dt><dd>{compact(item.median_peak_concurrent)}{item.median_peak_concurrent === null && <small className="metric-missing">尚無直播同接樣本</small>}</dd></div></dl></button></article>;
             })}</div>
-            {representativePopover && <div className={`content-representatives floating${representativePopover.locked ? " locked" : ""}`} style={{ left: representativePopover.x, top: representativePopover.y }} role="dialog" aria-label={`${representativePopover.item.content_type}代表內容`} onPointerEnter={cancelPopoverClose} onPointerLeave={schedulePopoverClose}><div><strong>{representativePopover.item.content_type}代表內容</strong><span>每個頻道最多一項</span>{representativePopover.locked && <button type="button" onClick={() => setRepresentativePopover(null)} aria-label="關閉代表內容">×</button>}</div>{representativePopover.item.representative_videos.length === 0 ? <p>目前沒有足夠資料。</p> : representativePopover.item.representative_videos.map((video, index) => <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" key={video.video_id}><b>{index + 1}</b>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <i>V</i>}<span><strong>{video.title}</strong><small>{video.channel_title} · <em>{video.format_type}</em>{video.attributes.includes("聯動") ? " · 聯動" : ""} · {compact(video.view_count)} 觀看 · {percent(video.view_rate)}</small></span></a>)}</div>}
+            {representativePopover && <div className={`content-representatives floating${representativePopover.locked ? " locked" : ""}`} style={{ left: representativePopover.x, top: representativePopover.y }} role="dialog" aria-label={`${representativePopover.item.content_type}代表內容`} onPointerEnter={cancelPopoverClose} onPointerLeave={schedulePopoverClose}>
+              <div className="representative-heading"><strong>{representativePopover.item.content_type}代表內容</strong><span>觀看／訂閱比排序 · 每頻道一項</span>{representativePopover.locked && <button type="button" onClick={() => setRepresentativePopover(null)} aria-label="關閉代表內容">×</button>}</div>
+              {representativePopover.item.representative_videos.length === 0 ? <p>目前沒有足夠資料。</p> : representativePopover.item.representative_videos.map((video, index) => <div className="representative-row" key={video.video_id}>
+                <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer"><b>{index + 1}</b>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <i>V</i>}<span><strong>{video.title}</strong><small>{video.channel_title} · <em>{video.content_type}</em>{video.game_name ? ` · ${video.game_name}` : ""}{video.attributes.includes("聯動") ? " · 聯動" : ""} · {compact(video.view_count)} 觀看 · {percent(video.view_rate)}</small><small>依據：{video.classification_source}{video.classification_evidence ? ` · ${video.classification_evidence}` : ""}</small></span></a>
+                <button type="button" onClick={() => openClassification(video)}>修正分類</button>
+              </div>)}
+            </div>}
           </section>
 
           <section className="insight-two-column schedule-layout">
             <article className="panel schedule-panel">
               <div className="panel-heading"><div><p className="section-kicker">LIVE SCHEDULE</p><h2>直播時段熱圖</h2></div><span>台北時間 · 顏色越深代表開台越集中</span></div>
-              <div className="heatmap" role="img" aria-label="一週直播開台時段熱圖"><div className="heatmap-corner" />{BLOCKS.map((block) => <span className="heatmap-header" key={block}>{block}</span>)}{insights.schedule.map((row, day) => <div className="heatmap-row" key={DAYS[day]}><strong>{DAYS[day]}</strong>{row.map((cell, block) => <div className="heat-cell" key={block} style={{ backgroundColor: `color-mix(in srgb, var(--mint) ${8 + cell.count / heatMax * 82}%, transparent)` }} title={`${DAYS[day]} ${BLOCKS[block]}：${cell.count} 場，最高同接中位數 ${compact(cell.median_peak)}`}><span>{cell.count || ""}</span></div>)}</div>)}</div>
-              <p className="panel-footnote">這表示同級頻道何時集中開台，不代表觀眾彼此重疊。</p>
+              <div className="schedule-summary"><span>統計日期 <strong>{calendarDate(insights.schedule_summary.date_start)}～{calendarDate(insights.schedule_summary.date_end)}</strong></span><span>涵蓋頻道 <strong>{insights.schedule_summary.channel_count}</strong></span><span>直播場次 <strong>{insights.schedule_summary.stream_count}</strong></span></div>
+              <p className="schedule-conclusion">{insights.schedule_summary.conclusion}</p>
+              <div className="heatmap" role="grid" aria-label="一週直播開台時段熱圖"><div className="heatmap-corner" />{BLOCKS.map((block) => <span className="heatmap-header" key={block}>{block}</span>)}{insights.schedule.map((row, day) => <div className="heatmap-row" key={DAYS[day]}><strong>{DAYS[day]}</strong>{row.map((cell, block) => {
+                const selected = selectedScheduleCell?.day === day && selectedScheduleCell.block === block;
+                const label = `${DAYS[day]} ${BLOCKS[block]}：${cell.count} 場，最高同接中位數 ${compact(cell.median_peak)}`;
+                return <button className={`heat-cell${selected ? " selected" : ""}`} type="button" key={block} style={{ backgroundColor: `color-mix(in srgb, var(--mint) ${8 + cell.count / heatMax * 82}%, transparent)` }} title={label} aria-label={`${label}；點擊查看直播明細`} aria-pressed={selected} disabled={cell.count === 0} onClick={() => setSelectedScheduleCell({ day, block })}><span>{cell.count || ""}</span></button>;
+              })}</div>)}</div>
+              {selectedScheduleCell && selectedSchedule && <section className="schedule-detail" aria-live="polite"><div><strong>{DAYS[selectedScheduleCell.day]} {BLOCKS[selectedScheduleCell.block]} 直播明細</strong><span>{selectedSchedule.count} 場 · 最高同接中位數 {compact(selectedSchedule.median_peak)}</span><button type="button" onClick={() => setSelectedScheduleCell(null)} aria-label="關閉直播明細">×</button></div><div className="schedule-stream-list">{selectedSchedule.streams.map((stream) => <a href={`https://www.youtube.com/watch?v=${stream.video_id}`} target="_blank" rel="noreferrer" key={stream.video_id}><span><strong>{stream.title}</strong><small>{stream.channel_title} · {streamTime(stream.started_at)}</small></span><b>{compact(stream.peak_concurrent)}<small>最高同接</small></b><i>開啟 YouTube ↗</i></a>)}</div></section>}
+              <p className="panel-footnote">點擊有數字的格子可查看頻道、直播標題、開始時間、最高同接與 YouTube 連結。時段集中不代表觀眾彼此重疊。</p>
             </article>
 
             <aside className="panel keyword-panel">
@@ -472,9 +598,11 @@ export default function InsightsDashboard() {
             </aside>
           </section>
 
-          <section className="analysis-note"><strong>如何閱讀這一頁</strong><p>先用參考頻道建立同量級群組，再看內容占比、觀看／訂閱比和開台時段。資料量少時不要急著下結論；建議至少累積 30 天，成長比較則需每個頻道至少兩筆快照。</p></section>
+          <section className="analysis-note"><strong>看懂內容環境</strong><p>先選擇一個基準頻道，觀察訂閱規模相近的頻道在做什麼。從內容主題、觀看／訂閱比與直播時段找出自己的位置；趨勢與成長比較會隨資料累積而更可靠。</p></section>
         </>
       )}
+
+      {classificationVideo && <div className="modal-backdrop" role="presentation"><section className="confirmation-dialog content-classification-dialog" role="dialog" aria-modal="true" aria-labelledby="content-classification-title"><p className="section-kicker">CONTENT CLASSIFICATION</p><h2 id="content-classification-title">修正內容分類</h2><p className="classification-current"><strong>{classificationVideo.title}</strong><span>目前依據：{classificationVideo.classification_source}{classificationVideo.classification_evidence ? ` · ${classificationVideo.classification_evidence}` : ""}</span></p><form onSubmit={(event) => void saveClassification(event)}><fieldset><legend>內容主題（可複選）</legend><div className="classification-topic-options">{TOPIC_OPTIONS.map((topic) => <label key={topic}><input type="checkbox" checked={classificationTopics.includes(topic)} onChange={() => toggleClassificationTopic(topic)} /><span>{topic}</span></label>)}</div><small>不選任何主題會保存為「其他」；混合主題只算一筆內容。</small></fieldset><label><span>遊戲名稱或常用別名</span><input value={classificationGame} onChange={(event) => setClassificationGame(event.target.value)} maxLength={120} placeholder="例如：Minecraft、麥塊" /><small>填寫後會同時標記為遊戲；相同字樣出現在後續標題時可沿用這次確認。</small></label><label><span>修正備註（選填）</span><input value={classificationNote} onChange={(event) => setClassificationNote(event.target.value)} maxLength={240} placeholder="例如：標題中的歌是背景音樂，主題仍為雜談" /></label><div className="dialog-actions">{classificationVideo.classification_source === "人工確認" && <button className="button ghost danger" type="button" onClick={() => void resetClassification()} disabled={classificationSaving}>改回自動分類</button>}<button className="button ghost" type="button" onClick={() => setClassificationVideo(null)} disabled={classificationSaving}>取消</button><button className="button primary" type="submit" disabled={classificationSaving}>{classificationSaving ? "儲存中…" : "儲存並沿用"}</button></div></form></section></div>}
 
       <LegalFooter context="內容環境" note="所有分析都在你的電腦完成" />
     </main>
