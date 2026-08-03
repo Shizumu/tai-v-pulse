@@ -206,6 +206,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(game["classification_source"], "標題（系統遊戲別名）")
         self.assertEqual(video_format("video", 42, "短片"), "Shorts")
         self.assertEqual(video_format("completed", 7200, "直播存檔"), "直播")
+        self.assertEqual(video_format("unavailable", 7200, "已不可公開存取的直播"), "直播")
 
     def test_specific_channel_query_parser(self):
         channel_id = "UC1234567890abcdefghijkl"
@@ -386,6 +387,88 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(limited["channels"], 1)
             self.assertTrue(limited["quota_limited"])
             self.assertEqual(limited_playlists[0][1]["playlistId"], "UU-owned")
+            service.database.close()
+
+    def test_live_poll_removes_missing_private_video_from_radar_and_can_restore_it(self):
+        live_video = self.public_video_item("video-private-live", "UC-private-live")
+
+        class FakeYouTube:
+            def __init__(self):
+                self.items = []
+
+            def get(self, resource, params, bucket="general"):
+                self.assert_resource(resource)
+                return {"items": list(self.items)}
+
+            @staticmethod
+            def assert_resource(resource):
+                if resource != "videos":
+                    raise AssertionError(resource)
+
+            @staticmethod
+            def usage(bucket):
+                return 0
+
+            @staticmethod
+            def safe_limit(bucket):
+                return 9000
+
+            @staticmethod
+            def reset_at():
+                return ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = SimpleNamespace(
+                api_key="",
+                database_path=Path(directory) / "test.sqlite3",
+                min_subscribers=1000,
+                live_poll_seconds=60,
+                channel_refresh_hours=6,
+                upload_scan_hours=4,
+                edition="public",
+                retention_days=30,
+                creator_retention_days=0,
+                discovery_pages_per_term=1,
+                quota_general_limit=10_000,
+                quota_search_limit=100,
+                quota_safety_percent=10,
+            )
+            service = TrackerService(config)
+            service.database.upsert_channel(
+                self.public_channel_item("UC-private-live", "後來轉成私人影片的頻道"),
+                status="eligible",
+                evidence=("台V", "頻道說明", "台V"),
+            )
+            service.database.upsert_video(live_video)
+            fake_youtube = FakeYouTube()
+            service.youtube = fake_youtube
+
+            service.poll_live()
+
+            unavailable = service.database.rows(
+                "SELECT live_state,current_concurrent FROM videos WHERE video_id=?",
+                ("video-private-live",),
+            )[0]
+            self.assertEqual(unavailable["live_state"], "unavailable")
+            self.assertIsNone(unavailable["current_concurrent"])
+            self.assertEqual(service.database.scalar(
+                "SELECT COUNT(*) FROM concurrency_samples WHERE video_id=?",
+                ("video-private-live",),
+            ), 1)
+            self.assertEqual(service.summary()["live_videos"], [])
+
+            restored_video = json.loads(json.dumps(live_video))
+            restored_video["liveStreamingDetails"]["concurrentViewers"] = "12"
+            fake_youtube.items = [restored_video]
+            service.refresh_videos(["video-private-live"])
+
+            restored = service.database.rows(
+                "SELECT live_state,current_concurrent FROM videos WHERE video_id=?",
+                ("video-private-live",),
+            )[0]
+            self.assertEqual(restored["live_state"], "live")
+            self.assertEqual(restored["current_concurrent"], 12)
+            self.assertEqual(len(service.summary()["live_videos"]), 1)
             service.database.close()
 
     def test_missing_upload_playlist_skips_channel_and_preserves_batch(self):

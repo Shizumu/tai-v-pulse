@@ -90,7 +90,7 @@ type DetailedVideo = {
   view_count: number | null;
   like_count: number | null;
   comment_count: number | null;
-  live_state: "video" | "live" | "upcoming" | "completed";
+  live_state: "video" | "live" | "upcoming" | "completed" | "unavailable";
   current_concurrent: number | null;
   peak_concurrent: number | null;
   concurrency_samples: number;
@@ -332,6 +332,7 @@ function duration(value: number | null) {
 }
 
 function videoType(video: DetailedVideo) {
+  if (video.live_state === "unavailable") return "目前無法公開存取";
   if (video.live_state === "live") return "直播中";
   if (video.live_state === "upcoming") return "待直播";
   if (video.live_state === "completed") return "直播存檔";

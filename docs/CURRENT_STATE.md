@@ -1,8 +1,16 @@
 # 台V Pulse 目前狀態
 
-更新日期：2026-08-01
-版本：`0.10.0`
-狀態：`0.10.0` 已實作 0.9.0 公開資料匯入相容修正、Windows 非強制一鍵更新與 GitHub 標籤自動建置／Release 流程；本機正式 ZIP、Windows 安裝程式與 SHA-256 已建立並通過隔離安裝驗證。0.9.0 使用者仍須先手動安裝一次 0.10.0，之後才可使用內建更新器；GitHub 尚未推送 0.10.0 標籤或建立 Release。
+更新日期：2026-08-03
+版本：`0.10.1`
+狀態：`0.10.1` 修正私人／刪除／不可公開存取的直播永久殘留在直播雷達並持續輪詢；保留歷史公開資料，且重新公開後可恢復正常狀態。0.10.0 已有正式 GitHub Release 與內建更新器，可遠端覆蓋升級至 0.10.1；0.9.0 與更早版本仍須先手動安裝 0.10.0 或更新版本。
+
+## `0.10.1` 直播雷達不可公開影片修正
+
+- `refresh_videos()` 現在會在 YouTube `videos.list` 整批成功後，比對要求與實際回傳的影片 ID。缺少且資料庫原本為 `live`／`upcoming` 的影片會改為 `unavailable`，清空 `current_concurrent`，因此立刻退出直播雷達與每分鐘輪詢。
+- 不會刪除影片列、觀看快照或 `concurrency_samples`；頻道詳細資料明確顯示「目前無法公開存取」，內容格式仍保留為直播。若影片重新公開並於加強掃描或上傳掃描再次回傳，`upsert_video()` 會恢復實際狀態。
+- 新增回歸測試覆蓋私人影片從雷達移除、舊同接清空、歷史樣本保留及重新公開恢復。`python -m unittest tests.test_collector` 43 項、TypeScript、rendered HTML 7 項、production build、Windows 啟動與 UTF-8 檢查均通過；lint 為 0 errors、204 個既有 `<img>` 警告，多數來自 `work/` 歷史驗證副本且不進公開包。
+- 版本升為 `0.10.1`。0.10.0 啟動器可由正式 GitHub Release 偵測並下載 `tai-v-pulse-0.10.1-setup.exe`；更新保留 `.env`、`work/`、SQLite、OAuth、Studio、個人設定與既有 `node_modules`。
+- 本機白名單產物已建立：公開 ZIP 307,914 bytes、SHA-256 `1265dee9e3ead18275e332a7517390fec6e405e5f4cf1dbe8137064d667eef9f`；Windows 安裝程式 404,480 bytes、SHA-256 `bdfde0d65c8d1c418c88e93a607cbf29c2cabaf358c85f0bbf3d9075729ec017`，檔案版本 `0.10.1.0`／產品版本 `0.10.1`。ZIP 54 個檔案與 53 條 manifest 完全吻合，未發現 `.env`、`work/`、SQLite、OAuth、Studio、相依套件、LOG、輸出或 Git metadata；正式 GitHub Actions 會重新建置，因此 Release asset 的最終 SHA-256 另以 GitHub 提供者為準。
 
 ## `0.10.0` 更新與資料搬遷修正
 

@@ -738,7 +738,7 @@ def classify_content_fields(
 
 
 def video_format(live_state: str, duration_seconds: int | None, title: str = "", description: str = "") -> str:
-    if live_state in {"live", "upcoming", "completed"}:
+    if live_state in {"live", "upcoming", "completed", "unavailable"}:
         return "直播"
     text = f"{title} {description}"
     if re.search(r"[#＃]\s*shorts?\b", text, re.I) or (duration_seconds is not None and duration_seconds <= 60):
@@ -4690,8 +4690,20 @@ class TrackerService:
                 "part": "snippet,contentDetails,statistics,liveStreamingDetails",
                 "id": ",".join(group), "maxResults": 50,
             })
-            for item in payload.get("items", []):
+            items = payload.get("items", [])
+            returned_ids = {str(item.get("id") or "") for item in items}
+            for item in items:
                 self.database.upsert_video(item)
+            missing_ids = [video_id for video_id in group if video_id not in returned_ids]
+            if missing_ids:
+                placeholders = ",".join("?" for _ in missing_ids)
+                self.database.execute(
+                    f"""UPDATE videos
+                           SET live_state='unavailable',current_concurrent=NULL,updated_at=?
+                         WHERE video_id IN ({placeholders})
+                           AND live_state IN ('live','upcoming')""",
+                    (utc_now(), *missing_ids),
+                )
 
     def scan_hourly_live_candidates(self) -> dict[str, int | bool]:
         owned_channel_id = self.owned_channel_id()
@@ -4747,7 +4759,7 @@ class TrackerService:
                 existing_states[row["video_id"]] = row["live_state"]
         refresh_ids = [
             video_id for video_id in unique_ids
-            if video_id not in existing_states or existing_states[video_id] in {"live", "upcoming"}
+            if video_id not in existing_states or existing_states[video_id] in {"live", "upcoming", "unavailable"}
         ]
         if refresh_ids:
             self.refresh_videos(refresh_ids)

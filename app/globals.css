@@ -342,6 +342,7 @@ td { padding: 12px 16px; border-top: 1px solid #edf0ed; font-size: 11px; vertica
 .state-badge.live { background: #ffe5df; color: #b34836; }
 .state-badge.upcoming { background: #fff4ce; color: #816d21; }
 .state-badge.completed { background: var(--mint-soft); color: var(--mint-deep); }
+.state-badge.unavailable { background: #fff0ec; color: #a44736; }
 
 .insights-shell { max-width: 1500px; }
 .insights-topbar { display: grid; grid-template-columns: 1fr auto 1fr; }
