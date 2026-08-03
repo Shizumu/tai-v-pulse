@@ -30,6 +30,12 @@ type Channel = {
   match_field: string | null;
   match_excerpt: string | null;
   updated_at: string | null;
+  median_average_concurrent?: number | null;
+  concurrency_covered_streams?: number;
+  concurrency_total_streams?: number;
+  weekly_streams?: number;
+  weekly_videos?: number;
+  weekly_shorts?: number;
 };
 
 type LiveVideo = {
@@ -766,6 +772,10 @@ export default function Dashboard() {
       if (sortBy === "organization") return (a.organization_name || "未設定").localeCompare(b.organization_name || "未設定", "zh-Hant") || a.title.localeCompare(b.title, "zh-Hant");
       if (sortBy === "views") return (b.view_count ?? -1) - (a.view_count ?? -1);
       if (sortBy === "videos") return (b.video_count ?? -1) - (a.video_count ?? -1);
+      if (sortBy === "average_concurrent") return (b.median_average_concurrent ?? -1) - (a.median_average_concurrent ?? -1);
+      if (sortBy === "weekly_streams") return (b.weekly_streams ?? -1) - (a.weekly_streams ?? -1);
+      if (sortBy === "weekly_videos") return (b.weekly_videos ?? -1) - (a.weekly_videos ?? -1);
+      if (sortBy === "weekly_shorts") return (b.weekly_shorts ?? -1) - (a.weekly_shorts ?? -1);
       if (sortBy === "name") return a.title.localeCompare(b.title, "zh-Hant");
       if (sortBy === "updated") return new Date(b.updated_at ?? 0).getTime() - new Date(a.updated_at ?? 0).getTime();
       return (b.subscriber_count ?? -1) - (a.subscriber_count ?? -1);
@@ -915,7 +925,7 @@ export default function Dashboard() {
         <article className="hero-card live-hero"><div className="hero-heading"><span className="live-dot" /><span>現正直播</span><time dateTime={taipeiNow === "—" ? undefined : taipeiNow}><small>台北時間</small>{taipeiNow}</time></div><strong>{data.live_count}</strong><p>此刻有多少已收錄頻道正在直播 · 每 {data.settings.live_poll_seconds} 秒批次更新同接</p><div className="mini-bars" aria-hidden="true">{[18, 33, 23, 51, 39, 72, 57, 86, 64, 94, 78, 100].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}</div></article>
         <article className="metric-card"><span>已收錄頻道</span><strong>{number(data.eligible_channels)}</strong><p>目前有多少頻道可納入比較</p></article>
         <article className="metric-card"><span>即將直播</span><strong>{number(data.upcoming_count)}</strong><p>接下來有多少已知直播排程</p></article>
-        <article className="metric-card"><span>同接資料點</span><strong className={data.sample_count > 0 ? undefined : "accumulating"}>{data.sample_count > 0 ? number(data.sample_count) : "資料累積中"}</strong><p>用來看直播環境 · 公開快照保留 {retentionLabel(data.retention_days)}</p></article>
+        <article className="metric-card"><span>資料更新狀態</span><strong className={data.current_job || data.last_job_finished_at ? undefined : "accumulating"}>{data.current_job ? "更新中" : data.last_job_status === "error" ? "需要處理" : data.last_job_finished_at ? ago(data.last_job_finished_at) : "尚未更新"}</strong><p>{data.current_job ? `${data.current_job} · ${time(data.current_job_started_at)}` : data.last_job_finished_at ? `${data.last_job ?? "資料收集"} · ${time(data.last_job_finished_at)}` : "完成首次收集後顯示最近更新時間"}</p></article>
         <article className="metric-card quota-card"><span>今日 API 配額</span><strong>{number(data.quota_general)} <small>/ {number(data.quota_general_safe_limit)} 一般安全額</small></strong><div className="quota-track"><i style={{ width: `${quotaPercent}%` }} /></div><p>今天安全更新空間 · 一般 {quotaPercent}% · 搜尋 {data.quota_search}/{data.quota_search_safe_limit}（{searchQuotaPercent}%）</p></article>
       </section>
 
@@ -971,6 +981,7 @@ export default function Dashboard() {
             <dl className="rules-list system-rules-list">
               <div><dt>分時開台偵測</dt><dd>{data.settings.enhanced_live_scan_times.join("、")}（台北時間）</dd></div>
               <div><dt>執行模式</dt><dd>{data.settings.edition === "personal" ? "私人本機版" : "對外發布版"}</dd></div>
+              <div><dt>同接資料點</dt><dd>{data.sample_count > 0 ? `${number(data.sample_count)} 筆 · 保留 ${retentionLabel(data.retention_days)}` : "資料累積中"}</dd></div>
               <div><dt>手動排除</dt><dd>{data.excluded_channels} 個黑名單頻道</dd></div>
             </dl>
           </section>
@@ -992,16 +1003,16 @@ export default function Dashboard() {
             <label className="compact-select"><span>分類</span><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option>全部</option>{data.categories.map(({ category, channel_count }) => <option value={category} key={category}>{category}（{channel_count}）</option>)}</select></label>
             <label className="compact-select"><span>所屬</span><select value={organizationFilter} onChange={(event) => setOrganizationFilter(event.target.value)}><option>全部</option>{data.organizations.map(({ organization_name, channel_count }) => <option value={organization_name} key={organization_name}>{organization_name}（{channel_count}）</option>)}</select></label>
             <label className="compact-select"><span>活動</span><select value={activityFilter} onChange={(event) => setActivityFilter(event.target.value)}><option>全部</option><option value="待確認">待確認（{data.activity_review_count}）</option>{data.activity_statuses.map(({ activity_status, channel_count }) => <option value={activity_status} key={activity_status}>{activity_status}（{channel_count}）</option>)}</select></label>
-            <label className="compact-select"><span>排序</span><select value={sortBy} onChange={(event) => setSortBy(event.target.value)}><option value="subscribers">訂閱數</option><option value="views">總觀看</option><option value="videos">影片數</option><option value="category">分類</option><option value="organization">所屬組織</option><option value="name">名稱</option><option value="updated">最近更新</option></select></label>
+            <label className="compact-select"><span>排序</span><select value={sortBy} onChange={(event) => setSortBy(event.target.value)}><option value="subscribers">訂閱數</option><option value="views">總觀看</option><option value="videos">影片數</option><option value="average_concurrent">平均同接</option><option value="weekly_streams">每週直播</option><option value="weekly_videos">每週影片</option><option value="weekly_shorts">每週 Shorts</option><option value="category">分類</option><option value="organization">所屬組織</option><option value="name">名稱</option><option value="updated">最近更新</option></select></label>
             <label className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜尋頻道、組織、標籤或證據" aria-label="搜尋頻道" /></label>
           </div>
         </div>
-        <div className="table-wrap"><table><thead><tr><th>頻道</th><th>分類</th><th>所屬／標籤</th><th>訂閱</th><th>總觀看</th><th>影片</th><th>收錄依據</th><th>更新</th><th>操作</th></tr></thead><tbody>
-          {visibleChannels.length === 0 ? <tr><td colSpan={9} className="table-empty">沒有符合目前篩選的頻道。</td></tr> : visibleChannels.map((channel) => <tr key={channel.channel_id}>
+        <div className="table-wrap"><table className="channel-performance-table"><thead><tr><th>頻道</th><th>分類</th><th>所屬／標籤</th><th>訂閱</th><th>總觀看</th><th>影片</th><th>30日直播表現</th><th>近30日週均</th><th>更新</th><th>操作</th></tr></thead><tbody>
+          {visibleChannels.length === 0 ? <tr><td colSpan={10} className="table-empty">沒有符合目前篩選的頻道。</td></tr> : visibleChannels.map((channel) => <tr key={channel.channel_id}>
             <td><button className="channel-link" type="button" onClick={() => void openChannel(channel.channel_id)}><span className="channel-name">{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="avatar-fallback">V</span>}<span><strong>{channel.title}</strong><small>{channel.handle ?? channel.channel_id}</small></span></span><span className="open-detail">查看詳細資料 →</span></button></td>
             <td><div className="category-status-cell"><select className="category-select" value={channel.category} onChange={(event) => void updateChannelMetadata(channel.channel_id, { category: event.target.value, organization_name: channel.organization_name, manual_tags: channel.manual_tags })} disabled={actingChannelId === channel.channel_id}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select><i className={`activity-badge ${channel.activity_status_source}`}>{channel.activity_status_source === "automatic" && ["休止中", "疑似已畢業"].includes(channel.activity_status) ? `系統初判：${channel.activity_status}` : channel.activity_status}</i></div></td>
             <td><div className="affiliation-cell"><strong>{channel.organization_name || "—"}</strong>{channel.manual_tags.length > 0 && <span>{channel.manual_tags.slice(0, 3).map((tag) => `#${tag}`).join(" ")}</span>}</div></td>
-            <td>{number(channel.subscriber_count)}</td><td>{number(channel.view_count)}</td><td>{number(channel.video_count)}</td><td><span className="evidence">{channel.match_term ?? "待確認"}</span><small className="excerpt">{channel.match_excerpt ?? "—"}</small></td><td>{ago(channel.updated_at)}</td><td><button className="danger-button" type="button" onClick={() => void excludeChannel(channel)} disabled={actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中" : "排除"}</button></td>
+            <td>{number(channel.subscriber_count)}</td><td>{number(channel.view_count)}</td><td>{number(channel.video_count)}</td><td><div className="channel-live-performance"><strong>{number(channel.median_average_concurrent)}</strong><span>平均同接</span><small>{channel.concurrency_covered_streams ?? 0}/{channel.concurrency_total_streams ?? 0} 場完整取樣</small></div></td><td><div className="channel-cadence"><span>直播 {channel.weekly_streams === undefined ? "—" : channel.weekly_streams.toFixed(1)}</span><span>影片 {channel.weekly_videos === undefined ? "—" : channel.weekly_videos.toFixed(1)}</span><span>Shorts {channel.weekly_shorts === undefined ? "—" : channel.weekly_shorts.toFixed(1)}</span></div></td><td>{ago(channel.updated_at)}</td><td><button className="danger-button" type="button" onClick={() => void excludeChannel(channel)} disabled={actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中" : "排除"}</button></td>
           </tr>)}
         </tbody></table></div>
       </section>
