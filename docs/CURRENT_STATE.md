@@ -1,8 +1,8 @@
 # 台V Pulse 目前狀態
 
-更新日期：2026-08-03
+更新日期：2026-08-04
 版本：`0.11.0`
-狀態：`0.11.0` 功能、真實本機資料與瀏覽器驗證已完成，正準備正式 GitHub Release。此版重新定義公開直播成效為有品質門檻的平均同接與「直播持續動員」，加入歷史比例趨勢、基準頻道自己的高效率內容，以及已收錄頻道的直播與發布節奏。0.10.0 以上可由內建更新器遠端覆蓋升級；0.9.0 與更早版本仍須先手動安裝最新版一次。
+狀態：`0.11.0` 已正式發布；功能、真實本機資料、瀏覽器、GitHub Actions、白名單 ZIP、Windows 安裝程式及 `releases/latest` 更新端點均已驗證。此版重新定義公開直播成效為有品質門檻的平均同接與「直播持續動員」，加入歷史比例趨勢、基準頻道自己的高效率內容，以及已收錄頻道的直播與發布節奏。0.10.0 以上可由內建更新器遠端覆蓋升級；0.9.0 與更早版本仍須先手動安裝最新版一次。
 
 ## `0.11.0` 公開指標與決策介面調整
 
@@ -12,7 +12,8 @@
 - 同級高效率內容將基準頻道自己的最佳內容另外置頂並顯示同級名次，不納入同級中位數或占用同級榜單；直播排行使用平均同接／訂閱，仍保留峰值與覆蓋率。實際本機資料已確認基準頻道 Shorts 出現於此區。
 - 監測首頁主卡改顯示最近更新狀態與台北時間；同接資料點保留在唯讀系統資訊。已收錄頻道表新增最近 30 日平均同接、完整取樣場次、每週直播、一般影片及 Shorts 頻率與排序。
 - 驗證完成：collector 44 項、rendered HTML 7 項、TypeScript、production build、Windows 啟動與 UTF-8 編碼均通過；lint 為 0 errors，僅保留 205 個既有 `<img>` 警告。使用 152 個本機公開頻道驗證 API payload 與三個頁面，並完成桌面及 390 × 844 行動版互動檢查。
-- 本機正式白名單候選已建立：公開 ZIP 312,881 bytes、SHA-256 `77da481e6ff101d304131cb04363a30df13a3409acbd9b1896b502bd15d8520c`；Windows 安裝程式 409,088 bytes、SHA-256 `d531c8d9f6632fd68de32dfd29cd8f4c3905aff099d5a967f1711ee2f1e8297b`，檔案版本 `0.11.0.0`／產品版本 `0.11.0`。ZIP 內 53 個受管理檔案與 manifest 相符，`.env.example` 的 API Key 空白，未發現 `.env`、`work/`、SQLite、相依套件、outputs 或 Git metadata。這些是本機候選；GitHub Actions 與正式 Release 資產仍須另外核對。
+- PR [#8](https://github.com/Shizumu/tai-v-pulse/pull/8) 已 squash merge 至 `main` commit `858a58137850cad87d0636c23570b31a671cefd6`。標籤 `v0.11.0` 的 [GitHub Actions run 30846570600](https://github.com/Shizumu/tai-v-pulse/actions/runs/30846570600) 全部通過，並建立非草稿、非預發佈的正式 [GitHub Release](https://github.com/Shizumu/tai-v-pulse/releases/tag/v0.11.0)。
+- 已重新下載 GitHub Release 資產驗證：公開 ZIP 313,848 bytes、SHA-256 `6f1dd3d1553352a52fd029dab83a1c033c9ef9a21d38f58798d0e10a9b48e24b`；Windows 安裝程式 410,112 bytes、SHA-256 `d3f94152be9f76d455233b4810e2a884d0e4457654491ac2b9744e44a3fd88fc`，檔案版本 `0.11.0.0`／產品版本 `0.11.0`。兩者均與 sidecar 相符；ZIP 的 53 條 manifest 與 53 個受管理檔案完全吻合，`.env.example` 的 API Key 為空白，未發現 `.env`、`work/`、SQLite、相依套件、outputs 或 Git metadata。GitHub `releases/latest` 已回傳 `v0.11.0` 與同一組安裝程式大小及 SHA-256，因此 0.10.0 以上啟動器可偵測此版。
 
 ## `0.10.1` 直播雷達不可公開影片修正
 
@@ -250,7 +251,7 @@
 - 公開搬遷目前只接受 `format_version=1`，單次上傳上限 256 MB、解壓後上限 1 GB；尚未用接近上限的大型真實同接資料驗證瀏覽器記憶體、匯出耗時與匯入交易時間。
 - 尚未在兩台實體 Windows 電腦完成來源匯出、檔案傳遞、目的端預覽、合併、取代、重啟與後續 API 更新的完整驗收；目前證據為臨時 SQLite、自動測試、型別、lint、production build 與 server-render。
 - 合併模式對相同頻道／影片以 `updated_at` 判斷較新版本；同一父項目與相同 `captured_at` 的歷史列視為同一資料點並保留目的端既有列。若未來需要對相同時間但數值不同的資料做衝突檢視，需另設明確衝突模型，不能靜默猜測來源優先序。
-- 既有 `0.8.3`、`0.8.4`、`0.9.0` 與 `outputs/pending-version-20260729-oauth-help-final/` 內候選包是歷史產物；0.11.0 發布完成前，最近已驗證的正式分享檔仍是 GitHub Release 的 `tai-v-pulse-0.10.1-setup.exe` 及同名 `.sha256`。
+- 既有 `0.8.3`、`0.8.4`、`0.9.0` 與 `outputs/pending-version-20260729-oauth-help-final/` 內候選包是歷史產物；目前正式分享檔是 GitHub Release 的 `tai-v-pulse-0.11.0-setup.exe` 及同名 `.sha256`。
 - 尚未完成真實頻道 Analytics 成功同步、24 小時續期、撤銷及重新連結的完整端到端驗收；自動測試仍只使用臨時 DPAPI 密文與假的 Google 回應，沒有把私人憑證或頻道資料放進 repository。
 - Google OAuth 同意畫面若維持測試狀態，refresh token 通常 7 天後失效；長期個人使用需在 Google Cloud 設定正式發布。未驗證應用程式可能仍顯示 Google 警告。
 - 目前直接同步使用 YouTube Analytics Targeted Queries API，未納入曝光、曝光點閱率、回訪觀眾、收益及 Reporting API 報表；這些欄位可繼續由 Studio 進階備援匯入。
@@ -265,6 +266,6 @@
 - 先用兩份不含憑證、且已備妥可回復環境的實際公開監測資料，分別驗證合併與取代；確認頻道／影片／快照／同接／人工分類筆數、私人工作區與 Analytics 未變，以及目的電腦設定自己的 API Key 後可繼續更新。
 - 另以大量同接樣本測試 256 MB 上限附近的匯出、瀏覽器上傳、預覽與 SQLite 交易耗時；若實際資料接近上限，再依量測決定是否改成串流上傳，不先提高安全限制。
 - 先在可安全復原的測試環境驗證既有本機資料啟動遷移、熱圖統計／明細、分類證據、人工修正保存與重新啟動後沿用；再以桌面及行動版瀏覽器確認鍵盤、觸控與版面。
-- `0.11.0` 正式 GitHub Release 完成後，對外只提供該 Release 的安裝程式與同名 SHA-256；更早版本保留為歷史產物，不再宣稱包含本次調整。
+- 對外只提供 `0.11.0` 正式 GitHub Release 的安裝程式與同名 SHA-256；更早版本保留為歷史產物，不再宣稱包含本次調整。
 - 由使用者在 Google Cloud 建立自己的桌面 OAuth 用戶端，以實際頻道依序驗證首次授權、立即同步、24 小時續期、Google 撤銷與重新連結；驗收時不要分享 JSON 或 token。
 - 在乾淨 Windows 電腦驗證 `0.11.0` 正式包的首次安裝、缺少執行環境時的引導、啟動及資料保留，並從既有 0.10.x 實際執行內建更新到 0.11.0。
