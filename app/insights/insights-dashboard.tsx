@@ -38,8 +38,11 @@ type ChannelMetrics = {
   average_duration_seconds: number | null;
   median_views: number | null;
   median_view_rate: number | null;
+  median_average_concurrent: number | null;
   median_peak_concurrent: number | null;
+  median_sustained_ccv_rate: number | null;
   median_ccv_rate: number | null;
+  concurrency_covered_streams: number;
   subscriber_growth: number | null;
   view_growth: number | null;
   snapshot_count: number;
@@ -54,7 +57,12 @@ type RankedVideo = {
   subscriber_count: number | null;
   view_count: number | null;
   view_rate: number | null;
+  average_concurrent: number | null;
   peak_concurrent: number | null;
+  concurrency_sample_count: number;
+  concurrency_coverage: number | null;
+  concurrency_ready: boolean;
+  sustained_ccv_rate: number | null;
   ccv_rate: number | null;
   content_type: string;
   topics: string[];
@@ -64,6 +72,8 @@ type RankedVideo = {
   game_name: string;
   format_type: string;
   published_at: string | null;
+  peer_rank?: number;
+  comparison_count?: number;
 };
 
 type ContentBreakdown = {
@@ -129,6 +139,7 @@ type Insights = {
   classification_guide: { priority: string; representative_ranking: string };
   top_videos: RankedVideo[];
   top_videos_by_format: Record<"綜合" | "影片" | "直播" | "Shorts", RankedVideo[]>;
+  reference_top_videos_by_format: Record<"綜合" | "影片" | "直播" | "Shorts", RankedVideo | null>;
   top_channels: ChannelMetrics[];
   keywords: { keyword: string; count: number }[];
   coverage: {
@@ -164,6 +175,11 @@ function exact(value: number | null | undefined) {
 function percent(value: number | null | undefined) {
   if (value === null || value === undefined) return "—";
   return `${value.toFixed(value < 10 ? 1 : 0)}%`;
+}
+
+function perHundred(value: number | null | undefined) {
+  if (value === null || value === undefined) return "—";
+  return `${value.toFixed(value >= 10 ? 1 : 2)} 人／百訂閱`;
 }
 
 function hours(value: number | null | undefined) {
@@ -472,6 +488,7 @@ export default function InsightsDashboard() {
     : insights?.content_breakdown ?? [];
   const contentMax = Math.max(1, ...(landscapeItems.map((item) => item.items) ?? [1]));
   const efficientVideos = insights?.top_videos_by_format?.[contentFormat] ?? [];
+  const referenceEfficientVideo = insights?.reference_top_videos_by_format?.[contentFormat] ?? null;
   const growthCoverageText = insights && insights.coverage.growth_channels > 0
     ? `以 ${insights.coverage.growth_channels}/${insights.overview.channels} 個已有期間起點資料的頻道加總`
     : `尚未累積到 ${days} 天前的頻道資料；累積後顯示`;
@@ -481,8 +498,9 @@ export default function InsightsDashboard() {
     ["average_duration_seconds", "平均內容長度", hours],
     ["median_views", "內容觀看中位數", compact],
     ["median_view_rate", "觀看／訂閱比", percent],
-    ["median_peak_concurrent", "直播同接中位數", compact],
-    ["median_ccv_rate", "同接／訂閱比", percent],
+    ["median_average_concurrent", "直播平均同接中位數", compact],
+    ["median_peak_concurrent", "直播峰值同接中位數", compact],
+    ["median_sustained_ccv_rate", "直播持續動員", perHundred],
     ["subscriber_growth", `${days} 日訂閱成長`, signed],
     ["view_growth", `${days} 日觀看成長`, signed],
   ] as const;
@@ -535,7 +553,7 @@ export default function InsightsDashboard() {
             <article className="panel benchmark-panel">
               <div className="panel-heading"><div><p className="section-kicker">PEER BENCHMARK</p><h2>同級表現基準</h2></div><span>{reference ? `比較：${reference.title}` : "選參考頻道即可加入個別比較"}</span></div>
               <div className="table-wrap"><table><thead><tr><th>指標</th>{reference && <th>{reference.title}</th>}<th>同級中位數</th><th>同級前 25%</th></tr></thead><tbody>{benchmarkRows.map(([key, label, formatter]) => <tr key={key}><td><strong>{label}</strong>{(key === "subscriber_growth" || key === "view_growth") && insights.coverage.growth_channels < insights.overview.channels && <small className="benchmark-metric-note">{growthCoverageText}</small>}</td>{reference && <td className="reference-value">{formatter(insights.reference?.[key] as number | null)}</td>}<td>{formatter(insights.benchmarks[key]?.median ?? null)}</td><td>{formatter(insights.benchmarks[key]?.p75 ?? null)}</td></tr>)}</tbody></table></div>
-              <p className="panel-footnote">觀看／訂閱比使用目前公開訂閱數計算，適合比較量級，不代表不重複觀眾。</p>
+              <p className="panel-footnote">觀看／訂閱比使用目前公開訂閱數計算；直播持續動員是完整取樣場次的平均同接／訂閱，以每百位訂閱可持續留下幾位觀眾呈現。兩者都不是不重複觀眾或官方留存率。</p>
             </article>
 
             <aside className="panel format-panel">
@@ -588,8 +606,11 @@ export default function InsightsDashboard() {
           <section className="insight-two-column leader-layout">
             <article className="panel top-content-panel">
               <div className="panel-heading efficiency-heading"><div><p className="section-kicker">CONTENT EXAMPLES</p><h2>同級高效率內容</h2></div><div className="format-tabs" role="group" aria-label="高效率內容形式">{(["影片", "直播", "Shorts", "綜合"] as const).map((format) => <button className={contentFormat === format ? "active" : ""} type="button" onClick={() => setContentFormat(format)} aria-pressed={contentFormat === format} key={format}>{format === "影片" ? "一般影片" : format}</button>)}</div></div>
-              <p className="efficiency-explainer">{contentFormat === "直播" ? "直播依最高同接／訂閱比排序；沒有同接樣本的直播會排在後方。" : `${contentFormat === "綜合" ? "綜合內容" : contentFormat}依觀看／訂閱比排序。`} 每個頻道先取表現最好的一項，避免同一頻道占滿榜單。</p>
-              <div className="top-content-list">{efficientVideos.length === 0 ? <div className="insight-placeholder embedded">目前期間內沒有{contentFormat === "綜合" ? "近期內容" : contentFormat}資料。</div> : efficientVideos.map((video, index) => <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" className="top-content-row" key={video.video_id}><span className="rank">{index + 1}</span>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <span className="top-thumb-fallback">V</span>}<div><strong>{video.title}</strong><p>{video.channel_title} · {video.content_type} · {video.format_type}</p></div><div className="top-content-metric"><strong>{contentFormat === "直播" ? percent(video.ccv_rate) : percent(video.view_rate)}</strong><span>{contentFormat === "直播" ? `${compact(video.peak_concurrent)} 最高同接` : `${compact(video.view_count)} 觀看`}</span></div></a>)}</div>
+              <p className="efficiency-explainer">{contentFormat === "直播" ? "直播依完整取樣場次的平均同接／訂閱排序；至少需要 20 個樣本且涵蓋 70% 直播時長，並同時保留峰值供判讀。" : `${contentFormat === "綜合" ? "綜合內容" : contentFormat}依觀看／訂閱比排序。`} 每個同級頻道先取表現最好的一項；我的內容另外顯示，不影響同級排行與基準。</p>
+              <div className="top-content-list">
+                {referenceEfficientVideo && <a href={`https://www.youtube.com/watch?v=${referenceEfficientVideo.video_id}`} target="_blank" rel="noreferrer" className="top-content-row reference-content-row"><span className="rank">我的</span>{referenceEfficientVideo.thumbnail_url ? <img src={referenceEfficientVideo.thumbnail_url} alt="" /> : <span className="top-thumb-fallback">V</span>}<div><strong>{referenceEfficientVideo.title}</strong><p>{referenceEfficientVideo.channel_title} · {referenceEfficientVideo.content_type} · {referenceEfficientVideo.format_type}{referenceEfficientVideo.peer_rank ? ` · 同級第 ${referenceEfficientVideo.peer_rank}/${referenceEfficientVideo.comparison_count}` : ""}</p></div><div className="top-content-metric"><strong>{contentFormat === "直播" ? perHundred(referenceEfficientVideo.sustained_ccv_rate) : percent(referenceEfficientVideo.view_rate)}</strong><span>{contentFormat === "直播" ? `${compact(referenceEfficientVideo.average_concurrent)} 平均 · ${compact(referenceEfficientVideo.peak_concurrent)} 峰值` : `${compact(referenceEfficientVideo.view_count)} 觀看`}</span></div></a>}
+                {efficientVideos.length === 0 ? <div className="insight-placeholder embedded">目前期間內沒有可比較的{contentFormat === "綜合" ? "近期內容" : contentFormat}資料。</div> : efficientVideos.map((video, index) => <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" className="top-content-row" key={video.video_id}><span className="rank">{index + 1}</span>{video.thumbnail_url ? <img src={video.thumbnail_url} alt="" /> : <span className="top-thumb-fallback">V</span>}<div><strong>{video.title}</strong><p>{video.channel_title} · {video.content_type} · {video.format_type}</p></div><div className="top-content-metric"><strong>{contentFormat === "直播" ? perHundred(video.sustained_ccv_rate) : percent(video.view_rate)}</strong><span>{contentFormat === "直播" ? `${compact(video.average_concurrent)} 平均 · ${compact(video.peak_concurrent)} 峰值 · ${video.concurrency_coverage === null ? "—" : `${video.concurrency_coverage.toFixed(0)}%`} 覆蓋` : `${compact(video.view_count)} 觀看`}</span></div></a>)}
+              </div>
             </article>
 
             <aside className="panel top-channel-panel">

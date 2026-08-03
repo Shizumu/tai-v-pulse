@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -766,6 +767,73 @@ def parse_api_time(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+MIN_CONCURRENCY_SAMPLES = 20
+MIN_CONCURRENCY_COVERAGE = .70
+
+
+def concurrency_sample_stats(
+    samples: Iterable[dict[str, Any]],
+    *,
+    actual_start: str | None,
+    actual_end: str | None,
+    duration_seconds: int | float | None,
+    poll_seconds: int = 60,
+) -> dict[str, Any]:
+    """Summarize one stream's public concurrency samples without filling downtime gaps."""
+    points = sorted(
+        (
+            (captured, float(row["concurrent_viewers"]))
+            for row in samples
+            if (captured := parse_api_time(str(row.get("captured_at") or ""))) is not None
+            and row.get("concurrent_viewers") is not None
+        ),
+        key=lambda item: item[0],
+    )
+    start = parse_api_time(actual_start)
+    end = parse_api_time(actual_end)
+    duration = (
+        (end - start).total_seconds()
+        if start and end and end > start
+        else float(duration_seconds or 0)
+    )
+    if not points:
+        return {
+            "concurrency_sample_count": 0,
+            "concurrency_coverage": 0.0 if duration > 0 else None,
+            "average_concurrent": None,
+            "peak_concurrent": None,
+            "concurrency_ready": False,
+        }
+
+    poll = max(1, int(poll_seconds))
+    weighted_total = 0.0
+    observed_seconds = 0.0
+    for index, (captured, value) in enumerate(points):
+        next_at = points[index + 1][0] if index + 1 < len(points) else captured + timedelta(seconds=poll)
+        segment_start = max(captured, start) if start else captured
+        segment_end = min(next_at, end) if end else next_at
+        seconds = max(0.0, (segment_end - segment_start).total_seconds())
+        # A delayed poll must not silently count the unobserved gap as sustained audience time.
+        weight = min(seconds, poll * 2)
+        weighted_total += value * weight
+        observed_seconds += weight
+
+    coverage = min(1.0, observed_seconds / duration) if duration > 0 else None
+    ready = (
+        len(points) >= MIN_CONCURRENCY_SAMPLES
+        and coverage is not None
+        and coverage >= MIN_CONCURRENCY_COVERAGE
+        and observed_seconds > 0
+    )
+    return {
+        "concurrency_sample_count": len(points),
+        "concurrency_coverage": coverage * 100 if coverage is not None else None,
+        "average_concurrent": weighted_total / observed_seconds if ready else None,
+        "peak_concurrent": max(value for _, value in points),
+        "concurrency_ready": ready,
+    }
 
 
 def extract_video_keywords(title: str, raw_tags: str | None) -> list[str]:
@@ -2008,6 +2076,8 @@ class TrackerService:
             f"http://{getattr(config, 'host', '127.0.0.1')}:{getattr(config, 'port', 8787)}/api/creator/oauth/callback",
         )
         self.channel_candidate_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.channel_performance_cache_at = 0.0
+        self.channel_performance_cache: dict[str, dict[str, Any]] = {}
         self.run_lock = threading.Lock()
         self.state_lock = threading.RLock()
         defaults = {
@@ -3818,6 +3888,99 @@ class TrackerService:
         if not channel_id or not self.database.delete_creator_manual_metric(channel_id, metric_id):
             raise ValueError("找不到這筆手動補充資料")
 
+    def attach_concurrency_stats(self, videos: list[dict[str, Any]]) -> None:
+        video_lookup = {str(video["video_id"]): video for video in videos}
+        samples_by_video: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for group in chunks(list(video_lookup), 400):
+            placeholders = ",".join("?" for _ in group)
+            for sample in self.database.rows(
+                f"""SELECT video_id,captured_at,concurrent_viewers
+                    FROM concurrency_samples
+                    WHERE video_id IN ({placeholders})
+                    ORDER BY video_id,captured_at""",
+                tuple(group),
+            ):
+                samples_by_video[str(sample["video_id"])].append(sample)
+        for video_id, video in video_lookup.items():
+            video.update(concurrency_sample_stats(
+                samples_by_video.get(video_id, []),
+                actual_start=video.get("actual_start"),
+                actual_end=video.get("actual_end"),
+                duration_seconds=video.get("duration_seconds"),
+                poll_seconds=self.config.live_poll_seconds,
+            ))
+
+    def attach_channel_recent_performance(
+        self,
+        channels: list[dict[str, Any]],
+        days: int = 30,
+    ) -> None:
+        channel_lookup = {str(channel["channel_id"]): channel for channel in channels}
+        if (
+            time.monotonic() - self.channel_performance_cache_at < 60
+            and set(channel_lookup).issubset(self.channel_performance_cache)
+        ):
+            for channel_id, channel in channel_lookup.items():
+                channel.update(self.channel_performance_cache[channel_id])
+            return
+        for channel in channels:
+            channel.update({
+                "median_average_concurrent": None,
+                "concurrency_covered_streams": 0,
+                "concurrency_total_streams": 0,
+                "weekly_streams": 0.0,
+                "weekly_videos": 0.0,
+                "weekly_shorts": 0.0,
+            })
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+        videos: list[dict[str, Any]] = []
+        for group in chunks(list(channel_lookup), 400):
+            placeholders = ",".join("?" for _ in group)
+            videos.extend(self.database.rows(
+                f"""SELECT video_id,channel_id,title,description,published_at,duration_seconds,
+                           live_state,actual_start,actual_end,scheduled_start
+                    FROM videos
+                    WHERE channel_id IN ({placeholders})
+                      AND datetime(COALESCE(actual_start,published_at,scheduled_start,updated_at))
+                          >= datetime(?)""",
+                tuple([*group, cutoff]),
+            ))
+        self.attach_concurrency_stats(videos)
+        counts: dict[str, Counter[str]] = defaultdict(Counter)
+        averages: dict[str, list[float]] = defaultdict(list)
+        for video in videos:
+            channel_id = str(video["channel_id"])
+            format_type = video_format(
+                video["live_state"], video["duration_seconds"], video["title"], video["description"] or ""
+            )
+            if format_type == "直播":
+                if not parse_api_time(video.get("actual_start")):
+                    continue
+                counts[channel_id]["直播"] += 1
+                if video["concurrency_ready"] and video["average_concurrent"] is not None:
+                    averages[channel_id].append(float(video["average_concurrent"]))
+            else:
+                counts[channel_id][format_type] += 1
+        for channel_id, channel in channel_lookup.items():
+            channel["median_average_concurrent"] = percentile(averages[channel_id], .5)
+            channel["concurrency_covered_streams"] = len(averages[channel_id])
+            channel["concurrency_total_streams"] = counts[channel_id]["直播"]
+            channel["weekly_streams"] = counts[channel_id]["直播"] / days * 7
+            channel["weekly_videos"] = counts[channel_id]["影片"] / days * 7
+            channel["weekly_shorts"] = counts[channel_id]["Shorts"] / days * 7
+        self.channel_performance_cache = {
+            channel_id: {
+                key: channel[key]
+                for key in (
+                    "median_average_concurrent", "concurrency_covered_streams",
+                    "concurrency_total_streams", "weekly_streams", "weekly_videos",
+                    "weekly_shorts",
+                )
+            }
+            for channel_id, channel in channel_lookup.items()
+        }
+        self.channel_performance_cache_at = time.monotonic()
+
     def insights(
         self,
         days: int = 30,
@@ -3879,14 +4042,11 @@ class TrackerService:
                            v.published_at,v.duration_seconds,v.category_id,v.tags,v.content_type,v.content_tags,
                            v.classification_source,v.classification_evidence,v.game_name,
                            v.view_count,v.like_count,v.comment_count,v.live_state,
-                           v.current_concurrent,v.scheduled_start,v.actual_start,v.actual_end,
-                           MAX(cs.concurrent_viewers) AS peak_concurrent
+                           v.current_concurrent,v.scheduled_start,v.actual_start,v.actual_end
                     FROM videos v
-                    LEFT JOIN concurrency_samples cs ON cs.video_id=v.video_id
                     WHERE v.channel_id IN ({placeholders})
                       AND datetime(COALESCE(v.published_at,v.actual_start,v.scheduled_start,v.updated_at))
-                          >= datetime(?)
-                    GROUP BY v.video_id""",
+                          >= datetime(?)""",
                 tuple([*analysis_group, cutoff]),
             ))
             snapshots.extend(self.database.rows(
@@ -3897,6 +4057,7 @@ class TrackerService:
                 tuple([*analysis_group, cutoff]),
             ))
 
+        self.attach_concurrency_stats(videos)
         videos_by_channel: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for video in videos:
             video["format_type"] = video_format(
@@ -3924,8 +4085,11 @@ class TrackerService:
                 for video in channel_videos if subscribers and video["view_count"] is not None
             ]
             live_videos = [video for video in channel_videos if video["format_type"] == "直播"]
-            peaks = [video["peak_concurrent"] for video in live_videos if video["peak_concurrent"] is not None]
-            ccv_rates = [float(peak) / subscribers * 100 for peak in peaks] if subscribers else []
+            covered_live_videos = [video for video in live_videos if video["concurrency_ready"]]
+            averages = [video["average_concurrent"] for video in covered_live_videos]
+            peaks = [video["peak_concurrent"] for video in covered_live_videos]
+            sustained_rates = [float(value) / subscribers * 100 for value in averages] if subscribers else []
+            peak_rates = [float(value) / subscribers * 100 for value in peaks] if subscribers else []
             durations = [video["duration_seconds"] for video in channel_videos if video["duration_seconds"] is not None]
             return {
                 "channel_id": channel["channel_id"],
@@ -3939,8 +4103,11 @@ class TrackerService:
                 "average_duration_seconds": sum(durations) / len(durations) if durations else None,
                 "median_views": percentile(views, .5),
                 "median_view_rate": percentile(view_rates, .5),
+                "median_average_concurrent": percentile(averages, .5),
                 "median_peak_concurrent": percentile(peaks, .5),
-                "median_ccv_rate": percentile(ccv_rates, .5),
+                "median_sustained_ccv_rate": percentile(sustained_rates, .5),
+                "median_ccv_rate": percentile(peak_rates, .5),
+                "concurrency_covered_streams": len(covered_live_videos),
                 "subscriber_growth": growth(channel["channel_id"], "subscriber_count"),
                 "view_growth": growth(channel["channel_id"], "view_count"),
                 "snapshot_count": len(snapshots_by_channel[channel["channel_id"]]),
@@ -3950,7 +4117,8 @@ class TrackerService:
         reference_metrics = channel_metrics(reference_channel) if reference_channel else None
         benchmark_fields = (
             "weekly_frequency", "average_duration_seconds", "median_views",
-            "median_view_rate", "median_peak_concurrent", "median_ccv_rate",
+            "median_view_rate", "median_average_concurrent", "median_peak_concurrent",
+            "median_sustained_ccv_rate", "median_ccv_rate",
             "subscriber_growth", "view_growth",
         )
         benchmarks = {
@@ -3964,6 +4132,8 @@ class TrackerService:
         cohort_ids = {channel["channel_id"] for channel in cohort_channels}
         cohort_videos = [video for video in videos if video["channel_id"] in cohort_ids]
         channel_lookup = {channel["channel_id"]: channel for channel in cohort_channels}
+        if reference_channel:
+            channel_lookup[reference_channel["channel_id"]] = reference_channel
         format_counter: Counter[str] = Counter()
         keyword_counter: Counter[str] = Counter()
         schedule_counts = [[0 for _ in range(6)] for _ in range(7)]
@@ -3971,22 +4141,28 @@ class TrackerService:
         schedule_streams: list[list[list[dict[str, Any]]]] = [[[] for _ in range(6)] for _ in range(7)]
         ranked_videos: list[dict[str, Any]] = []
 
-        for video in cohort_videos:
-            format_counter[video["format_type"]] += 1
-            keyword_counter.update(extract_video_keywords(video["title"], video["tags"]))
+        def ranked_video_payload(video: dict[str, Any]) -> dict[str, Any]:
             channel = channel_lookup.get(video["channel_id"], {})
             subscribers = int(channel.get("subscriber_count") or 0)
             view_rate = (
                 float(video["view_count"]) / subscribers * 100
                 if subscribers and video["view_count"] is not None else None
             )
-            ranked_videos.append({
+            return {
                 "video_id": video["video_id"], "title": video["title"],
                 "thumbnail_url": video["thumbnail_url"], "channel_id": video["channel_id"],
                 "channel_title": channel.get("title", video["channel_id"]),
                 "subscriber_count": channel.get("subscriber_count"),
                 "view_count": video["view_count"], "view_rate": view_rate,
+                "average_concurrent": video["average_concurrent"],
                 "peak_concurrent": video["peak_concurrent"],
+                "concurrency_sample_count": video["concurrency_sample_count"],
+                "concurrency_coverage": video["concurrency_coverage"],
+                "concurrency_ready": video["concurrency_ready"],
+                "sustained_ccv_rate": (
+                    float(video["average_concurrent"]) / subscribers * 100
+                    if subscribers and video["average_concurrent"] is not None else None
+                ),
                 "ccv_rate": (
                     float(video["peak_concurrent"]) / subscribers * 100
                     if subscribers and video["peak_concurrent"] is not None else None
@@ -3998,7 +4174,13 @@ class TrackerService:
                 "classification_evidence": video["classification_evidence"] or "",
                 "game_name": video["game_name"] or "",
                 "format_type": video["format_type"], "published_at": video["published_at"],
-            })
+            }
+
+        for video in cohort_videos:
+            format_counter[video["format_type"]] += 1
+            keyword_counter.update(extract_video_keywords(video["title"], video["tags"]))
+            channel = channel_lookup.get(video["channel_id"], {})
+            ranked_videos.append(ranked_video_payload(video))
             if video["format_type"] == "直播":
                 started = parse_api_time(video["actual_start"] or video["scheduled_start"] or video["published_at"])
                 if started:
@@ -4030,6 +4212,8 @@ class TrackerService:
             result: list[dict[str, Any]] = []
             seen_channels: set[str] = set()
             for row in ordered:
+                if row.get(metric) is None:
+                    continue
                 if row["channel_id"] in seen_channels:
                     continue
                 result.append(row)
@@ -4145,12 +4329,37 @@ class TrackerService:
                 (row for row in ranked_videos if row["format_type"] == "影片"), "view_rate", 12
             ),
             "直播": ranked_distinct(
-                (row for row in ranked_videos if row["format_type"] == "直播"), "ccv_rate", 12
+                (row for row in ranked_videos if row["format_type"] == "直播"), "sustained_ccv_rate", 12
             ),
             "Shorts": ranked_distinct(
                 (row for row in ranked_videos if row["format_type"] == "Shorts"), "view_rate", 12
             ),
         }
+        reference_ranked_videos = [
+            ranked_video_payload(video)
+            for video in videos_by_channel.get(reference_channel["channel_id"], [])
+        ] if reference_channel else []
+        ranking_definitions = {
+            "綜合": ("view_rate", lambda row: True),
+            "影片": ("view_rate", lambda row: row["format_type"] == "影片"),
+            "直播": ("sustained_ccv_rate", lambda row: row["format_type"] == "直播"),
+            "Shorts": ("view_rate", lambda row: row["format_type"] == "Shorts"),
+        }
+        reference_top_videos_by_format: dict[str, dict[str, Any] | None] = {}
+        for label, (metric, accepted) in ranking_definitions.items():
+            reference_candidates = [row for row in reference_ranked_videos if accepted(row)]
+            reference_best = ranked_distinct(reference_candidates, metric, 1)
+            if not reference_best:
+                reference_top_videos_by_format[label] = None
+                continue
+            item = dict(reference_best[0])
+            peer_ranked = ranked_distinct((row for row in ranked_videos if accepted(row)), metric, 10_000)
+            item["peer_rank"] = 1 + sum(
+                1 for row in peer_ranked
+                if float(row[metric]) > float(item[metric])
+            )
+            item["comparison_count"] = len(peer_ranked) + 1
+            reference_top_videos_by_format[label] = item
         growth_covered = sum(1 for row in cohort_metrics if row["snapshot_count"] >= 2)
         classified = sum(1 for video in cohort_videos if video["content_type"] != "其他")
         live_seconds = sum(
@@ -4196,10 +4405,11 @@ class TrackerService:
             },
             "classification_guide": {
                 "priority": "人工確認 → 標題（含系統與既有確認的遊戲別名）→ YouTube 類別 → 影片標籤 → 說明文字",
-                "representative_ranking": "代表內容依觀看／訂閱比由高至低排序，每個頻道最多一項；直播同接只作為卡片補充指標。",
+                "representative_ranking": "一般影片與 Shorts 依觀看／訂閱比排序；直播依完整取樣的平均同接／訂閱比排序，每個頻道最多一項。",
             },
             "top_videos": videos_by_format["綜合"],
             "top_videos_by_format": videos_by_format,
+            "reference_top_videos_by_format": reference_top_videos_by_format,
             "top_channels": sorted(
                 cohort_metrics,
                 key=lambda row: row["median_view_rate"] if row["median_view_rate"] is not None else -1,
@@ -4313,8 +4523,9 @@ class TrackerService:
         data_ids = [row["channel_id"] for row in data_channels]
         channel_lookup = {row["channel_id"]: row for row in data_channels}
         now = datetime.now(UTC)
-        sixty_day_cutoff = (now - timedelta(days=60)).isoformat(timespec="seconds")
+        video_cutoff = (now - timedelta(days=max(60, days + 30))).isoformat(timespec="seconds")
         series_cutoff = (now - timedelta(days=days)).isoformat(timespec="seconds")
+        history_snapshot_cutoff = (now - timedelta(days=days + 30)).isoformat(timespec="seconds")
 
         videos: list[dict[str, Any]] = []
         snapshots: list[dict[str, Any]] = []
@@ -4324,14 +4535,13 @@ class TrackerService:
                 videos.extend(self.database.rows(
                     f"""SELECT v.video_id,v.channel_id,v.title,v.description,v.thumbnail_url,
                                v.published_at,v.duration_seconds,v.content_type,v.content_tags,
-                               v.view_count,v.live_state,v.actual_start,v.scheduled_start,
-                               MAX(cs.concurrent_viewers) AS peak_concurrent
-                        FROM videos v LEFT JOIN concurrency_samples cs ON cs.video_id=v.video_id
+                               v.view_count,v.live_state,v.actual_start,v.actual_end,v.scheduled_start,
+                               v.updated_at
+                        FROM videos v
                         WHERE v.channel_id IN ({placeholders})
                           AND datetime(COALESCE(v.published_at,v.actual_start,v.scheduled_start,v.updated_at))
-                              >= datetime(?)
-                        GROUP BY v.video_id""",
-                    tuple([*group, sixty_day_cutoff]),
+                              >= datetime(?)""",
+                    tuple([*group, video_cutoff]),
                 ))
                 snapshots.extend(self.database.rows(
                     f"""SELECT channel_id,captured_at,subscriber_count,view_count,video_count
@@ -4339,6 +4549,8 @@ class TrackerService:
                         ORDER BY captured_at ASC""",
                     tuple(group),
                 ))
+
+        self.attach_concurrency_stats(videos)
 
         def accepted_format(video: dict[str, Any]) -> bool:
             actual = video_format(
@@ -4355,7 +4567,23 @@ class TrackerService:
                 return actual != "Shorts"
             return actual == format_type
 
-        videos = [video for video in videos if accepted_format(video)]
+        all_videos = list(videos)
+        videos = [video for video in all_videos if accepted_format(video)]
+        video_snapshots_by_video: dict[str, list[tuple[datetime, int]]] = defaultdict(list)
+        video_ids = [str(video["video_id"]) for video in all_videos]
+        for group in chunks(video_ids, 400):
+            placeholders = ",".join("?" for _ in group)
+            rows = self.database.rows(
+                f"""SELECT video_id,captured_at,view_count
+                    FROM video_snapshots
+                    WHERE video_id IN ({placeholders}) AND datetime(captured_at)>=datetime(?)
+                    ORDER BY video_id,captured_at""",
+                tuple([*group, history_snapshot_cutoff]),
+            )
+            for row in rows:
+                captured = parse_api_time(row["captured_at"])
+                if captured and row["view_count"] is not None:
+                    video_snapshots_by_video[str(row["video_id"])].append((captured, int(row["view_count"])))
         snapshots_by_channel: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for snapshot in snapshots:
             snapshots_by_channel[snapshot["channel_id"]].append(snapshot)
@@ -4407,12 +4635,25 @@ class TrackerService:
             if cached is not None:
                 return cached
             channel_videos = [video for video in videos if video["channel_id"] == channel["channel_id"]]
+            channel_live_videos = [
+                video for video in all_videos
+                if video["channel_id"] == channel["channel_id"] and video["format_type"] == "直播"
+            ]
             current_videos = [
                 video for video in channel_videos
                 if (published := published_time(video)) and published >= now - timedelta(days=30)
             ]
             previous_videos = [
                 video for video in channel_videos
+                if (published := published_time(video))
+                and now - timedelta(days=60) <= published < now - timedelta(days=30)
+            ]
+            current_live_videos = [
+                video for video in channel_live_videos
+                if (published := published_time(video)) and published >= now - timedelta(days=30)
+            ]
+            previous_live_videos = [
+                video for video in channel_live_videos
                 if (published := published_time(video))
                 and now - timedelta(days=60) <= published < now - timedelta(days=30)
             ]
@@ -4423,15 +4664,20 @@ class TrackerService:
 
             current_views = median_field(current_videos, "view_count")
             previous_views = median_field(previous_videos, "view_count")
-            current_peak = median_field(current_videos, "peak_concurrent")
-            previous_peak = median_field(previous_videos, "peak_concurrent")
+            covered_current_live = [video for video in current_live_videos if video["concurrency_ready"]]
+            covered_previous_live = [video for video in previous_live_videos if video["concurrency_ready"]]
+            current_average = median_field(covered_current_live, "average_concurrent")
+            previous_average = median_field(covered_previous_live, "average_concurrent")
+            current_peak = median_field(covered_current_live, "peak_concurrent")
             stickiness = current_views / subscribers * 100 if current_views is not None and subscribers else None
             previous_stickiness = (
                 previous_views / subscribers * 100 if previous_views is not None and subscribers else None
             )
-            ccv_rate = current_peak / subscribers * 100 if current_peak is not None and subscribers else None
-            previous_ccv_rate = (
-                previous_peak / subscribers * 100 if previous_peak is not None and subscribers else None
+            sustained_ccv_rate = (
+                current_average / subscribers * 100 if current_average is not None and subscribers else None
+            )
+            previous_sustained_ccv_rate = (
+                previous_average / subscribers * 100 if previous_average is not None and subscribers else None
             )
             result = {
                 **channel,
@@ -4439,16 +4685,23 @@ class TrackerService:
                 "recent_items": len(current_videos),
                 "previous_items": len(previous_videos),
                 "median_views": current_views,
+                "median_average_concurrent": current_average,
                 "median_peak_concurrent": current_peak,
                 "stickiness": stickiness,
-                "ccv_rate": ccv_rate,
+                "sustained_ccv_rate": sustained_ccv_rate,
+                "ccv_rate": sustained_ccv_rate,
+                "concurrency_covered_streams": len(covered_current_live),
+                "concurrency_total_streams": len(current_live_videos),
                 "subscriber_delta_7": snapshot_delta(channel, 7, "subscriber_count"),
                 "subscriber_delta_30": snapshot_delta(channel, 30, "subscriber_count"),
                 "view_delta_30": snapshot_delta(channel, 30, "view_count"),
                 "median_views_delta": rolling_delta(current_views, previous_views),
                 "stickiness_delta": rolling_delta(stickiness, previous_stickiness),
-                "ccv_rate_delta": rolling_delta(ccv_rate, previous_ccv_rate),
+                "sustained_ccv_rate_delta": rolling_delta(
+                    sustained_ccv_rate, previous_sustained_ccv_rate
+                ),
             }
+            result["ccv_rate_delta"] = result["sustained_ccv_rate_delta"]
             metric_cache[channel["channel_id"]] = result
             return result
 
@@ -4536,26 +4789,84 @@ class TrackerService:
             })
         organizations.sort(key=lambda row: row["median_views_total"], reverse=True)
 
+        video_snapshot_times = {
+            video_id: [captured for captured, _ in rows]
+            for video_id, rows in video_snapshots_by_video.items()
+        }
+
+        def historical_view_count(video: dict[str, Any], as_of: datetime) -> int | None:
+            video_id = str(video["video_id"])
+            history = video_snapshots_by_video.get(video_id, [])
+            if not history:
+                return None
+            index = bisect_right(video_snapshot_times[video_id], as_of) - 1
+            return history[index][1] if index >= 0 else None
+
+        videos_by_channel: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        live_videos_by_channel: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for video in videos:
+            videos_by_channel[str(video["channel_id"])].append(video)
+        for video in all_videos:
+            if video["format_type"] == "直播":
+                live_videos_by_channel[str(video["channel_id"])].append(video)
+
+        def rolling_history_metrics(
+            channel_id: str,
+            date: str,
+            subscribers: int | None,
+        ) -> dict[str, float | None]:
+            if not subscribers:
+                return {"stickiness": None, "sustained_ccv_rate": None}
+            as_of = datetime.fromisoformat(f"{date}T23:59:59+00:00")
+            window_start = as_of - timedelta(days=30)
+            view_values: list[int] = []
+            for video in videos_by_channel.get(channel_id, []):
+                published = published_time(video)
+                if not published or not (window_start <= published <= as_of):
+                    continue
+                value = historical_view_count(video, as_of)
+                if value is not None:
+                    view_values.append(value)
+            live_averages = [
+                float(video["average_concurrent"])
+                for video in live_videos_by_channel.get(channel_id, [])
+                if video["concurrency_ready"]
+                and (published := published_time(video)) is not None
+                and window_start <= published <= as_of
+                and (ended := parse_api_time(video.get("actual_end"))) is not None
+                and ended <= as_of
+            ]
+            median_views = percentile(view_values, .5)
+            median_average = percentile(live_averages, .5)
+            return {
+                "stickiness": median_views / subscribers * 100 if median_views is not None else None,
+                "sustained_ccv_rate": (
+                    median_average / subscribers * 100 if median_average is not None else None
+                ),
+            }
+
         series_rows: list[dict[str, Any]] = []
-        peer_daily: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        peer_daily: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
         if selected_series_ids:
             for channel_id in selected_series_ids:
                 daily: dict[str, dict[str, Any]] = {}
                 for row in snapshots_by_channel.get(channel_id, []):
                     if row["captured_at"] >= series_cutoff:
                         daily[row["captured_at"][:10]] = row
+                points: list[dict[str, Any]] = []
+                for date, row in sorted(daily.items()):
+                    rolling = rolling_history_metrics(channel_id, date, row["subscriber_count"])
+                    points.append({
+                        "date": date,
+                        "subscriber_count": row["subscriber_count"],
+                        "view_count": row["view_count"],
+                        "video_count": row["video_count"],
+                        **rolling,
+                    })
                 series_rows.append({
                     "channel_id": channel_id,
                     "title": channel_lookup.get(channel_id, {}).get("title", channel_id),
-                    "points": [
-                        {
-                            "date": date,
-                            "subscriber_count": row["subscriber_count"],
-                            "view_count": row["view_count"],
-                            "video_count": row["video_count"],
-                        }
-                        for date, row in sorted(daily.items())
-                    ],
+                    "points": points,
                 })
         for channel in cohort:
             daily: dict[str, dict[str, Any]] = {}
@@ -4565,13 +4876,21 @@ class TrackerService:
             for date, row in daily.items():
                 for field in ("subscriber_count", "view_count", "video_count"):
                     if row[field] is not None:
-                        peer_daily[date][field].append(int(row[field]))
+                        peer_daily[date][field].append(float(row[field]))
+                rolling = rolling_history_metrics(
+                    str(channel["channel_id"]), date, row["subscriber_count"]
+                )
+                for field in ("stickiness", "sustained_ccv_rate"):
+                    if rolling[field] is not None:
+                        peer_daily[date][field].append(float(rolling[field]))
         peer_series = [
             {
                 "date": date,
                 "subscriber_count": percentile(values["subscriber_count"], .5),
                 "view_count": percentile(values["view_count"], .5),
                 "video_count": percentile(values["video_count"], .5),
+                "stickiness": percentile(values["stickiness"], .5),
+                "sustained_ccv_rate": percentile(values["sustained_ccv_rate"], .5),
             }
             for date, values in sorted(peer_daily.items())
         ]
@@ -4607,6 +4926,9 @@ class TrackerService:
                 "median_subscribers": percentile((row.get("subscriber_count") for row in cohort_metrics), .5),
                 "median_views": percentile((row.get("median_views") for row in cohort_metrics), .5),
                 "median_stickiness": percentile((row.get("stickiness") for row in cohort_metrics), .5),
+                "median_sustained_ccv_rate": percentile(
+                    (row.get("sustained_ccv_rate") for row in cohort_metrics), .5
+                ),
             },
             "rankings": {
                 "subscribers": ranked("subscriber_count"),
@@ -4614,7 +4936,8 @@ class TrackerService:
                 "growth_30": growth_30[:50],
                 "median_views": ranked("median_views"),
                 "stickiness": ranked("stickiness"),
-                "ccv_rate": ranked("ccv_rate"),
+                "sustained_ccv_rate": ranked("sustained_ccv_rate"),
+                "ccv_rate": ranked("sustained_ccv_rate"),
                 "top_videos": ranked_videos[:30],
                 "organizations": organizations,
             },
@@ -4915,6 +5238,7 @@ class TrackerService:
         )
         for channel in channels:
             channel["manual_tags"] = parse_json_list(channel.get("manual_tags"))
+        self.attach_channel_recent_performance(channels)
         live_videos = self.database.rows(
             """SELECT v.video_id,v.channel_id,v.title,c.title AS channel_title,v.thumbnail_url,v.live_state,
                       v.current_concurrent,v.scheduled_start,v.actual_start,v.updated_at

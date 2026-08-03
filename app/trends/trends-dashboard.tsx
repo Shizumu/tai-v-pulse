@@ -43,14 +43,19 @@ type TrendChannel = Channel & {
   recent_items: number;
   previous_items: number;
   median_views: number | null;
+  median_average_concurrent: number | null;
   median_peak_concurrent: number | null;
   stickiness: number | null;
+  sustained_ccv_rate: number | null;
   ccv_rate: number | null;
+  concurrency_covered_streams: number;
+  concurrency_total_streams: number;
   subscriber_delta_7: Delta;
   subscriber_delta_30: Delta;
   view_delta_30: Delta;
   median_views_delta: Delta;
   stickiness_delta: Delta;
+  sustained_ccv_rate_delta: Delta;
   ccv_rate_delta: Delta;
 };
 
@@ -84,6 +89,7 @@ type Trends = {
     growth_30: TrendChannel[];
     median_views: TrendChannel[];
     stickiness: TrendChannel[];
+    sustained_ccv_rate: TrendChannel[];
     ccv_rate: TrendChannel[];
     top_videos: RankedVideo[];
     organizations: {
@@ -101,9 +107,9 @@ type Trends = {
   series: {
     channel_id: string;
     title: string;
-    points: { date: string; subscriber_count: number | null; view_count: number | null; video_count: number | null }[];
+    points: { date: string; subscriber_count: number | null; view_count: number | null; video_count: number | null; stickiness: number | null; sustained_ccv_rate: number | null }[];
   }[];
-  peer_series: { date: string; subscriber_count: number | null; view_count: number | null; video_count: number | null }[];
+  peer_series: { date: string; subscriber_count: number | null; view_count: number | null; video_count: number | null; stickiness: number | null; sustained_ccv_rate: number | null }[];
   readiness: {
     oldest_snapshot_at: string | null;
     collected_days: number;
@@ -125,15 +131,16 @@ const COLORS = ["#2ca981", "#ce6f93", "#4c8ecb", "#8b72ca", "#c18a2d"];
 const PERIOD_OPTIONS = [7, 14, 30, 90, 365] as const;
 const TOPIC_OPTIONS = ["全部", "遊戲", "雜談", "歌回", "ASMR", "音樂作品", "紀念／重大活動", "其他"] as const;
 
-type HistoryField = "subscriber_count" | "view_count" | "video_count";
-type ChartMetric = "subscribers" | "subscriber_growth" | "views" | "view_growth" | "videos";
+type HistoryField = "subscriber_count" | "view_count" | "stickiness" | "sustained_ccv_rate";
+type ChartMetric = "subscribers" | "subscriber_growth" | "views" | "view_growth" | "stickiness" | "sustained_ccv_rate";
 
-const CHART_METRICS: Record<ChartMetric, { label: string; field: HistoryField; growth: boolean; description: string }> = {
-  subscribers: { label: "訂閱總數", field: "subscriber_count", growth: false, description: "比較各頻道當下規模" },
-  subscriber_growth: { label: "訂閱成長", field: "subscriber_count", growth: true, description: "各頻道相對於圖表起點增加多少訂閱" },
-  views: { label: "累積觀看", field: "view_count", growth: false, description: "比較頻道公開累積觀看總數" },
-  view_growth: { label: "觀看成長", field: "view_count", growth: true, description: "各頻道相對於圖表起點增加多少公開觀看" },
-  videos: { label: "內容總數", field: "video_count", growth: false, description: "比較頻道公開影片與直播累積數量" },
+const CHART_METRICS: Record<ChartMetric, { label: string; field: HistoryField; growth: boolean; format: "number" | "multiple" | "per_hundred"; description: string }> = {
+  subscribers: { label: "訂閱總數", field: "subscriber_count", growth: false, format: "number", description: "比較各頻道當下規模" },
+  subscriber_growth: { label: "訂閱成長", field: "subscriber_count", growth: true, format: "number", description: "各頻道相對於圖表起點增加多少訂閱" },
+  views: { label: "累積觀看", field: "view_count", growth: false, format: "number", description: "比較頻道公開累積觀看總數" },
+  view_growth: { label: "觀看成長", field: "view_count", growth: true, format: "number", description: "各頻道相對於圖表起點增加多少公開觀看" },
+  stickiness: { label: "公開黏著度", field: "stickiness", growth: false, format: "multiple", description: "各日往前 30 天內容觀看中位數／當日訂閱；以倍數呈現" },
+  sustained_ccv_rate: { label: "直播持續動員", field: "sustained_ccv_rate", growth: false, format: "per_hundred", description: "各日往前 30 天完整取樣直播的平均同接中位數／當日訂閱" },
 };
 
 function compact(value: number | null | undefined, digits = 1) {
@@ -149,6 +156,17 @@ function exact(value: number | null | undefined, digits = 1) {
 function percent(value: number | null | undefined) {
   if (value === null || value === undefined) return "—";
   return `${value.toFixed(Math.abs(value) < 10 ? 1 : 0)}%`;
+}
+
+function multiple(value: number | null | undefined) {
+  if (value === null || value === undefined) return "—";
+  const ratio = value / 100;
+  return `${ratio.toFixed(ratio >= 10 ? 1 : 2)}×`;
+}
+
+function perHundred(value: number | null | undefined) {
+  if (value === null || value === undefined) return "—";
+  return `${value.toFixed(value >= 10 ? 1 : 2)} 人／百訂閱`;
 }
 
 function matchesContentTopic(video: RankedVideo, topic: string) {
@@ -346,7 +364,9 @@ function ComparisonChart({ series, peerSeries, metric }: { series: Trends["serie
         const lineY = padding.top + line / 4 * (height - padding.top - padding.bottom);
         context.beginPath(); context.moveTo(padding.left, lineY); context.lineTo(width - padding.right, lineY); context.stroke();
         context.fillStyle = "#6d7973"; context.font = "11px system-ui";
-        context.fillText(compact(max - span * line / 4), 8, lineY + 4);
+        const labelValue = max - span * line / 4;
+        const axisLabel = definition.format === "multiple" ? multiple(labelValue) : definition.format === "per_hundred" ? perHundred(labelValue) : compact(labelValue);
+        context.fillText(axisLabel, 8, lineY + 4);
       }
       const drawLine = (points: { date: string; value: number | null }[], color: string, dashed = false) => {
         context.strokeStyle = color; context.lineWidth = dashed ? 2 : 2.8; context.setLineDash(dashed ? [6, 5] : []);
@@ -368,7 +388,7 @@ function ComparisonChart({ series, peerSeries, metric }: { series: Trends["serie
     const observer = new ResizeObserver(draw);
     if (canvas.parentElement) observer.observe(canvas.parentElement);
     return () => observer.disconnect();
-  }, [definition.field, definition.growth, peerSeries, series]);
+  }, [definition.field, definition.format, definition.growth, peerSeries, series]);
   return <canvas ref={canvasRef} role="img" aria-label={`頻道${definition.label}歷史折線圖`} />;
 }
 
@@ -394,7 +414,7 @@ export default function TrendsDashboard() {
   const [organizationScope, setOrganizationScope] = useState<"peer" | "all">("peer");
   const [includeGraduated, setIncludeGraduated] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [ranking, setRanking] = useState<"subscribers" | "median_views" | "stickiness" | "ccv_rate">("subscribers");
+  const [ranking, setRanking] = useState<"subscribers" | "median_views" | "stickiness" | "sustained_ccv_rate">("subscribers");
   const [chartMetric, setChartMetric] = useState<ChartMetric>("subscribers");
   const [savedGroups, setSavedGroups] = useState<{ name: string; ids: string[] }[]>([]);
   const [groupName, setGroupName] = useState("");
@@ -504,17 +524,17 @@ export default function TrendsDashboard() {
     named_channels: 0,
   };
   const visibleTopVideos = trends?.rankings.top_videos.filter((video) => matchesContentTopic(video, contentTopic)) ?? [];
-  const rankingMetric = (row: TrendChannel) => ranking === "subscribers" ? row.subscriber_count : ranking === "median_views" ? row.median_views : ranking === "stickiness" ? row.stickiness : row.ccv_rate;
-  const rankingDelta = (row: TrendChannel) => ranking === "subscribers" ? row.subscriber_delta_30 : ranking === "median_views" ? row.median_views_delta : ranking === "stickiness" ? row.stickiness_delta : row.ccv_rate_delta;
-  const metricLabel = ranking === "subscribers" ? "訂閱數" : ranking === "median_views" ? "觀看中位數" : ranking === "stickiness" ? "公開觀看黏著度" : "同接／訂閱比";
-  const metricFormatter = (value: number | null) => ["stickiness", "ccv_rate"].includes(ranking) ? percent(value) : compact(value);
+  const rankingMetric = (row: TrendChannel) => ranking === "subscribers" ? row.subscriber_count : ranking === "median_views" ? row.median_views : ranking === "stickiness" ? row.stickiness : row.sustained_ccv_rate;
+  const rankingDelta = (row: TrendChannel) => ranking === "subscribers" ? row.subscriber_delta_30 : ranking === "median_views" ? row.median_views_delta : ranking === "stickiness" ? row.stickiness_delta : row.sustained_ccv_rate_delta;
+  const metricLabel = ranking === "subscribers" ? "訂閱數" : ranking === "median_views" ? "觀看中位數" : ranking === "stickiness" ? "公開觀看黏著度" : "直播持續動員";
+  const metricFormatter = (value: number | null) => ranking === "stickiness" ? multiple(value) : ranking === "sustained_ccv_rate" ? perHundred(value) : compact(value);
   const rankingExplanation = ranking === "subscribers"
     ? "依目前公開訂閱數排序；頻道隱藏訂閱數時顯示缺值並排在後方。這是頻道級指標，不受內容形式篩選影響。"
     : ranking === "median_views"
       ? `依最近 30 日${formatType === "全部" ? "全部內容" : `符合「${formatType}」的內容`}公開觀看中位數排序；沒有可用內容時顯示缺值。`
       : ranking === "stickiness"
         ? `公開觀看黏著度＝最近 30 日${formatType === "全部" ? "全部內容" : `符合「${formatType}」的內容`}觀看中位數／目前訂閱數；缺少內容或訂閱數時不計算，也不是 Studio 回訪觀眾或留存率。`
-        : `同接／訂閱比＝最近 30 日${formatType === "全部" ? "直播" : `符合「${formatType}」且有同接樣本的直播`}最高同接中位數／目前訂閱數；沒有同接樣本或訂閱數時不計算。`;
+        : "直播持續動員＝最近 30 日完整取樣直播的平均同接中位數／目前訂閱數，以每百位訂閱可持續留下幾位觀眾呈現。每場至少需要 20 個樣本且涵蓋 70% 直播時長；此指標固定看直播，不受上方內容形式篩選影響。";
   const maxMetric = Math.max(1, ...rankingRows.slice(0, 15).map((row) => Math.max(0, Number(rankingMetric(row) ?? 0))));
 
   return <main className="app-shell trends-shell">
@@ -546,9 +566,9 @@ export default function TrendsDashboard() {
         <article className="insight-hero primary"><span>同級頻道</span><strong>{trends.overview.peer_channels}</strong><p>{trends.overview.active_channels} 個近 30 天有內容</p></article>
         <article className="insight-hero"><span>同級訂閱中位數</span><strong>{compact(trends.overview.median_subscribers)}</strong><p>不包含基準頻道</p></article>
         <article className="insight-hero"><span>近 30 日觀看中位數</span><strong>{compact(trends.overview.median_views)}</strong><p>{formatType === "主要內容" ? "不包含 Shorts" : formatType}</p></article>
-        <article className="insight-hero"><span>近 30 日公開黏著度</span><strong>{percent(trends.overview.median_stickiness)}</strong><p>觀看中位數／訂閱數</p></article>
+        <article className="insight-hero"><span>近 30 日公開黏著度</span><strong>{multiple(trends.overview.median_stickiness)}</strong><p>觀看中位數／訂閱數</p></article>
         {trends.reference && <article className="insight-hero owned-trend-card"><span>我的公開訂閱</span><div className="metric-with-delta"><strong>{compact(trends.reference.subscriber_count)}</strong><DeltaBadge delta={trends.reference.subscriber_delta_30} label="訂閱數" collectedDays={trends.readiness.collected_days} /></div><p>{trends.reference.title}</p></article>}
-        {trends.reference && <article className="insight-hero"><span>我的公開黏著度</span><div className="metric-with-delta"><strong>{percent(trends.reference.stickiness)}</strong><DeltaBadge delta={trends.reference.stickiness_delta} label="公開觀看黏著度" collectedDays={trends.readiness.collected_days} /></div><p>不是 Studio 回訪觀眾</p></article>}
+        {trends.reference && <article className="insight-hero"><span>我的公開黏著度</span><div className="metric-with-delta"><strong>{multiple(trends.reference.stickiness)}</strong><DeltaBadge delta={trends.reference.stickiness_delta} label="公開觀看黏著度" collectedDays={trends.readiness.collected_days} /></div><p>不是 Studio 回訪觀眾</p></article>}
       </section>
 
       <section className="panel trend-chart-panel">
@@ -560,14 +580,14 @@ export default function TrendsDashboard() {
 
       <section className="panel fixed-comparison-panel">
         <div className="panel-heading"><div><p className="section-kicker">CHANNEL SCORECARD</p><h2>固定頻道指標比較</h2></div><span>同一批頻道一次比較規模、成長、產量、觀看與直播表現</span></div>
-        <div className="comparison-table-wrap"><table className="comparison-metric-table"><thead><tr><th>頻道</th><th>訂閱</th><th>30日訂閱變化</th><th>30日觀看變化</th><th>近30日內容</th><th>觀看中位數</th><th>公開黏著度</th><th>直播同接中位數</th><th>同接／訂閱</th></tr></thead><tbody>{trends.comparison_channels.map((row) => <tr className={row.is_reference ? "reference" : ""} key={row.channel_id}><td><strong>{row.title}</strong>{row.is_reference && <span>我的基準</span>}</td><td>{compact(row.subscriber_count)}</td><td>{row.subscriber_delta_30.ready ? <><b className={Number(row.subscriber_delta_30.change) > 0 ? "positive" : Number(row.subscriber_delta_30.change) < 0 ? "negative" : ""}>{Number(row.subscriber_delta_30.change) > 0 ? "+" : ""}{compact(row.subscriber_delta_30.change)}</b><small>{percent(row.subscriber_delta_30.percent_change)}</small></> : <small>資料累積中</small>}</td><td>{row.view_delta_30.ready ? <><b className={Number(row.view_delta_30.change) > 0 ? "positive" : Number(row.view_delta_30.change) < 0 ? "negative" : ""}>{Number(row.view_delta_30.change) > 0 ? "+" : ""}{compact(row.view_delta_30.change)}</b><small>{percent(row.view_delta_30.percent_change)}</small></> : <small>資料累積中</small>}</td><td>{exact(row.recent_items, 0)}</td><td>{compact(row.median_views)}</td><td>{percent(row.stickiness)}</td><td>{compact(row.median_peak_concurrent)}</td><td>{percent(row.ccv_rate)}</td></tr>)}</tbody></table></div>
+        <div className="comparison-table-wrap"><table className="comparison-metric-table"><thead><tr><th>頻道</th><th>訂閱</th><th>30日訂閱變化</th><th>30日觀看變化</th><th>近30日內容</th><th>觀看中位數</th><th>公開黏著度</th><th>直播平均／峰值</th><th>直播持續動員</th></tr></thead><tbody>{trends.comparison_channels.map((row) => <tr className={row.is_reference ? "reference" : ""} key={row.channel_id}><td><strong>{row.title}</strong>{row.is_reference && <span>我的基準</span>}</td><td>{compact(row.subscriber_count)}</td><td>{row.subscriber_delta_30.ready ? <><b className={Number(row.subscriber_delta_30.change) > 0 ? "positive" : Number(row.subscriber_delta_30.change) < 0 ? "negative" : ""}>{Number(row.subscriber_delta_30.change) > 0 ? "+" : ""}{compact(row.subscriber_delta_30.change)}</b><small>{percent(row.subscriber_delta_30.percent_change)}</small></> : <small>資料累積中</small>}</td><td>{row.view_delta_30.ready ? <><b className={Number(row.view_delta_30.change) > 0 ? "positive" : Number(row.view_delta_30.change) < 0 ? "negative" : ""}>{Number(row.view_delta_30.change) > 0 ? "+" : ""}{compact(row.view_delta_30.change)}</b><small>{percent(row.view_delta_30.percent_change)}</small></> : <small>資料累積中</small>}</td><td>{exact(row.recent_items, 0)}</td><td>{compact(row.median_views)}</td><td>{multiple(row.stickiness)}</td><td><b>{compact(row.median_average_concurrent)} 平均</b><small>{compact(row.median_peak_concurrent)} 峰值 · {row.concurrency_covered_streams}/{row.concurrency_total_streams} 場完整</small></td><td>{perHundred(row.sustained_ccv_rate)}</td></tr>)}</tbody></table></div>
         {trends.comparison_channels.length < 2 && <p className="panel-footnote">在上方「固定比較線」再加入頻道，就能並排比較這些指標。</p>}
       </section>
 
       <section className="panel ranking-panel">
-        <div className="panel-heading efficiency-heading"><div><p className="section-kicker">MARKET RANKINGS</p><h2>市場排行</h2></div><div className="format-tabs ranking-tabs">{(["subscribers", "median_views", "stickiness", "ccv_rate"] as const).map((key) => <button className={ranking === key ? "active" : ""} type="button" onClick={() => setRanking(key)} key={key}>{key === "subscribers" ? "訂閱數" : key === "median_views" ? "觀看中位數" : key === "stickiness" ? "公開黏著度" : "同接／訂閱"}</button>)}</div></div>
+        <div className="panel-heading efficiency-heading"><div><p className="section-kicker">MARKET RANKINGS</p><h2>市場排行</h2></div><div className="format-tabs ranking-tabs">{(["subscribers", "median_views", "stickiness", "sustained_ccv_rate"] as const).map((key) => <button className={ranking === key ? "active" : ""} type="button" onClick={() => setRanking(key)} key={key}>{key === "subscribers" ? "訂閱數" : key === "median_views" ? "觀看中位數" : key === "stickiness" ? "公開黏著度" : "直播持續動員"}</button>)}</div></div>
         <p className="efficiency-explainer">{rankingExplanation}</p>
-        <div className="ranking-layout"><div className="trend-bars">{rankingRows.slice(0, 15).map((row, index) => { const value = rankingMetric(row); return <div className={`trend-bar-row${row.is_reference ? " reference" : ""}`} key={row.channel_id}><span>{index + 1}</span><div><strong>{row.title}{row.is_reference ? "（我的頻道）" : ""}</strong><small>{compact(row.subscriber_count)} 訂閱 · {row.recent_items} 項內容</small></div><div className="trend-bar-track"><i style={{ width: `${Math.max(2, Math.max(0, Number(value ?? 0)) / maxMetric * 100)}%` }} /></div><b>{metricFormatter(value)}</b><DeltaBadge delta={rankingDelta(row)} label={metricLabel} collectedDays={trends.readiness.collected_days} /></div>; })}</div></div>
+        <div className="ranking-layout"><div className="trend-bars">{rankingRows.slice(0, 15).map((row, index) => { const value = rankingMetric(row); return <div className={`trend-bar-row${row.is_reference ? " reference" : ""}`} key={row.channel_id}><span>{index + 1}</span><div><strong>{row.title}{row.is_reference ? "（我的頻道）" : ""}</strong><small>{compact(row.subscriber_count)} 訂閱 · {ranking === "sustained_ccv_rate" ? `${row.concurrency_covered_streams}/${row.concurrency_total_streams} 場完整取樣` : `${row.recent_items} 項內容`}</small></div><div className="trend-bar-track"><i style={{ width: `${Math.max(2, Math.max(0, Number(value ?? 0)) / maxMetric * 100)}%` }} /></div><b>{metricFormatter(value)}</b><DeltaBadge delta={rankingDelta(row)} label={metricLabel} collectedDays={trends.readiness.collected_days} /></div>; })}</div></div>
       </section>
 
       <section className="insight-two-column trend-secondary-grid">

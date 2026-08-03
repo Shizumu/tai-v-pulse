@@ -127,6 +127,10 @@ test("starter preview is fully removed", async () => {
   assert.match(dashboard, /我的頻道匯入資料保留/);
   assert.match(dashboard, /可修改設定摘要/);
   assert.match(dashboard, /系統資訊（唯讀）/);
+  assert.match(dashboard, /資料更新狀態/);
+  assert.match(dashboard, /30日直播表現/);
+  assert.match(dashboard, /近30日週均/);
+  assert.match(dashboard, /每週 Shorts/);
   assert.match(dashboard, /inline-settings-form/);
   assert.match(dashboard, /取消編輯/);
   assert.doesNotMatch(dashboard, /className="panel settings-panel"/);
@@ -164,6 +168,9 @@ test("starter preview is fully removed", async () => {
   assert.match(insights, /看懂內容環境/);
   assert.match(insights, /先選擇一個基準頻道，觀察訂閱規模相近的頻道在做什麼/);
   assert.match(insights, /趨勢與成長比較會隨資料累積而更可靠/);
+  assert.match(insights, /直播持續動員/);
+  assert.match(insights, /我的內容另外顯示/);
+  assert.match(insights, /完整取樣場次的平均同接／訂閱/);
   assert.match(insights, /尚未累積到.*天前的頻道資料/);
   assert.match(insights, /尚無直播同接樣本/);
   assert.doesNotMatch(insights, /建議至少累積 30 天/);
@@ -184,7 +191,10 @@ test("starter preview is fully removed", async () => {
   assert.match(trends, /event\.key === "Escape"/);
   assert.match(trends, /關閉比較跳卡/);
   assert.match(trends, /trend-filter-stack[^\n]*比較群組[^\n]*graduated-toggle[^\n]*包含已確認畢業頻道/);
-  assert.match(trends, /\["subscribers", "median_views", "stickiness", "ccv_rate"\]/);
+  assert.match(trends, /\["subscribers", "median_views", "stickiness", "sustained_ccv_rate"\]/);
+  assert.match(trends, /直播持續動員/);
+  assert.match(trends, /公開黏著度.*field: "stickiness"/);
+  assert.doesNotMatch(trends, /label: "內容總數"/);
   assert.match(trends, /TOPIC_OPTIONS = \["全部", "遊戲", "雜談", "歌回", "ASMR", "音樂作品", "紀念／重大活動", "其他"\]/);
   assert.match(trends, /video\.content_type\.split\("\+"\)\.some\(\(part\) => part\.trim\(\) === topic\)/);
   assert.match(trends, /visibleTopVideos = trends\?\.rankings\.top_videos\.filter/);

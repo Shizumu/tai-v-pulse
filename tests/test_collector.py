@@ -21,6 +21,7 @@ from collector.server import (
     classify_content_details,
     classify_content_fields,
     classify_content_labels,
+    concurrency_sample_stats,
     evidence_for,
     evidence_for_terms,
     hourly_live_scan_slot,
@@ -73,6 +74,38 @@ class CollectorTests(unittest.TestCase):
                 "concurrentViewers": "88",
             },
         }
+
+    def test_concurrency_sample_stats_requires_sufficient_coverage(self):
+        start = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        complete = [
+            {
+                "captured_at": (start + timedelta(minutes=index)).isoformat(),
+                "concurrent_viewers": 100 + index,
+            }
+            for index in range(90)
+        ]
+        result = concurrency_sample_stats(
+            complete,
+            actual_start=start.isoformat(),
+            actual_end=(start + timedelta(minutes=90)).isoformat(),
+            duration_seconds=5400,
+            poll_seconds=60,
+        )
+        self.assertTrue(result["concurrency_ready"])
+        self.assertEqual(result["concurrency_sample_count"], 90)
+        self.assertEqual(result["concurrency_coverage"], 100)
+        self.assertAlmostEqual(result["average_concurrent"], 144.5)
+        self.assertEqual(result["peak_concurrent"], 189)
+
+        incomplete = concurrency_sample_stats(
+            complete[:19],
+            actual_start=start.isoformat(),
+            actual_end=(start + timedelta(minutes=90)).isoformat(),
+            duration_seconds=5400,
+            poll_seconds=60,
+        )
+        self.assertFalse(incomplete["concurrency_ready"])
+        self.assertIsNone(incomplete["average_concurrent"])
 
     def test_load_env_accepts_bom_spacing_quotes_and_last_value(self):
         key = "TAI_V_PULSE_TEST_ENV_KEY"
@@ -716,6 +749,8 @@ class CollectorTests(unittest.TestCase):
             reopened.database.close()
 
     def test_content_insights_aggregate_same_scale_channels(self):
+        stream_end = datetime.now(UTC).replace(microsecond=0)
+        stream_start = stream_end - timedelta(minutes=90)
         item = {
             "id": "UC-insight",
             "snippet": {"title": "同級測試台V", "description": "台V", "thumbnails": {}},
@@ -729,7 +764,7 @@ class CollectorTests(unittest.TestCase):
                 "channelId": "UC-insight",
                 "title": "深夜助眠 ASMR #睡眠",
                 "description": "安靜陪伴",
-                "publishedAt": utc_now(),
+                "publishedAt": stream_start.isoformat(),
                 "categoryId": "24",
                 "tags": ["ASMR", "睡眠"],
                 "thumbnails": {},
@@ -737,22 +772,44 @@ class CollectorTests(unittest.TestCase):
             "statistics": {"viewCount": "2100", "likeCount": "180", "commentCount": "12"},
             "contentDetails": {"duration": "PT2H"},
             "liveStreamingDetails": {
-                "actualStartTime": utc_now(),
-                "actualEndTime": utc_now(),
+                "actualStartTime": stream_start.isoformat(),
+                "actualEndTime": stream_end.isoformat(),
             },
         }
         with tempfile.TemporaryDirectory() as directory:
             config = SimpleNamespace(
+                api_key="",
                 database_path=Path(directory) / "test.sqlite3",
                 min_subscribers=1000,
                 live_poll_seconds=60,
                 channel_refresh_hours=6,
                 upload_scan_hours=4,
+                edition="public",
                 retention_days=30,
+                creator_retention_days=0,
+                discovery_pages_per_term=1,
+                quota_general_limit=10_000,
+                quota_search_limit=100,
+                quota_safety_percent=10,
             )
             service = TrackerService(config)
             service.database.upsert_channel(item, status="eligible", evidence=("台V", "頻道說明", "台V"))
             service.database.upsert_video(video)
+            own_short = {
+                "id": "video-own-short",
+                "snippet": {
+                    "channelId": "UC-insight",
+                    "title": "我的上船迫遷 Shorts",
+                    "description": "短片",
+                    "publishedAt": stream_end.isoformat(),
+                    "categoryId": "24",
+                    "tags": ["Shorts"],
+                    "thumbnails": {},
+                },
+                "statistics": {"viewCount": "2100", "likeCount": "120", "commentCount": "8"},
+                "contentDetails": {"duration": "PT45S"},
+            }
+            service.database.upsert_video(own_short)
             peer_item = {
                 "id": "UC-peer",
                 "snippet": {"title": "同級夥伴台V", "description": "台V", "thumbnails": {}},
@@ -766,20 +823,38 @@ class CollectorTests(unittest.TestCase):
                     "channelId": "UC-peer",
                     "title": "耳邊陪伴 ASMR",
                     "description": "助眠",
-                    "publishedAt": utc_now(),
+                    "publishedAt": stream_start.isoformat(),
                     "categoryId": "24",
                     "tags": ["ASMR"],
                     "thumbnails": {},
                 },
                 "statistics": {"viewCount": "2500", "likeCount": "210", "commentCount": "15"},
                 "contentDetails": {"duration": "PT90M"},
-                "liveStreamingDetails": {"actualStartTime": utc_now(), "actualEndTime": utc_now()},
+                "liveStreamingDetails": {"actualStartTime": stream_start.isoformat(), "actualEndTime": stream_end.isoformat()},
             }
             service.database.upsert_channel(peer_item, status="eligible", evidence=("台V", "頻道說明", "台V"))
             service.database.upsert_video(peer_video)
-            service.database.execute(
+            peer_short = {
+                "id": "video-peer-short",
+                "snippet": {
+                    "channelId": "UC-peer",
+                    "title": "同級 Shorts",
+                    "description": "短片",
+                    "publishedAt": stream_end.isoformat(),
+                    "categoryId": "24",
+                    "tags": ["Shorts"],
+                    "thumbnails": {},
+                },
+                "statistics": {"viewCount": "2000", "likeCount": "90", "commentCount": "5"},
+                "contentDetails": {"duration": "PT40S"},
+            }
+            service.database.upsert_video(peer_short)
+            service.database.executemany(
                 "INSERT INTO concurrency_samples(video_id,captured_at,concurrent_viewers) VALUES (?,?,?)",
-                ("video-peer-asmr", utc_now(), 333),
+                (
+                    ("video-peer-asmr", (stream_start + timedelta(minutes=index)).isoformat(), 333)
+                    for index in range(90)
+                ),
             )
 
             result = service.insights(
@@ -791,16 +866,22 @@ class CollectorTests(unittest.TestCase):
 
             self.assertEqual(result["overview"]["channels"], 1)
             self.assertEqual(result["overview"]["recent_streams"], 1)
-            self.assertEqual(result["content_breakdown"][0]["content_type"], "ASMR")
+            asmr_breakdown = next(
+                row for row in result["content_breakdown"] if row["content_type"] == "ASMR"
+            )
             self.assertEqual(result["reference"]["title"], "同級測試台V")
             self.assertEqual(result["top_videos"][0]["video_id"], "video-peer-asmr")
             self.assertEqual(result["top_videos_by_format"]["直播"][0]["video_id"], "video-peer-asmr")
+            self.assertEqual(result["top_videos_by_format"]["直播"][0]["average_concurrent"], 333)
+            self.assertEqual(result["reference_top_videos_by_format"]["Shorts"]["video_id"], "video-own-short")
+            self.assertEqual(result["reference_top_videos_by_format"]["Shorts"]["peer_rank"], 1)
+            self.assertEqual(result["reference_top_videos_by_format"]["Shorts"]["comparison_count"], 2)
             self.assertEqual(
-                result["content_breakdown"][0]["representative_videos"][0]["channel_id"],
+                asmr_breakdown["representative_videos"][0]["channel_id"],
                 "UC-peer",
             )
             self.assertEqual(result["content_landscapes"]["主要內容"]["items"], 1)
-            self.assertEqual(result["content_landscapes"]["Shorts"]["items"], 0)
+            self.assertEqual(result["content_landscapes"]["Shorts"]["items"], 1)
             self.assertEqual(result["schedule_summary"]["channel_count"], 1)
             self.assertEqual(result["schedule_summary"]["stream_count"], 1)
             self.assertIn("開台最集中", result["schedule_summary"]["conclusion"])
@@ -812,9 +893,14 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(schedule_cell["streams"][0]["channel_title"], "同級夥伴台V")
             self.assertEqual(
                 result["classification_guide"]["representative_ranking"],
-                "代表內容依觀看／訂閱比由高至低排序，每個頻道最多一項；直播同接只作為卡片補充指標。",
+                "一般影片與 Shorts 依觀看／訂閱比排序；直播依完整取樣的平均同接／訂閱比排序，每個頻道最多一項。",
             )
-            self.assertEqual(service.database.scalar("SELECT COUNT(*) FROM video_snapshots"), 2)
+            summary_channel = next(row for row in service.summary()["channels"] if row["channel_id"] == "UC-peer")
+            self.assertEqual(summary_channel["median_average_concurrent"], 333)
+            self.assertEqual(summary_channel["concurrency_covered_streams"], 1)
+            self.assertGreater(summary_channel["weekly_streams"], 0)
+            self.assertGreater(summary_channel["weekly_shorts"], 0)
+            self.assertEqual(service.database.scalar("SELECT COUNT(*) FROM video_snapshots"), 4)
             service.database.close()
 
     def test_manual_content_classification_persists_and_teaches_game_name(self):
