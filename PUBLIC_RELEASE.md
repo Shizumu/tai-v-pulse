@@ -1,6 +1,6 @@
-# 台V Pulse 0.11.0 Windows 對外測試版
+# 台V Pulse 0.12.0 Windows 對外測試版
 
-本版提供單檔 Windows 安裝程式 `tai-v-pulse-0.11.0-setup.exe`。程式仍只在使用者自己的電腦執行；YouTube API Key、OAuth 設定／token、本機 SQLite 資料庫及私人 Analytics 不會傳給專案作者。
+本版提供單檔 Windows 安裝程式 `tai-v-pulse-0.12.0-setup.exe`。程式仍只在使用者自己的電腦執行；YouTube API Key、OAuth 設定／token、本機 SQLite 資料庫及私人 Analytics 不會傳給專案作者。
 
 ## 使用前準備
 
@@ -13,7 +13,7 @@
 
 ## 安裝與啟動
 
-1. 核對安裝程式旁 `.sha256` 檔中的 SHA-256，再雙擊 `tai-v-pulse-0.11.0-setup.exe`。已安裝 0.10.0 以上的電腦也可由啟動器按「檢查更新」；0.9.0 與更早版本沒有內建更新器，必須手動完成一次覆蓋安裝。
+1. 核對安裝程式旁 `.sha256` 檔中的 SHA-256，再雙擊 `tai-v-pulse-0.12.0-setup.exe`。已安裝 0.10.0 以上的電腦也可由啟動器按「檢查更新」；0.9.0 與更早版本沒有內建更新器，必須手動完成一次覆蓋安裝。
 2. 閱讀並勾選非商用授權及本機資料說明，按「安裝並啟動」。程式會安裝到目前使用者的 `%LOCALAPPDATA%\Programs\TaiVPulse`，不要求管理員權限。
 3. 啟動器會檢查 Node.js、Python、Python 時區資料、npm 前端套件、資料服務與網頁服務。若缺少 Node.js 或 Python，會提供 WinGet 自動安裝、開啟官方下載頁或取消三種選項；若 Windows 缺少 IANA 時區資料，會把固定版本的 `tzdata` 安裝到台V Pulse 自己的 `work/python-packages`。
 4. 第一次缺少 API Key 時會建立並開啟 `.env`；將自己的 Key 填入 `YOUTUBE_API_KEY=`，儲存後回到啟動器再按一次「啟動」。
@@ -37,6 +37,15 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 這只影響目前 PowerShell 視窗。
+
+## 0.12.0 重點
+
+- 監測首頁可同步 Taiwan VTuber Data 公開名錄中的活動中台灣個人 VTuber；系統只使用 Channel ID，所有頻道與統計數值仍以使用者自己的 YouTube Data API Key 核對，不匯入外站統計。
+- 首次使用新增六段導覽，說明頻道工作區、監測首頁、內容環境、趨勢圖表與常用指標；可略過並隨時從頁首重新開啟。
+- 選定自己的頻道後，工作區會依最近 90 日公開內容形式、主題與訂閱規模建立較小、同級及成長參考三組頻道，每組最多兩個，可替換並帶入內容環境或趨勢圖表。
+- 已收錄頻道列表支援完整資料集的搜尋與篩選，並以每次 200 個漸進顯示；內容環境和趨勢圖表最多可指定 6 個比較頻道。
+- 推薦只代表公開內容定位與規模，不代表跨頻道觀眾重疊或流量因果；資料不足時會明確標示只依規模推薦。
+- 0.10.0 以上可透過內建更新器遠端覆蓋升級；更新仍會保留 `.env`、`work/`、SQLite、OAuth、Studio、個人設定與既有 `node_modules`。
 
 ## 0.11.0 重點
 
