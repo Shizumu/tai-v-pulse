@@ -290,12 +290,25 @@ export default function InsightsDashboard() {
   }, [landscapeFormat]);
 
   useEffect(() => {
-    if (!ownedDefaultApplied.current && summary?.owned_channel_id) {
-      ownedDefaultApplied.current = true;
-      setReferenceId(summary.owned_channel_id);
+    if (ownedDefaultApplied.current || !summary) return;
+    const parameters = new URLSearchParams(window.location.search);
+    const requestedReference = parameters.get("reference")?.trim() ?? "";
+    const allChannels = [...summary.channels, ...(summary.owned_channel ? [summary.owned_channel] : [])];
+    const validIds = new Set(allChannels.map((channel) => channel.channel_id));
+    const nextReference = validIds.has(requestedReference) ? requestedReference : summary.owned_channel_id ?? "";
+    const requestedChannels = (parameters.get("channels") ?? "").split(",")
+      .map((channelId) => channelId.trim())
+      .filter((channelId, index, values) => channelId && channelId !== nextReference && validIds.has(channelId) && values.indexOf(channelId) === index)
+      .slice(0, 6);
+    ownedDefaultApplied.current = true;
+    if (nextReference) setReferenceId(nextReference);
+    if (requestedChannels.length > 0) {
+      setSelectedChannelIds(requestedChannels);
+      setMode("channels");
+    } else if (nextReference) {
       setMode("relative");
     }
-  }, [summary?.owned_channel_id]);
+  }, [summary]);
 
   const reference = summary?.channels.find((channel) => channel.channel_id === referenceId)
     ?? (summary?.owned_channel?.channel_id === referenceId ? summary.owned_channel : null);
@@ -317,7 +330,7 @@ export default function InsightsDashboard() {
 
   function addSelectedChannel(channelId: string) {
     if (!channelId || channelId === referenceId) return;
-    setSelectedChannelIds((current) => [...new Set([...current, channelId])].slice(0, 5));
+    setSelectedChannelIds((current) => [...new Set([...current, channelId])].slice(0, 6));
   }
 
   function saveComparisonGroup() {
@@ -526,7 +539,7 @@ export default function InsightsDashboard() {
           <label><span>比較群組</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">全體已收錄頻道</option><option value="relative">參考頻道的 0.5～2 倍</option><option value="tier">固定訂閱級距</option><option value="range">自訂訂閱範圍</option><option value="channels">指定頻道</option></select></label>
           {mode === "tier" && <label><span>訂閱級距</span><select value={tier} onChange={(event) => setTier(event.target.value)}>{Object.entries(TIERS).map(([value, item]) => <option value={value} key={value}>{item[2]}</option>)}</select></label>}
           {mode === "range" && <div className="range-controls"><label><span>最低訂閱</span><input type="number" min={0} value={customMin} onChange={(event) => setCustomMin(Number(event.target.value))} /></label><label><span>最高訂閱</span><input type="number" min={customMin} value={customMax} onChange={(event) => setCustomMax(Number(event.target.value))} /></label></div>}
-          {mode === "channels" && <div className="channel-group-builder"><label><span>加入比較頻道（最多 5 個）</span><select value="" onChange={(event) => addSelectedChannel(event.target.value)}><option value="">選擇頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !selectedChannelIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)}</option>)}</select></label><div className="selected-channel-chips">{selectedChannels.map((channel) => <button type="button" onClick={() => setSelectedChannelIds((current) => current.filter((id) => id !== channel.channel_id))} key={channel.channel_id}>{channel.title}<span>×</span></button>)}</div><div className="save-group-row"><input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="比較組合名稱" /><button type="button" onClick={saveComparisonGroup} disabled={!groupName.trim() || selectedChannelIds.length === 0}>儲存</button>{savedGroups.length > 0 && <select value="" onChange={(event) => { const group = savedGroups.find((item) => item.name === event.target.value); if (group) setSelectedChannelIds(group.ids.slice(0, 5)); }}><option value="">載入已存組合…</option>{savedGroups.map((group) => <option value={group.name} key={group.name}>{group.name}</option>)}</select>}</div></div>}
+          {mode === "channels" && <div className="channel-group-builder"><label><span>加入比較頻道（最多 6 個）</span><select value="" onChange={(event) => addSelectedChannel(event.target.value)}><option value="">選擇頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !selectedChannelIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)}</option>)}</select></label><div className="selected-channel-chips">{selectedChannels.map((channel) => <button type="button" onClick={() => setSelectedChannelIds((current) => current.filter((id) => id !== channel.channel_id))} key={channel.channel_id}>{channel.title}<span>×</span></button>)}</div><div className="save-group-row"><input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="比較組合名稱" /><button type="button" onClick={saveComparisonGroup} disabled={!groupName.trim() || selectedChannelIds.length === 0}>儲存</button>{savedGroups.length > 0 && <select value="" onChange={(event) => { const group = savedGroups.find((item) => item.name === event.target.value); if (group) setSelectedChannelIds(group.ids.slice(0, 6)); }}><option value="">載入已存組合…</option>{savedGroups.map((group) => <option value={group.name} key={group.name}>{group.name}</option>)}</select>}</div></div>}
           <label><span>頻道分類</span><select value={category} onChange={(event) => setCategory(event.target.value)}><option>全部</option>{summary?.categories.map((item) => <option value={item.category} key={item.category}>{item.category}（{item.channel_count}）</option>)}</select></label>
           <label className="reference-control"><span>參考頻道（用於個別比較）</span><select value={referenceId} onChange={(event) => setReferenceId(event.target.value)}><option value="">不比較單一頻道</option>{summary?.owned_channel && !summary.channels.some((channel) => channel.channel_id === summary.owned_channel?.channel_id) && <option value={summary.owned_channel.channel_id}>我的頻道：{summary.owned_channel.title}｜{compact(summary.owned_channel.subscriber_count)} 訂閱</option>}{summary?.channels.map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)} 訂閱</option>)}</select></label>
           <label className="graduated-toggle"><input type="checkbox" checked={includeGraduated} onChange={(event) => setIncludeGraduated(event.target.checked)} /><span>包含已確認畢業頻道</span></label>

@@ -127,7 +127,7 @@ const TIERS: Record<string, [number, number, string]> = {
   "100k+": [100000, 100000000, "10 萬以上"],
 };
 
-const COLORS = ["#2ca981", "#ce6f93", "#4c8ecb", "#8b72ca", "#c18a2d"];
+const COLORS = ["#2ca981", "#ce6f93", "#4c8ecb", "#8b72ca", "#c18a2d", "#28747c", "#b44c3d"];
 const PERIOD_OPTIONS = [7, 14, 30, 90, 365] as const;
 const TOPIC_OPTIONS = ["全部", "遊戲", "雜談", "歌回", "ASMR", "音樂作品", "紀念／重大活動", "其他"] as const;
 
@@ -452,12 +452,26 @@ export default function TrendsDashboard() {
   }, [trends]);
 
   useEffect(() => {
-    if (!ownedDefaultApplied.current && summary?.owned_channel_id) {
-      ownedDefaultApplied.current = true;
-      setReferenceId(summary.owned_channel_id);
+    if (ownedDefaultApplied.current || !summary) return;
+    const parameters = new URLSearchParams(window.location.search);
+    const requestedReference = parameters.get("reference")?.trim() ?? "";
+    const allChannels = [...summary.channels, ...(summary.owned_channel ? [summary.owned_channel] : [])];
+    const validIds = new Set(allChannels.map((channel) => channel.channel_id));
+    const nextReference = validIds.has(requestedReference) ? requestedReference : summary.owned_channel_id ?? "";
+    const requestedChannels = (parameters.get("channels") ?? "").split(",")
+      .map((channelId) => channelId.trim())
+      .filter((channelId, index, values) => channelId && channelId !== nextReference && validIds.has(channelId) && values.indexOf(channelId) === index)
+      .slice(0, 6);
+    ownedDefaultApplied.current = true;
+    if (nextReference) setReferenceId(nextReference);
+    if (requestedChannels.length > 0) {
+      setCohortIds(requestedChannels);
+      setComparisonIds(requestedChannels);
+      setMode("channels");
+    } else if (nextReference) {
       setMode("relative");
     }
-  }, [summary?.owned_channel_id]);
+  }, [summary]);
 
   const reference = summary?.channels.find((channel) => channel.channel_id === referenceId)
     ?? (summary?.owned_channel?.channel_id === referenceId ? summary.owned_channel : null);
@@ -507,7 +521,7 @@ export default function TrendsDashboard() {
 
   function addId(setter: (value: string[] | ((current: string[]) => string[])) => void, id: string) {
     if (!id || id === referenceId) return;
-    setter((current: string[]) => [...new Set([...current, id])].slice(0, 5));
+    setter((current: string[]) => [...new Set([...current, id])].slice(0, 6));
   }
 
   function saveGroup() {
@@ -550,16 +564,16 @@ export default function TrendsDashboard() {
         <label><span>頻道分類</span><select value={category} onChange={(event) => setCategory(event.target.value)}><option>全部</option>{summary?.categories.map((item) => <option value={item.category} key={item.category}>{item.category}</option>)}</select></label>
         <label><span>內容形式</span><select value={formatType} onChange={(event) => setFormatType(event.target.value)}><option>主要內容</option><option>直播</option><option value="影片">一般影片</option><option>Shorts</option><option>全部</option></select></label>
         <label className="reference-control"><span>基準頻道</span><select value={referenceId} onChange={(event) => setReferenceId(event.target.value)}><option value="">不設定基準</option>{summary?.owned_channel && !summary.channels.some((channel) => channel.channel_id === summary.owned_channel?.channel_id) && <option value={summary.owned_channel.channel_id}>我的頻道：{summary.owned_channel.title}</option>}{summary?.channels.map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}｜{compact(channel.subscriber_count)}</option>)}</select></label>
-        <label className="comparison-control"><span>加入固定比較頻道（最多 5 個）</span><select value="" onChange={(event) => addId(setComparisonIds, event.target.value)}><option value="">加入頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !comparisonIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}</option>)}</select></label>
+        <label className="comparison-control"><span>加入固定比較頻道（最多 6 個）</span><select value="" onChange={(event) => addId(setComparisonIds, event.target.value)}><option value="">加入頻道…</option>{summary?.channels.filter((channel) => channel.channel_id !== referenceId && !comparisonIds.includes(channel.channel_id)).map((channel) => <option value={channel.channel_id} key={channel.channel_id}>{channel.title}</option>)}</select></label>
       </div>
       <div className="cohort-summary"><span>{referenceId === summary?.owned_channel_id ? "以我的頻道為基準" : "目前比較"}</span><strong>{mode === "relative" && reference ? `${reference.title} 的 0.5～2 倍` : mode === "tier" ? TIERS[tier][2] : mode === "range" ? `${exact(range[0])}～${exact(range[1])}` : mode === "channels" ? `${cohortIds.length} 個指定頻道` : "全部已收錄頻道"}</strong><small>{mode === "channels" ? "指定群組" : `${exact(range[0])}～${range[1] >= 100000000 ? "不限上限" : exact(range[1])} 訂閱`}</small></div>
       {mode === "channels" && <div className="cohort-channel-chips"><span>指定群組</span><div className="selected-channel-chips">{cohortIds.map((id) => <button type="button" onClick={() => setCohortIds((current) => current.filter((value) => value !== id))} key={id}>{summary?.channels.find((channel) => channel.channel_id === id)?.title ?? id}<span>×</span></button>)}</div></div>}
       <div className="comparison-selection-strip"><span>圖表固定比較線</span><div className="selected-channel-chips">{comparisonIds.length === 0 ? <small>尚未加入額外頻道</small> : comparisonIds.map((id) => <button type="button" onClick={() => setComparisonIds((current) => current.filter((value) => value !== id))} key={id}>{summary?.channels.find((channel) => channel.channel_id === id)?.title ?? id}<span>×</span></button>)}</div></div>
-      <div className="saved-comparison-toolbar"><span>儲存固定比較組合</span><div className="save-group-row"><input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="組合名稱" aria-label="固定比較組合名稱" /><button type="button" onClick={saveGroup} disabled={!groupName.trim() || comparisonIds.length === 0}>儲存</button>{savedGroups.length > 0 && <select value="" aria-label="載入固定比較組合" onChange={(event) => { const group = savedGroups.find((item) => item.name === event.target.value); if (group) setComparisonIds(group.ids.slice(0, 5)); }}><option value="">載入組合…</option>{savedGroups.map((group) => <option value={group.name} key={group.name}>{group.name}</option>)}</select>}</div></div>
+      <div className="saved-comparison-toolbar"><span>儲存固定比較組合</span><div className="save-group-row"><input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="組合名稱" aria-label="固定比較組合名稱" /><button type="button" onClick={saveGroup} disabled={!groupName.trim() || comparisonIds.length === 0}>儲存</button>{savedGroups.length > 0 && <select value="" aria-label="載入固定比較組合" onChange={(event) => { const group = savedGroups.find((item) => item.name === event.target.value); if (group) setComparisonIds(group.ids.slice(0, 6)); }}><option value="">載入組合…</option>{savedGroups.map((group) => <option value={group.name} key={group.name}>{group.name}</option>)}</select>}</div></div>
     </section>
 
     {loading && !trends && <section className="panel insight-placeholder">正在整理趨勢資料…</section>}
-    {!loading && mode === "channels" && cohortIds.length === 0 && <section className="panel insight-placeholder"><div><strong>先加入要比較的頻道</strong><p>可指定最多 5 個頻道形成自訂比較群組。</p></div></section>}
+    {!loading && mode === "channels" && cohortIds.length === 0 && <section className="panel insight-placeholder"><div><strong>先加入要比較的頻道</strong><p>可指定最多 6 個頻道形成自訂比較群組。</p></div></section>}
     {trends && <>
       {!trends.readiness.month_ready && <section className="notice trend-readiness"><span className="notice-icon">◷</span><div><strong>30 天摘要與變化正在累積</strong><p>目前已累積 {trends.readiness.collected_days.toFixed(1)} 天；圖表仍依上方 {days} 天期間顯示已有快照，固定 30 天的觀看摘要與月變化會在資料成熟後解鎖。</p></div></section>}
       <section className="trend-overview-grid">

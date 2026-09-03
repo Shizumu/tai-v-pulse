@@ -173,6 +173,34 @@ type Summary = {
     message: string | null;
     error: string | null;
   };
+  external_directory: {
+    id: number | null;
+    status: "idle" | "running" | "completed" | "error";
+    source_name: string;
+    source_site_url: string;
+    source_url: string;
+    source_commit: string | null;
+    source_sha256: string | null;
+    source_license: string;
+    started_at: string | null;
+    completed_at: string | null;
+    row_count: number;
+    individual_tw_count: number;
+    selected_count: number;
+    examined_count: number;
+    eligible_count: number;
+    new_count: number;
+    refreshed_count: number;
+    below_threshold_count: number;
+    hidden_subscriber_count: number;
+    excluded_count: number;
+    unavailable_count: number;
+    inactive_count: number;
+    missing_youtube_count: number;
+    invalid_youtube_count: number;
+    duplicate_count: number;
+    error: string | null;
+  };
   retention_days: number;
   settings: CollectionSettings;
   categories: { category: string; channel_count: number }[];
@@ -279,6 +307,34 @@ const EMPTY_SUMMARY: Summary = {
     below_threshold_count: 0, review_count: 0, excluded_count: 0,
     rejected_count: 0, message: null, error: null,
   },
+  external_directory: {
+    id: null,
+    status: "idle",
+    source_name: "Taiwan VTuber Data",
+    source_site_url: "https://taiwanvtuberdata.github.io/",
+    source_url: "https://raw.githubusercontent.com/TaiwanVtuberData/TaiwanVtuberTrackingData/master/DATA/TW_VTUBER_TRACK_LIST.csv",
+    source_commit: null,
+    source_sha256: null,
+    source_license: "Unlicense",
+    started_at: null,
+    completed_at: null,
+    row_count: 0,
+    individual_tw_count: 0,
+    selected_count: 0,
+    examined_count: 0,
+    eligible_count: 0,
+    new_count: 0,
+    refreshed_count: 0,
+    below_threshold_count: 0,
+    hidden_subscriber_count: 0,
+    excluded_count: 0,
+    unavailable_count: 0,
+    inactive_count: 0,
+    missing_youtube_count: 0,
+    invalid_youtube_count: 0,
+    duplicate_count: 0,
+    error: null,
+  },
   retention_days: 30,
   settings: DEFAULT_SETTINGS,
   categories: [],
@@ -359,6 +415,7 @@ export default function Dashboard() {
   const [organizationFilter, setOrganizationFilter] = useState("全部");
   const [activityFilter, setActivityFilter] = useState("全部");
   const [sortBy, setSortBy] = useState("subscribers");
+  const [channelDisplayLimit, setChannelDisplayLimit] = useState(200);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<CollectionSettings>(DEFAULT_SETTINGS);
   const [termsDraft, setTermsDraft] = useState(DEFAULT_SETTINGS.discovery_terms.join("\n"));
@@ -427,6 +484,19 @@ export default function Dashboard() {
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "操作失敗");
+    }
+  };
+
+  const importExternalDirectory = async () => {
+    setMessage(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/external-directory/import`, { method: "POST" });
+      const payload = (await response.json()) as { message?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "無法開始同步外部名錄");
+      setMessage(payload.message ?? "已開始同步 Taiwan VTuber Data 名錄");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "無法同步外部名錄");
     }
   };
 
@@ -755,7 +825,7 @@ export default function Dashboard() {
     return Array.from(values);
   }, [data.categories]);
 
-  const visibleChannels = useMemo(() => {
+  const filteredChannels = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-TW");
     const channels = data.channels.filter((channel) => {
       if (categoryFilter !== "全部" && channel.category !== categoryFilter) return false;
@@ -781,6 +851,7 @@ export default function Dashboard() {
       return (b.subscriber_count ?? -1) - (a.subscriber_count ?? -1);
     });
   }, [activityFilter, categoryFilter, data.channels, organizationFilter, query, sortBy]);
+  const visibleChannels = filteredChannels.slice(0, channelDisplayLimit);
 
   const quotaPercent = Math.min(100, Math.round((data.quota_general / Math.max(1, data.quota_general_safe_limit)) * 100));
   const searchQuotaPercent = Math.min(100, Math.round((data.quota_search / Math.max(1, data.quota_search_safe_limit)) * 100));
@@ -940,6 +1011,45 @@ export default function Dashboard() {
         })}</div>}
       </section>
 
+      <section className="panel external-directory-panel" aria-labelledby="external-directory-title">
+        <div className="panel-heading external-directory-heading">
+          <div>
+            <p className="section-kicker">EXTERNAL DIRECTORY</p>
+            <h2 id="external-directory-title">同步 Taiwan VTuber Data 名錄</h2>
+          </div>
+          <a className="text-link" href={data.external_directory.source_site_url} target="_blank" rel="noreferrer">查看名錄來源 ↗</a>
+        </div>
+        <p>只讀取名錄中的活動中台灣個人 VTuber 與 YouTube Channel ID；訂閱、觀看、影片及直播數據仍由這台電腦使用 YouTube Data API 取得。</p>
+        <div className="directory-rules">
+          <span>保留最低 {fullNumber(data.settings.min_subscribers)} 訂閱門檻</span>
+          <span>遵守本機黑名單</span>
+          <span>不自動刪除既有頻道</span>
+          <span>名錄授權：{data.external_directory.source_license}</span>
+        </div>
+        {data.external_directory.status !== "idle" && <div className={`directory-result ${data.external_directory.status}`}>
+          <div>
+            <strong>{data.external_directory.status === "running" ? "名錄同步中" : data.external_directory.status === "completed" ? "上次名錄同步完成" : "上次名錄同步需要處理"}</strong>
+            <small>{data.external_directory.status === "running" ? `${fullNumber(data.external_directory.examined_count)}／${fullNumber(data.external_directory.selected_count)} 個頻道已核對` : time(data.external_directory.completed_at)}</small>
+          </div>
+          <dl>
+            <div><dt>名錄可驗證</dt><dd>{fullNumber(data.external_directory.selected_count)}</dd></div>
+            <div><dt>符合門檻</dt><dd>{fullNumber(data.external_directory.eligible_count)}</dd></div>
+            <div><dt>本次新增</dt><dd>{fullNumber(data.external_directory.new_count)}</dd></div>
+            <div><dt>既有更新</dt><dd>{fullNumber(data.external_directory.refreshed_count)}</dd></div>
+            <div><dt>未達門檻</dt><dd>{fullNumber(data.external_directory.below_threshold_count)}</dd></div>
+            <div><dt>黑名單</dt><dd>{fullNumber(data.external_directory.excluded_count)}</dd></div>
+          </dl>
+          {data.external_directory.error && <p className="directory-error">{data.external_directory.error}</p>}
+          {data.external_directory.source_sha256 && <small className="directory-source-proof">來源內容 SHA-256：{data.external_directory.source_sha256}{data.external_directory.source_commit ? ` · commit ${data.external_directory.source_commit}` : ""}</small>}
+        </div>}
+        <div className="directory-actions">
+          <p>團體官方頻道、非台灣項目、已畢業／停止活動、沒有有效 YouTube Channel ID 的列會略過；名錄內容不會覆蓋人工活動狀態或組織資料。</p>
+          <button className="button primary" type="button" onClick={() => void importExternalDirectory()} disabled={!connected || !data.api_key_configured || Boolean(data.current_job)}>
+            {data.current_job === "external-directory-import" ? "同步中…" : data.external_directory.status === "completed" ? "重新同步名錄" : "同步並直接收錄"}
+          </button>
+        </div>
+      </section>
+
       <section className="content-grid">
         <article className="panel live-panel">
           <div className="panel-heading"><div><p className="section-kicker">LIVE RADAR</p><h2>直播雷達</h2></div><span>{data.live_videos.length} 個項目</span></div>
@@ -1008,13 +1118,17 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="table-wrap"><table className="channel-performance-table"><thead><tr><th>頻道</th><th>分類</th><th>所屬／標籤</th><th>訂閱</th><th>總觀看</th><th>影片</th><th>30日直播表現</th><th>近30日週均</th><th>更新</th><th>操作</th></tr></thead><tbody>
-          {visibleChannels.length === 0 ? <tr><td colSpan={10} className="table-empty">沒有符合目前篩選的頻道。</td></tr> : visibleChannels.map((channel) => <tr key={channel.channel_id}>
+          {filteredChannels.length === 0 ? <tr><td colSpan={10} className="table-empty">沒有符合目前篩選的頻道。</td></tr> : visibleChannels.map((channel) => <tr key={channel.channel_id}>
             <td><button className="channel-link" type="button" onClick={() => void openChannel(channel.channel_id)}><span className="channel-name">{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span className="avatar-fallback">V</span>}<span><strong>{channel.title}</strong><small>{channel.handle ?? channel.channel_id}</small></span></span><span className="open-detail">查看詳細資料 →</span></button></td>
             <td><div className="category-status-cell"><select className="category-select" value={channel.category} onChange={(event) => void updateChannelMetadata(channel.channel_id, { category: event.target.value, organization_name: channel.organization_name, manual_tags: channel.manual_tags })} disabled={actingChannelId === channel.channel_id}>{categoryOptions.map((category) => <option value={category} key={category}>{category}</option>)}</select><i className={`activity-badge ${channel.activity_status_source}`}>{channel.activity_status_source === "automatic" && ["休止中", "疑似已畢業"].includes(channel.activity_status) ? `系統初判：${channel.activity_status}` : channel.activity_status}</i></div></td>
             <td><div className="affiliation-cell"><strong>{channel.organization_name || "—"}</strong>{channel.manual_tags.length > 0 && <span>{channel.manual_tags.slice(0, 3).map((tag) => `#${tag}`).join(" ")}</span>}</div></td>
             <td>{number(channel.subscriber_count)}</td><td>{number(channel.view_count)}</td><td>{number(channel.video_count)}</td><td><div className="channel-live-performance"><strong>{number(channel.median_average_concurrent)}</strong><span>平均同接</span><small>{channel.concurrency_covered_streams ?? 0}/{channel.concurrency_total_streams ?? 0} 場完整取樣</small></div></td><td><div className="channel-cadence"><span>直播 {channel.weekly_streams === undefined ? "—" : channel.weekly_streams.toFixed(1)}</span><span>影片 {channel.weekly_videos === undefined ? "—" : channel.weekly_videos.toFixed(1)}</span><span>Shorts {channel.weekly_shorts === undefined ? "—" : channel.weekly_shorts.toFixed(1)}</span></div></td><td>{ago(channel.updated_at)}</td><td><button className="danger-button" type="button" onClick={() => void excludeChannel(channel)} disabled={actingChannelId === channel.channel_id}>{actingChannelId === channel.channel_id ? "處理中" : "排除"}</button></td>
           </tr>)}
         </tbody></table></div>
+        <div className="channel-list-footer" aria-live="polite">
+          <span>符合條件 {fullNumber(filteredChannels.length)} 個，目前顯示 {fullNumber(visibleChannels.length)} 個</span>
+          {visibleChannels.length < filteredChannels.length && <button className="button ghost channel-load-more" type="button" onClick={() => setChannelDisplayLimit((current) => Math.min(current + 200, filteredChannels.length))}>再顯示最多 200 個</button>}
+        </div>
       </section>
 
       <section className={`panel public-transfer-panel${publicTransferExpanded ? " expanded" : ""}`} aria-labelledby="public-transfer-title">
@@ -1058,7 +1172,7 @@ export default function Dashboard() {
         </div>}
       </section>
 
-      <LegalFooter context="僅在你的電腦運作" note="資料來源：YouTube Data API" />
+      <LegalFooter context="僅在你的電腦運作" note="頻道名錄來源：Taiwan VTuber Data；公開數據來源：YouTube Data API" />
     </main>
   );
 }

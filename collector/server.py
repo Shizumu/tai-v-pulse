@@ -7,6 +7,7 @@ import html
 import io
 import json
 import locale
+import math
 import os
 import re
 import sqlite3
@@ -26,6 +27,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
+from collector.external_directory import (
+    DIRECTORY_CSV_URL,
+    DIRECTORY_LICENSE,
+    DIRECTORY_NAME,
+    DIRECTORY_SITE_URL,
+    fetch_directory,
+    parse_directory_csv,
+)
 from collector.oauth import GoogleOAuth, OAuthError, REQUIRED_SCOPES, oauth_error_guidance
 from collector.public_transfer import (
     MAX_PACKAGE_BYTES,
@@ -961,6 +970,51 @@ class Database:
                 CREATE INDEX IF NOT EXISTS discovery_candidates_status_idx
                   ON discovery_candidates(validation_status, handling_status);
 
+                CREATE TABLE IF NOT EXISTS external_directory_imports (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  source_name TEXT NOT NULL,
+                  source_site_url TEXT NOT NULL,
+                  source_url TEXT NOT NULL,
+                  source_commit TEXT,
+                  source_sha256 TEXT,
+                  source_license TEXT NOT NULL,
+                  started_at TEXT NOT NULL,
+                  completed_at TEXT,
+                  status TEXT NOT NULL DEFAULT 'running',
+                  row_count INTEGER NOT NULL DEFAULT 0,
+                  individual_tw_count INTEGER NOT NULL DEFAULT 0,
+                  selected_count INTEGER NOT NULL DEFAULT 0,
+                  examined_count INTEGER NOT NULL DEFAULT 0,
+                  eligible_count INTEGER NOT NULL DEFAULT 0,
+                  new_count INTEGER NOT NULL DEFAULT 0,
+                  refreshed_count INTEGER NOT NULL DEFAULT 0,
+                  below_threshold_count INTEGER NOT NULL DEFAULT 0,
+                  hidden_subscriber_count INTEGER NOT NULL DEFAULT 0,
+                  excluded_count INTEGER NOT NULL DEFAULT 0,
+                  unavailable_count INTEGER NOT NULL DEFAULT 0,
+                  inactive_count INTEGER NOT NULL DEFAULT 0,
+                  missing_youtube_count INTEGER NOT NULL DEFAULT 0,
+                  invalid_youtube_count INTEGER NOT NULL DEFAULT 0,
+                  duplicate_count INTEGER NOT NULL DEFAULT 0,
+                  error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS external_directory_imports_started_idx
+                  ON external_directory_imports(started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS external_directory_entries (
+                  import_id INTEGER NOT NULL REFERENCES external_directory_imports(id) ON DELETE CASCADE,
+                  channel_id TEXT NOT NULL,
+                  directory_name TEXT NOT NULL,
+                  directory_activity TEXT NOT NULL,
+                  directory_group_name TEXT NOT NULL DEFAULT '',
+                  nationality TEXT NOT NULL,
+                  result_status TEXT NOT NULL DEFAULT 'pending',
+                  result_reason TEXT NOT NULL DEFAULT '',
+                  PRIMARY KEY(import_id, channel_id)
+                );
+                CREATE INDEX IF NOT EXISTS external_directory_entries_channel_idx
+                  ON external_directory_entries(channel_id, import_id DESC);
+
                 CREATE TABLE IF NOT EXISTS channel_snapshots (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
@@ -1488,6 +1542,103 @@ class Database:
                WHERE id=?""",
             (status, note[:500], utc_now(), candidate_id),
         )
+
+    def create_external_directory_import(self) -> int:
+        cursor = self.execute(
+            """INSERT INTO external_directory_imports (
+                 source_name,source_site_url,source_url,source_license,started_at,status
+               ) VALUES (?,?,?,?,?,'running')""",
+            (
+                DIRECTORY_NAME,
+                DIRECTORY_SITE_URL,
+                DIRECTORY_CSV_URL,
+                DIRECTORY_LICENSE,
+                utc_now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def update_external_directory_import(self, import_id: int, values: dict[str, Any]) -> None:
+        allowed = {
+            "source_commit", "source_sha256", "completed_at", "status", "row_count",
+            "individual_tw_count", "selected_count", "examined_count", "eligible_count",
+            "new_count", "refreshed_count", "below_threshold_count",
+            "hidden_subscriber_count", "excluded_count", "unavailable_count",
+            "inactive_count", "missing_youtube_count", "invalid_youtube_count",
+            "duplicate_count", "error",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ",".join(f"{key}=?" for key in updates)
+        self.execute(
+            f"UPDATE external_directory_imports SET {assignments} WHERE id=?",
+            (*updates.values(), import_id),
+        )
+
+    def add_external_directory_entries(
+        self,
+        import_id: int,
+        entries: Iterable[dict[str, str]],
+    ) -> None:
+        self.executemany(
+            """INSERT INTO external_directory_entries (
+                 import_id,channel_id,directory_name,directory_activity,
+                 directory_group_name,nationality,result_status,result_reason
+               ) VALUES (?,?,?,?,?,?,'pending','')
+               ON CONFLICT(import_id,channel_id) DO UPDATE SET
+                 directory_name=excluded.directory_name,
+                 directory_activity=excluded.directory_activity,
+                 directory_group_name=excluded.directory_group_name,
+                 nationality=excluded.nationality""",
+            [
+                (
+                    import_id,
+                    entry["channel_id"],
+                    entry["display_name"],
+                    entry["activity"],
+                    entry["group_name"],
+                    entry["nationality"],
+                )
+                for entry in entries
+            ],
+        )
+
+    def update_external_directory_entry(
+        self,
+        import_id: int,
+        channel_id: str,
+        status: str,
+        reason: str = "",
+    ) -> None:
+        self.execute(
+            """UPDATE external_directory_entries
+               SET result_status=?,result_reason=?
+               WHERE import_id=? AND channel_id=?""",
+            (status, reason[:500], import_id, channel_id),
+        )
+
+    def update_external_directory_entries(
+        self,
+        import_id: int,
+        results: Iterable[tuple[str, str, str]],
+    ) -> None:
+        self.executemany(
+            """UPDATE external_directory_entries
+               SET result_status=?,result_reason=?
+               WHERE import_id=? AND channel_id=?""",
+            [
+                (status, reason[:500], import_id, channel_id)
+                for channel_id, status, reason in results
+            ],
+        )
+
+    def latest_external_directory_import(self) -> dict[str, Any] | None:
+        rows = self.rows(
+            """SELECT * FROM external_directory_imports
+               ORDER BY id DESC LIMIT 1"""
+        )
+        return rows[0] if rows else None
 
     def add_workspace_channel(self, channel_id: str) -> None:
         next_order = int(self.scalar(
@@ -2075,6 +2226,7 @@ class TrackerService:
             oauth_directory,
             f"http://{getattr(config, 'host', '127.0.0.1')}:{getattr(config, 'port', 8787)}/api/creator/oauth/callback",
         )
+        self.directory_fetcher = fetch_directory
         self.channel_candidate_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self.channel_performance_cache_at = 0.0
         self.channel_performance_cache: dict[str, dict[str, Any]] = {}
@@ -2131,6 +2283,36 @@ class TrackerService:
             "excluded_count": 0,
             "rejected_count": 0,
             "message": None,
+            "error": None,
+        }
+        self.external_directory_import_id: int | None = None
+        latest_directory_import = self.database.latest_external_directory_import()
+        self.external_directory_progress: dict[str, Any] = latest_directory_import or {
+            "id": None,
+            "status": "idle",
+            "source_name": DIRECTORY_NAME,
+            "source_site_url": DIRECTORY_SITE_URL,
+            "source_url": DIRECTORY_CSV_URL,
+            "source_commit": None,
+            "source_sha256": None,
+            "source_license": DIRECTORY_LICENSE,
+            "started_at": None,
+            "completed_at": None,
+            "row_count": 0,
+            "individual_tw_count": 0,
+            "selected_count": 0,
+            "examined_count": 0,
+            "eligible_count": 0,
+            "new_count": 0,
+            "refreshed_count": 0,
+            "below_threshold_count": 0,
+            "hidden_subscriber_count": 0,
+            "excluded_count": 0,
+            "unavailable_count": 0,
+            "inactive_count": 0,
+            "missing_youtube_count": 0,
+            "invalid_youtube_count": 0,
+            "duplicate_count": 0,
             "error": None,
         }
         self.running = True
@@ -2279,6 +2461,57 @@ class TrackerService:
                 "error": error,
             })
 
+    def _begin_external_directory_import(self) -> None:
+        import_id = self.database.create_external_directory_import()
+        started_at = utc_now()
+        self.external_directory_import_id = import_id
+        with self.state_lock:
+            self.external_directory_progress = {
+                "id": import_id,
+                "status": "running",
+                "source_name": DIRECTORY_NAME,
+                "source_site_url": DIRECTORY_SITE_URL,
+                "source_url": DIRECTORY_CSV_URL,
+                "source_commit": None,
+                "source_sha256": None,
+                "source_license": DIRECTORY_LICENSE,
+                "started_at": started_at,
+                "completed_at": None,
+                "row_count": 0,
+                "individual_tw_count": 0,
+                "selected_count": 0,
+                "examined_count": 0,
+                "eligible_count": 0,
+                "new_count": 0,
+                "refreshed_count": 0,
+                "below_threshold_count": 0,
+                "hidden_subscriber_count": 0,
+                "excluded_count": 0,
+                "unavailable_count": 0,
+                "inactive_count": 0,
+                "missing_youtube_count": 0,
+                "invalid_youtube_count": 0,
+                "duplicate_count": 0,
+                "error": None,
+            }
+
+    def _update_external_directory_progress(self, **values: Any) -> None:
+        with self.state_lock:
+            self.external_directory_progress.update(values)
+        if self.external_directory_import_id is not None:
+            self.database.update_external_directory_import(
+                self.external_directory_import_id,
+                values,
+            )
+
+    def _finish_external_directory_import(self) -> None:
+        completed_at = utc_now()
+        self._update_external_directory_progress(
+            status="completed",
+            completed_at=completed_at,
+            error=None,
+        )
+
     def _record_error(self, error: Exception) -> None:
         completed_at = utc_now()
         with self.state_lock:
@@ -2297,6 +2530,21 @@ class TrackerService:
                         "status": "error",
                         "error": self.last_error,
                     })
+            if self.current_job == "external-directory-import":
+                self.external_directory_progress.update({
+                    "status": "error",
+                    "completed_at": completed_at,
+                    "error": self.last_error,
+                })
+                if self.external_directory_import_id is not None:
+                    self.database.update_external_directory_import(
+                        self.external_directory_import_id,
+                        {
+                            "status": "error",
+                            "completed_at": completed_at,
+                            "error": self.last_error,
+                        },
+                    )
 
     @staticmethod
     def _is_missing_upload_playlist(error: Exception) -> bool:
@@ -2334,6 +2582,8 @@ class TrackerService:
             self.last_error = None
         if name == "discover":
             self._begin_discovery()
+        elif name == "external-directory-import":
+            self._begin_external_directory_import()
 
         def runner() -> None:
             try:
@@ -2347,7 +2597,13 @@ class TrackerService:
                 self._set_job(None)
 
         threading.Thread(target=runner, name=f"tracker-{name}", daemon=True).start()
-        return True, "已開始搜尋候選頻道" if name == "discover" else "工作已開始"
+        if name == "discover":
+            message = "已開始搜尋候選頻道"
+        elif name == "external-directory-import":
+            message = "已開始同步 Taiwan VTuber Data 名錄"
+        else:
+            message = "工作已開始"
+        return True, message
 
     def _save_discovery_candidate(
         self,
@@ -2548,6 +2804,156 @@ class TrackerService:
             )
         self.evaluate_activity_statuses()
         self._finish_discovery()
+
+    def import_external_directory(self) -> dict[str, Any]:
+        if self.external_directory_import_id is None or self.external_directory_progress.get("status") != "running":
+            self._begin_external_directory_import()
+        assert self.external_directory_import_id is not None
+        import_id = self.external_directory_import_id
+
+        source = self.directory_fetcher()
+        parsed = parse_directory_csv(str(source["text"]))
+        entries = list(parsed["entries"])
+        entry_by_id = {entry["channel_id"]: entry for entry in entries}
+        self.database.add_external_directory_entries(import_id, entries)
+        initial_values = {
+            "source_commit": source.get("source_commit"),
+            "source_sha256": source.get("source_sha256"),
+            **{key: parsed[key] for key in (
+                "row_count", "individual_tw_count", "selected_count", "inactive_count",
+                "missing_youtube_count", "invalid_youtube_count", "duplicate_count",
+            )},
+        }
+        self._update_external_directory_progress(**initial_values)
+
+        excluded_ids = {
+            row["channel_id"] for row in self.database.rows(
+                "SELECT channel_id FROM excluded_channels"
+            )
+        }
+        results: list[tuple[str, str, str]] = []
+        excluded_count = 0
+        requested_ids: list[str] = []
+        for entry in entries:
+            channel_id = entry["channel_id"]
+            if channel_id in excluded_ids:
+                excluded_count += 1
+                results.append((channel_id, "excluded", "此頻道已在本機黑名單"))
+            else:
+                requested_ids.append(channel_id)
+        if results:
+            self.database.update_external_directory_entries(import_id, results)
+        self._update_external_directory_progress(excluded_count=excluded_count)
+
+        counts = {
+            "examined_count": 0,
+            "eligible_count": 0,
+            "new_count": 0,
+            "refreshed_count": 0,
+            "below_threshold_count": 0,
+            "hidden_subscriber_count": 0,
+            "unavailable_count": 0,
+        }
+        eligible_ids: list[str] = []
+        min_subscribers = self.settings_payload()["min_subscribers"]
+        for group in chunks(requested_ids):
+            existing = {
+                row["channel_id"]: row["discovery_status"]
+                for row in self.database.rows(
+                    f"""SELECT channel_id,discovery_status FROM channels
+                         WHERE channel_id IN ({','.join('?' for _ in group)})""",
+                    tuple(group),
+                )
+            }
+            payload = self.youtube.get("channels", {
+                "part": "snippet,statistics,contentDetails,brandingSettings",
+                "id": ",".join(group),
+                "maxResults": len(group),
+            })
+            returned: set[str] = set()
+            group_results: list[tuple[str, str, str]] = []
+            for item in payload.get("items", []):
+                channel_id = str(item.get("id") or "")
+                if channel_id not in entry_by_id or channel_id not in group:
+                    continue
+                returned.add(channel_id)
+                counts["examined_count"] += 1
+                directory_entry = entry_by_id[channel_id]
+                group_name = directory_entry["group_name"]
+                excerpt = f"{directory_entry['display_name']} · TW · Active"
+                if group_name:
+                    excerpt += f" · {group_name}"
+                evidence = (DIRECTORY_NAME, "外部名錄", excerpt[:500])
+                statistics = item.get("statistics", {})
+                hidden = bool(statistics.get("hiddenSubscriberCount"))
+                subscribers = (
+                    int(statistics["subscriberCount"])
+                    if statistics.get("subscriberCount") else None
+                )
+                previous_status = existing.get(channel_id)
+                retained_status = previous_status in {"eligible", "owned"}
+                if hidden or subscribers is None:
+                    counts["hidden_subscriber_count"] += 1
+                    if retained_status:
+                        self.database.upsert_channel(item)
+                        group_results.append((
+                            channel_id,
+                            "retained",
+                            "訂閱數未公開；保留既有收錄狀態",
+                        ))
+                    else:
+                        self.database.upsert_channel(item, status="review", evidence=evidence)
+                        group_results.append((
+                            channel_id,
+                            "review",
+                            "公開訂閱數未顯示，無法確認是否達到收錄門檻",
+                        ))
+                    continue
+                if subscribers < min_subscribers:
+                    counts["below_threshold_count"] += 1
+                    if retained_status:
+                        self.database.upsert_channel(item)
+                        group_results.append((
+                            channel_id,
+                            "retained",
+                            f"目前 {subscribers:,} 訂閱；保留既有收錄狀態",
+                        ))
+                    else:
+                        self.database.upsert_channel(item, status="below_threshold", evidence=evidence)
+                        group_results.append((
+                            channel_id,
+                            "below_threshold",
+                            f"公開訂閱數 {subscribers:,}，未達收錄門檻 {min_subscribers:,}",
+                        ))
+                    continue
+
+                self.database.upsert_channel(item, status="eligible", evidence=evidence)
+                eligible_ids.append(channel_id)
+                counts["eligible_count"] += 1
+                if previous_status == "eligible":
+                    counts["refreshed_count"] += 1
+                    result_status = "refreshed"
+                    reason = "已更新既有收錄頻道"
+                else:
+                    counts["new_count"] += 1
+                    result_status = "included"
+                    reason = "已由外部名錄直接收錄"
+                group_results.append((channel_id, result_status, reason))
+
+            for channel_id in group:
+                if channel_id not in returned:
+                    counts["unavailable_count"] += 1
+                    group_results.append((
+                        channel_id,
+                        "unavailable",
+                        "YouTube API 未回傳此頻道，未變更本機資料",
+                    ))
+            self.database.update_external_directory_entries(import_id, group_results)
+            self._update_external_directory_progress(**counts)
+
+        self.evaluate_activity_statuses(eligible_ids)
+        self._finish_external_directory_import()
+        return dict(self.external_directory_progress)
 
     def search_channels(self, query: str) -> list[dict[str, Any]]:
         min_subscribers = self.settings_payload()["min_subscribers"]
@@ -3459,6 +3865,181 @@ class TrackerService:
         for row in daily_rows + video_rows:
             row["metrics"] = json.loads(row.pop("metrics_json"))
         return {"status": status, "summary": summary, "daily": daily_rows, "videos": video_rows}
+
+    def comparison_recommendations(
+        self,
+        requested_channel_id: str | None = None,
+        per_group: int = 2,
+    ) -> dict[str, Any]:
+        channel_id = (requested_channel_id or "").strip() or self.owned_channel_id()
+        per_group = max(1, min(2, int(per_group)))
+        group_specs = (
+            ("smaller", "較小規模", "訂閱少於你的 0.5 倍，優先選擇規模接近且內容相似的頻道", lambda ratio: ratio < .5, .35),
+            ("peer", "同量級", "沿用同級定義：訂閱為你的 0.5～2 倍，適合作為日常比較", lambda ratio: .5 <= ratio <= 2, 1.0),
+            ("larger", "成長參考", "訂閱高於你的 2 倍，優先選擇內容相似的下一個規模", lambda ratio: ratio > 2, 3.0),
+        )
+        empty_groups = [
+            {"key": key, "label": label, "description": description, "available_count": 0, "channels": []}
+            for key, label, description, _matches, _target in group_specs
+        ]
+        base = {
+            "generated_at": utc_now(),
+            "reference_channel_id": channel_id or None,
+            "reference_title": None,
+            "reference_subscriber_count": None,
+            "period_days": 90,
+            "requested_count": per_group * len(group_specs),
+            "groups": empty_groups,
+            "methodology": {
+                "summary": "先比較最近 90 日公開內容形式與主題，再依目前公開訂閱規模分組。",
+                "audience_boundary": "公開 API 無法確認頻道間的重疊觀眾；此處只代表公開內容定位相近。",
+                "activity_boundary": "已確認畢業、疑似已畢業與休止中的頻道不列入推薦。",
+            },
+        }
+        if not channel_id:
+            return {**base, "status": "missing_reference", "message": "請先在頻道工作區選擇自己的頻道。"}
+        reference_rows = self.database.rows(
+            """SELECT channel_id,title,handle,thumbnail_url,subscriber_count,category
+                 FROM channels
+                WHERE channel_id=? AND discovery_status IN ('eligible','owned','below_threshold')""",
+            (channel_id,),
+        )
+        if not reference_rows:
+            return {**base, "status": "missing_reference", "message": "找不到這個工作區頻道的公開資料。"}
+        reference = reference_rows[0]
+        base.update({
+            "reference_title": reference["title"],
+            "reference_subscriber_count": reference["subscriber_count"],
+        })
+        if not reference.get("subscriber_count"):
+            return {**base, "status": "missing_subscribers", "message": "此頻道沒有公開訂閱數，暫時無法建立規模分組。"}
+
+        reference_subscribers = int(reference["subscriber_count"])
+        candidates = self.database.rows(
+            """SELECT channel_id,title,handle,thumbnail_url,subscriber_count,category
+                 FROM channels
+                WHERE channel_id<>? AND discovery_status='eligible'
+                  AND subscriber_count IS NOT NULL AND subscriber_count>0
+                  AND COALESCE(activity_status,'') NOT IN ('休止中','疑似已畢業','已確認畢業')""",
+            (channel_id,),
+        )
+        candidate_groups: dict[str, list[dict[str, Any]]] = {key: [] for key, *_rest in group_specs}
+        for candidate in candidates:
+            ratio = int(candidate["subscriber_count"]) / reference_subscribers
+            for key, _label, _description, matches, _target in group_specs:
+                if matches(ratio):
+                    candidate["subscriber_ratio"] = ratio
+                    candidate_groups[key].append(candidate)
+                    break
+
+        profile_ids = [channel_id, *(candidate["channel_id"] for candidate in candidates)]
+        profiles: dict[str, dict[str, Any]] = {
+            value: {"formats": Counter(), "topics": Counter(), "items": 0}
+            for value in profile_ids
+        }
+        cutoff = (datetime.now(UTC) - timedelta(days=90)).isoformat(timespec="seconds")
+        for group in chunks(profile_ids, 400):
+            placeholders = ",".join("?" for _ in group)
+            recent_videos = self.database.rows(
+                f"""SELECT channel_id,title,description,duration_seconds,live_state,
+                            content_type,published_at,actual_start,scheduled_start,updated_at
+                       FROM videos
+                      WHERE channel_id IN ({placeholders})
+                        AND live_state NOT IN ('upcoming','unavailable')
+                        AND datetime(COALESCE(actual_start,published_at))>=datetime(?)
+                        AND datetime(COALESCE(actual_start,published_at))<=datetime('now')""",
+                tuple([*group, cutoff]),
+            )
+            for video in recent_videos:
+                profile = profiles[str(video["channel_id"])]
+                profile["items"] += 1
+                profile["formats"][video_format(
+                    video["live_state"], video["duration_seconds"], video["title"], video.get("description") or ""
+                )] += 1
+                for topic in (
+                    part.strip() for part in str(video.get("content_type") or "其他").split("+")
+                ):
+                    if topic and topic != "其他":
+                        profile["topics"][topic] += 1
+
+        def counter_similarity(left: Counter[str], right: Counter[str]) -> float:
+            keys = set(left) | set(right)
+            if not keys:
+                return 0.0
+            left_total, right_total = sum(left.values()), sum(right.values())
+            if not left_total or not right_total:
+                return 0.0
+            denominator = sum(max(left[key] / left_total, right[key] / right_total) for key in keys)
+            return sum(min(left[key] / left_total, right[key] / right_total) for key in keys) / denominator if denominator else 0.0
+
+        reference_profile = profiles[channel_id]
+        groups: list[dict[str, Any]] = []
+        for key, label, description, _matches, target_ratio in group_specs:
+            ranked: list[dict[str, Any]] = []
+            for candidate in candidate_groups[key]:
+                ratio = float(candidate["subscriber_ratio"])
+                candidate_profile = profiles[candidate["channel_id"]]
+                scale_fit = 1 / (1 + abs(math.log2(max(.01, ratio / target_ratio))))
+                category_fit = 1.0 if (
+                    reference.get("category") not in (None, "", "未分類")
+                    and candidate.get("category") == reference.get("category")
+                ) else 0.0
+                data_ready = reference_profile["items"] >= 3 and candidate_profile["items"] >= 3
+                format_fit = counter_similarity(reference_profile["formats"], candidate_profile["formats"])
+                topic_fit = counter_similarity(reference_profile["topics"], candidate_profile["topics"])
+                if data_ready:
+                    evidence_weight = .55 + .45 * min(1.0, min(
+                        reference_profile["items"], candidate_profile["items"]
+                    ) / 8)
+                    fit_score = ((.5 * format_fit + .3 * topic_fit) * evidence_weight) + (.15 * scale_fit) + (.05 * category_fit)
+                else:
+                    fit_score = .15 * scale_fit + .05 * category_fit
+                shared_topics = [
+                    topic for topic in CONTENT_TOPIC_ORDER
+                    if topic != "其他" and topic in reference_profile["topics"] and topic in candidate_profile["topics"]
+                ][:2]
+                reference_format = reference_profile["formats"].most_common(1)[0][0] if reference_profile["formats"] else None
+                candidate_format = candidate_profile["formats"].most_common(1)[0][0] if candidate_profile["formats"] else None
+                reasons = [f"目前公開訂閱約為你的 {ratio:.2f} 倍"]
+                if data_ready and reference_format and reference_format == candidate_format:
+                    reasons.append(f"最近 90 日主要形式同為{reference_format}")
+                if data_ready and shared_topics:
+                    reasons.append(f"共同主題：{'、'.join(shared_topics)}")
+                if not data_ready:
+                    reasons.append("雙方各需至少 3 項近期公開內容才判斷定位；目前僅依規模推薦")
+                ranked.append({
+                    **candidate,
+                    "subscriber_ratio": round(ratio, 3),
+                    "fit_score": max(0, min(100, round(fit_score * 100))),
+                    "recent_content_count": int(candidate_profile["items"]),
+                    "dominant_format": candidate_format,
+                    "shared_topics": shared_topics,
+                    "content_data_ready": data_ready,
+                    "reasons": reasons,
+                })
+            ranked.sort(key=lambda item: (
+                -int(item["content_data_ready"]),
+                -int(item["fit_score"]),
+                abs(math.log2(max(.01, float(item["subscriber_ratio"]) / target_ratio))),
+                -int(item["recent_content_count"]),
+                str(item["title"]),
+            ))
+            groups.append({
+                "key": key,
+                "label": label,
+                "description": description,
+                "available_count": len(ranked),
+                "channels": ranked[:max(6, per_group * 3)],
+            })
+        returned_count = sum(min(per_group, len(group["channels"])) for group in groups)
+        return {
+            **base,
+            "status": "ready" if returned_count else "insufficient_data",
+            "message": "已依公開內容定位與訂閱規模建立參考組。" if returned_count else "目前沒有足夠的活動中頻道可建立參考組。",
+            "returned_count": returned_count,
+            "reference_recent_content_count": int(reference_profile["items"]),
+            "groups": groups,
+        }
 
     def creator_dashboard(self, requested_channel_id: str | None = None) -> dict[str, Any]:
         workspace_channels = self.workspace_channels()
@@ -4444,7 +5025,7 @@ class TrackerService:
         min_subscribers = max(0, int(min_subscribers))
         max_subscribers = max(min_subscribers, min(100_000_000, int(max_subscribers)))
         selected_ids = list(dict.fromkeys(value for value in (channel_ids or []) if value))[:20]
-        comparison_ids = list(dict.fromkeys(value for value in (comparison_ids or []) if value))[:5]
+        comparison_ids = list(dict.fromkeys(value for value in (comparison_ids or []) if value))[:6]
         allowed_formats = {"主要內容", "直播", "影片", "Shorts", "全部"}
         if format_type not in allowed_formats:
             format_type = "主要內容"
@@ -5234,7 +5815,7 @@ class TrackerService:
                       activity_status_reviewed_at,activity_status_manual_lock,last_activity_at,
                       match_term,match_field,match_excerpt,updated_at
                FROM channels WHERE discovery_status='eligible'
-               ORDER BY subscriber_count DESC LIMIT 500"""
+               ORDER BY subscriber_count DESC"""
         )
         for channel in channels:
             channel["manual_tags"] = parse_json_list(channel.get("manual_tags"))
@@ -5256,6 +5837,7 @@ class TrackerService:
             error = self.last_error
             warning = self.last_warning
             progress = dict(self.discovery_progress)
+            external_directory = dict(self.external_directory_progress)
         search_usage = self.youtube.usage("search")
         general_usage = self.youtube.usage("general")
         owned_channel_id = self.owned_channel_id()
@@ -5313,6 +5895,7 @@ class TrackerService:
             "manual_refresh_queue_threshold": 50,
             "manual_refresh_queue_failed": manual_queue_failed,
             "discovery_progress": progress,
+            "external_directory": external_directory,
             "retention_days": settings["retention_days"],
             "settings": settings,
             "categories": self.database.rows(
@@ -5528,6 +6111,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif route == "/api/creator":
             query = urllib.parse.parse_qs(parsed.query)
             self._json(self.service.creator_dashboard(query.get("channel_id", [None])[0]))
+        elif route == "/api/creator/recommendations":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                self._json(self.service.comparison_recommendations(
+                    query.get("channel_id", [None])[0],
+                    per_group=int(query.get("per_group", ["2"])[0]),
+                ))
+            except (TypeError, ValueError) as error:
+                self._json({"error": str(error)}, 400)
         elif route == "/api/creator/analytics":
             query = urllib.parse.parse_qs(parsed.query)
             try:
@@ -5677,6 +6269,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json({"error": str(error)}, 400)
         elif route == "/api/discover":
             ok, message = self.service.launch_job("discover", self.service.discover_channels)
+            self._json({"message": message} if ok else {"error": message}, 202 if ok else 409)
+        elif route == "/api/external-directory/import":
+            ok, message = self.service.launch_job(
+                "external-directory-import",
+                self.service.import_external_directory,
+            )
             self._json({"message": message} if ok else {"error": message}, 202 if ok else 409)
         elif route == "/api/scan":
             ok, message = self.service.launch_job("upload-scan", lambda: self.service.scan_due_uploads(50))

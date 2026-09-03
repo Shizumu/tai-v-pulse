@@ -33,7 +33,7 @@ export default function LegalConsent() {
         </ul>
         <p className="legal-links"><a href="/legal" target="_blank">閱讀完整使用與隱私聲明</a><a href="https://www.youtube.com/t/terms" target="_blank" rel="noreferrer">YouTube 服務條款</a><a href="https://policies.google.com/privacy" target="_blank" rel="noreferrer">Google 隱私權政策</a></p>
         <label className="consent-check"><input type="checkbox" checked={checked} onChange={(event) => setChecked(event.target.checked)} /><span>我已閱讀並同意上述使用、資料保存與非商用授權條件</span></label>
-        <div className="dialog-actions"><button className="button primary" type="button" disabled={!checked} onClick={() => { window.localStorage.setItem(CONSENT_KEY, "accepted"); setAccepted(true); }}>同意並開始使用</button></div>
+        <div className="dialog-actions"><button className="button primary" type="button" disabled={!checked} onClick={() => { window.localStorage.setItem(CONSENT_KEY, "accepted"); setAccepted(true); window.dispatchEvent(new Event("tai-v-pulse-guide-ready")); }}>同意並開始使用</button></div>
       </section>
     </div>
   );

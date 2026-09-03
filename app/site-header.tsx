@@ -63,6 +63,7 @@ export default function SiteHeader({
         ))}
       </nav>
       <div className="status-cluster">
+        <button className="guide-launch" type="button" onClick={() => window.dispatchEvent(new Event("tai-v-pulse-open-guide"))} aria-label="開啟台V Pulse 使用教學"><span aria-hidden="true">?</span>使用教學</button>
         <label className="theme-picker"><span>外觀</span><select aria-label="頁面顏色主題" value={theme} onChange={(event) => setTheme(event.target.value)}>{THEMES.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
         <span className={`connection ${connected ? "online" : "offline"}`}><i />{statusText ?? (connected ? "本機資料已連線" : "等待本機服務")}</span>
         {actions}

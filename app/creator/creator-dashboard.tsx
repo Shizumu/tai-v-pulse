@@ -208,6 +208,47 @@ type CreatorData = {
   manual_metrics: ManualMetric[];
 };
 
+type RecommendedChannel = {
+  channel_id: string;
+  title: string;
+  handle: string | null;
+  thumbnail_url: string | null;
+  subscriber_count: number;
+  category: string;
+  subscriber_ratio: number;
+  fit_score: number;
+  recent_content_count: number;
+  dominant_format: string | null;
+  shared_topics: string[];
+  content_data_ready: boolean;
+  reasons: string[];
+};
+
+type RecommendationPayload = {
+  status: "ready" | "missing_reference" | "missing_subscribers" | "insufficient_data";
+  message: string;
+  generated_at: string;
+  reference_channel_id: string | null;
+  reference_title: string | null;
+  reference_subscriber_count: number | null;
+  reference_recent_content_count?: number;
+  returned_count?: number;
+  period_days: number;
+  groups: {
+    key: "smaller" | "peer" | "larger";
+    label: string;
+    description: string;
+    available_count: number;
+    channels: RecommendedChannel[];
+  }[];
+  methodology: {
+    summary: string;
+    audience_boundary: string;
+    activity_boundary: string;
+  };
+  error?: string;
+};
+
 type Preview = {
   filename: string;
   report_count: number;
@@ -372,6 +413,11 @@ export default function CreatorDashboard() {
   const [oauthManagerOpen, setOauthManagerOpen] = useState(false);
   const [oauthBusy, setOauthBusy] = useState(false);
   const [oauthSyncing, setOauthSyncing] = useState(false);
+  const [recommendations, setRecommendations] = useState<RecommendationPayload | null>(null);
+  const [recommendationsLoading, setRecommendationsLoading] = useState(false);
+  const [recommendationError, setRecommendationError] = useState<string | null>(null);
+  const [recommendationRefreshKey, setRecommendationRefreshKey] = useState(0);
+  const [selectedRecommendations, setSelectedRecommendations] = useState<Record<string, string[]>>({});
 
   const refresh = useCallback(async () => {
     try {
@@ -404,6 +450,38 @@ export default function CreatorDashboard() {
     const timer = window.setInterval(() => void refresh(), 30000);
     return () => { window.clearTimeout(initial); window.clearInterval(timer); };
   }, [refresh]);
+
+  useEffect(() => {
+    const channelId = creator?.owned_channel_id;
+    if (!channelId) return;
+    const controller = new AbortController();
+    const request = window.setTimeout(() => {
+      setRecommendations(null);
+      setSelectedRecommendations({});
+      setRecommendationsLoading(true);
+      setRecommendationError(null);
+      void fetch(`${API_BASE}/api/creator/recommendations?channel_id=${encodeURIComponent(channelId)}&per_group=2`, {
+        cache: "no-store",
+        signal: controller.signal,
+      }).then(async (response) => {
+        const payload = await response.json() as RecommendationPayload;
+        if (!response.ok) throw new Error(payload.error ?? "無法建立參考頻道組");
+        setRecommendations(payload);
+        setSelectedRecommendations(Object.fromEntries(
+          payload.groups.map((group) => [group.key, group.channels.slice(0, 2).map((channel) => channel.channel_id)]),
+        ));
+      }).catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setRecommendationError(error instanceof Error ? error.message : "無法建立參考頻道組");
+      }).finally(() => {
+        if (!controller.signal.aborted) setRecommendationsLoading(false);
+      });
+    }, 0);
+    return () => {
+      window.clearTimeout(request);
+      controller.abort();
+    };
+  }, [creator?.owned_channel_id, recommendationRefreshKey]);
 
   useEffect(() => {
     if (!oauthSyncing) return;
@@ -921,6 +999,45 @@ export default function CreatorDashboard() {
       end: last.captured_at,
     };
   }, [creator?.public?.snapshots]);
+  const selectedRecommendationIds = useMemo(() => {
+    if (!recommendations) return [];
+    return recommendations.groups.flatMap((group) => selectedRecommendations[group.key] ?? []).slice(0, 6);
+  }, [recommendations, selectedRecommendations]);
+
+  const replaceRecommendation = (groupKey: string, index: number, channelId: string) => {
+    setSelectedRecommendations((current) => {
+      const group = [...(current[groupKey] ?? [])];
+      group[index] = channelId;
+      return { ...current, [groupKey]: group };
+    });
+  };
+
+  const resetRecommendations = () => {
+    if (!recommendations) return;
+    setSelectedRecommendations(Object.fromEntries(
+      recommendations.groups.map((group) => [group.key, group.channels.slice(0, 2).map((channel) => channel.channel_id)]),
+    ));
+  };
+
+  const openRecommendedComparison = (destination: "/insights" | "/trends") => {
+    if (!recommendations?.reference_channel_id || selectedRecommendationIds.length === 0) return;
+    const name = `系統推薦｜${recommendations.reference_title ?? "我的頻道"}`;
+    try {
+      const existing = JSON.parse(window.localStorage.getItem("tai-v-pulse-comparison-groups") ?? "[]") as { name: string; ids: string[] }[];
+      const next = [
+        ...(Array.isArray(existing) ? existing.filter((group) => group?.name !== name) : []),
+        { name, ids: selectedRecommendationIds },
+      ];
+      window.localStorage.setItem("tai-v-pulse-comparison-groups", JSON.stringify(next));
+    } catch {
+      window.localStorage.setItem("tai-v-pulse-comparison-groups", JSON.stringify([{ name, ids: selectedRecommendationIds }]));
+    }
+    const parameters = new URLSearchParams({
+      reference: recommendations.reference_channel_id,
+      channels: selectedRecommendationIds.join(","),
+    });
+    window.location.assign(`${destination}?${parameters.toString()}`);
+  };
 
   return (
     <main className="app-shell creator-shell">
@@ -950,6 +1067,36 @@ export default function CreatorDashboard() {
           <article className="insight-hero"><span>歷史最高同接</span><strong>{compact(creator.public?.peak_concurrent)}</strong><p>{exact(creator.public?.concurrency_sample_count)} 個同接資料點</p></article>
         </section>
       </> : <section className="panel workspace-mode-empty"><strong>尚未選定個人頻道</strong><p>從下方管理區加入監測中的頻道，或使用私人 Analytics 連線自動辨識自己的頻道。</p><button className="button primary" type="button" onClick={() => document.getElementById("creator-channel-management")?.scrollIntoView({ behavior: "smooth", block: "start" })}>前往加入頻道</button></section>)}
+
+      {!loading && creator?.channel && workspaceMode === "personal" && <section className="panel recommendation-panel" aria-labelledby="recommendation-title">
+        <div className="panel-heading recommendation-heading">
+          <div><p className="section-kicker">REFERENCE SET</p><h2 id="recommendation-title">為你挑選的參考頻道</h2><p>依最近 90 日公開內容形式、主題與目前訂閱規模排序；每組最多預選 2 個，可以自行替換。</p></div>
+          <div className="recommendation-heading-actions"><button className="text-button" type="button" onClick={() => setRecommendationRefreshKey((current) => current + 1)} disabled={recommendationsLoading}>重新分析</button>{recommendations?.status === "ready" && <button className="text-button" type="button" onClick={resetRecommendations}>恢復系統推薦</button>}</div>
+        </div>
+        {recommendationsLoading && <div className="recommendation-placeholder">正在比較公開內容定位與規模…</div>}
+        {recommendationError && <div className="recommendation-placeholder error" role="status">{recommendationError}</div>}
+        {!recommendationsLoading && recommendations && recommendations.status !== "ready" && <div className="recommendation-placeholder"><strong>{recommendations.message}</strong><p>{recommendations.methodology.audience_boundary}</p></div>}
+        {!recommendationsLoading && recommendations?.status === "ready" && <>
+          <div className="recommendation-grid">{recommendations.groups.map((group) => {
+            const selectedIds = selectedRecommendations[group.key] ?? [];
+            return <article className={`recommendation-group ${group.key}`} key={group.key}>
+              <div className="recommendation-group-heading"><span>{group.label}</span><small>{group.available_count} 個候選 · 可替換前 {group.channels.length} 個</small></div>
+              <p>{group.description}</p>
+              {selectedIds.length === 0 ? <div className="recommendation-empty">目前沒有符合這個規模區間的活動中頻道。</div> : <div className="recommendation-list">{selectedIds.map((channelId, index) => {
+                const channel = group.channels.find((item) => item.channel_id === channelId);
+                if (!channel) return null;
+                return <div className="recommendation-channel" key={`${group.key}-${index}`}>
+                  <div className="recommendation-channel-identity">{channel.thumbnail_url ? <img src={channel.thumbnail_url} alt="" /> : <span>V</span>}<div><strong>{channel.title}</strong><small>{compact(channel.subscriber_count)} 訂閱 · 最近 90 日 {channel.recent_content_count} 項內容</small></div></div>
+                  <label><span>替換這個參考頻道</span><select value={channelId} onChange={(event) => replaceRecommendation(group.key, index, event.target.value)}>{group.channels.map((option) => <option value={option.channel_id} disabled={selectedIds.includes(option.channel_id) && option.channel_id !== channelId} key={option.channel_id}>{option.title}｜{compact(option.subscriber_count)}</option>)}</select></label>
+                  <ul>{channel.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                </div>;
+              })}</div>}
+            </article>;
+          })}</div>
+          <div className="recommendation-boundary"><strong>推薦範圍</strong><p>{recommendations.methodology.summary} {recommendations.methodology.audience_boundary} {recommendations.methodology.activity_boundary}</p></div>
+          <div className="recommendation-actions"><span>已選 {selectedRecommendationIds.length} 個參考頻道</span><div><button className="button" type="button" onClick={() => openRecommendedComparison("/trends")} disabled={selectedRecommendationIds.length === 0}>看趨勢比較</button><button className="button primary" type="button" onClick={() => openRecommendedComparison("/insights")} disabled={selectedRecommendationIds.length === 0}>分析這組內容環境</button></div></div>
+        </>}
+      </section>}
 
       {!loading && creator && workspaceMode === "team" && <section className="panel workspace-overview-panel">
         <div className="panel-heading"><div><p className="section-kicker">MANAGED CHANNELS</p><h2>管理頻道與團隊比較</h2></div><span>{creator.workspace_channels.length} 個頻道 · 全部為公開監測統計</span></div>

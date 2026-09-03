@@ -55,6 +55,7 @@ $topLevelFiles = @(
     'PUBLIC_RELEASE.md',
     'README.md',
     'requirements.txt',
+    'run-vinext.mjs',
     'start-local.ps1',
     'stop-local.ps1',
     'tsconfig.json',

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import LegalConsent from "./legal-consent";
+import ProductGuide from "./product-guide";
 
 export const metadata: Metadata = {
   title: "台V Pulse",
@@ -18,7 +19,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-Hant">
-      <body>{children}<LegalConsent /></body>
+      <body>{children}<LegalConsent /><ProductGuide /></body>
     </html>
   );
 }

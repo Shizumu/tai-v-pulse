@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from email.message import Message
 
+from collector.external_directory import parse_directory_csv
 from collector.oauth import GoogleOAuth, oauth_error_guidance
 from collector.server import (
     Database,
@@ -74,6 +75,174 @@ class CollectorTests(unittest.TestCase):
                 "concurrentViewers": "88",
             },
         }
+
+    def test_external_directory_parses_only_active_taiwanese_individuals(self):
+        eligible_id = "UC" + "A" * 22
+        csv_text = "\n".join([
+            "ID,Display Name,Alias Names,Youtube Channel ID,Twitch Channel ID,Twitch Channel Name,Debut Date,Graduation Date,Activity,Group Name,Nationality",
+            "## VTuber Group Official Channels,,,,,,,,,,",
+            f"1,團體官方,,{('UC' + 'G' * 22)},,,,,Active,Group,TW",
+            "## Taiwanese VTubers,,,,,,,,,,",
+            f"3,活動中台V,,{eligible_id},,,,,Active,Example,TW",
+            f"4,重複台V,,{eligible_id},,,,,Active,,TW",
+            f"5,已畢業台V,,{('UC' + 'B' * 22)},,,,2025-01-01,Graduated,,TW",
+            f"6,香港V,,{('UC' + 'H' * 22)},,,,,Active,,HK",
+            "7,沒有 YouTube,,,,,,,Active,,TW",
+            "8,錯誤 ID,,not-a-channel,,,,,Active,,TW",
+        ])
+        parsed = parse_directory_csv(csv_text)
+        self.assertEqual([row["channel_id"] for row in parsed["entries"]], [eligible_id])
+        self.assertEqual(parsed["selected_count"], 1)
+        self.assertEqual(parsed["inactive_count"], 1)
+        self.assertEqual(parsed["missing_youtube_count"], 1)
+        self.assertEqual(parsed["invalid_youtube_count"], 1)
+        self.assertEqual(parsed["duplicate_count"], 1)
+
+    def test_external_directory_directly_includes_eligible_channels_with_audit(self):
+        eligible_id = "UC" + "A" * 22
+        below_id = "UC" + "B" * 22
+        excluded_id = "UC" + "C" * 22
+        csv_text = "\n".join([
+            "ID,Display Name,Alias Names,Youtube Channel ID,Twitch Channel ID,Twitch Channel Name,Debut Date,Graduation Date,Activity,Group Name,Nationality",
+            "## Taiwanese VTubers,,,,,,,,,,",
+            f"2,名錄合格台V,,{eligible_id},,,,,Active,測試社,TW",
+            f"3,名錄未達門檻台V,,{below_id},,,,,Active,,TW",
+            f"4,名錄黑名單台V,,{excluded_id},,,,,Active,,TW",
+        ])
+
+        def item(channel_id: str, subscribers: int) -> dict:
+            value = self.public_channel_item(channel_id, f"YouTube {channel_id[-1]}")
+            value["statistics"]["subscriberCount"] = str(subscribers)
+            value["snippet"]["description"] = "沒有台 V 自述字樣"
+            value["brandingSettings"]["channel"]["keywords"] = "gaming"
+            return value
+
+        items = {
+            eligible_id: item(eligible_id, 2500),
+            below_id: item(below_id, 500),
+        }
+
+        class FakeYouTube:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, resource, params, bucket="general"):
+                self.calls.append((resource, bucket, params["id"]))
+                return {
+                    "items": [
+                        items[channel_id]
+                        for channel_id in params["id"].split(",")
+                        if channel_id in items
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = SimpleNamespace(
+                database_path=Path(directory) / "test.sqlite3",
+                min_subscribers=1000,
+                discovery_pages_per_term=1,
+                api_key="test",
+            )
+            service = TrackerService(config)
+            youtube = FakeYouTube()
+            service.youtube = youtube
+            service.directory_fetcher = lambda: {
+                "text": csv_text,
+                "source_commit": "a" * 40,
+                "source_sha256": "b" * 64,
+            }
+            service.database.execute(
+                """INSERT INTO excluded_channels(channel_id,title,reason,excluded_at)
+                   VALUES (?,?,?,?)""",
+                (excluded_id, "名錄黑名單台V", "manual", utc_now()),
+            )
+
+            result = service.import_external_directory()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["selected_count"], 3)
+            self.assertEqual(result["examined_count"], 2)
+            self.assertEqual(result["eligible_count"], 1)
+            self.assertEqual(result["new_count"], 1)
+            self.assertEqual(result["below_threshold_count"], 1)
+            self.assertEqual(result["excluded_count"], 1)
+            self.assertEqual(youtube.calls[0][0:2], ("channels", "general"))
+            self.assertNotIn(excluded_id, youtube.calls[0][2])
+
+            included = service.database.rows(
+                """SELECT discovery_status,match_term,match_field,match_excerpt
+                   FROM channels WHERE channel_id=?""",
+                (eligible_id,),
+            )[0]
+            self.assertEqual(included["discovery_status"], "eligible")
+            self.assertEqual(included["match_term"], "Taiwan VTuber Data")
+            self.assertEqual(included["match_field"], "外部名錄")
+            self.assertIn("名錄合格台V", included["match_excerpt"])
+            self.assertEqual(service.database.scalar(
+                "SELECT discovery_status FROM channels WHERE channel_id=?", (below_id,)
+            ), "below_threshold")
+            audit = service.database.rows(
+                """SELECT channel_id,result_status FROM external_directory_entries
+                   ORDER BY channel_id"""
+            )
+            self.assertEqual(
+                {row["channel_id"]: row["result_status"] for row in audit},
+                {eligible_id: "included", below_id: "below_threshold", excluded_id: "excluded"},
+            )
+            service.database.close()
+
+    def test_comparison_recommendations_group_by_scale_and_rank_content_fit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = TrackerService(SimpleNamespace(
+                database_path=Path(directory) / "test.sqlite3",
+                min_subscribers=1000,
+                live_poll_seconds=60,
+                channel_refresh_hours=6,
+                upload_scan_hours=4,
+                retention_days=30,
+            ))
+            channels = (
+                ("UC-reference", "我的頻道", 10000),
+                ("UC-smaller", "小型參考", 4000),
+                ("UC-peer-similar", "內容相似同級", 15000),
+                ("UC-peer-scale", "規模很近但主題不同", 10100),
+                ("UC-larger", "成長參考", 30000),
+                ("UC-paused", "休止頻道", 32000),
+            )
+            for channel_id, title, subscribers in channels:
+                item = self.public_channel_item(channel_id, title)
+                item["statistics"]["subscriberCount"] = str(subscribers)
+                service.database.upsert_channel(item, status="eligible", evidence=("台V", "頻道說明", "台V"))
+                service.database.execute(
+                    "UPDATE channels SET activity_status='活動中', category='個人勢' WHERE channel_id=?",
+                    (channel_id,),
+                )
+                for index in range(3):
+                    video = self.public_video_item(f"video-{channel_id}-{index}", channel_id)
+                    video["snippet"]["publishedAt"] = utc_now()
+                    video["liveStreamingDetails"]["actualStartTime"] = utc_now()
+                    if channel_id == "UC-peer-scale":
+                        video["snippet"]["title"] = f"ASMR 睡前陪伴 {index}"
+                        video["snippet"]["categoryId"] = "22"
+                        video["snippet"]["tags"] = ["ASMR"]
+                    service.database.upsert_video(video)
+            service.database.execute(
+                "UPDATE channels SET activity_status='休止中' WHERE channel_id='UC-paused'"
+            )
+
+            result = service.comparison_recommendations("UC-reference", per_group=2)
+
+            self.assertEqual(result["status"], "ready")
+            groups = {group["key"]: group for group in result["groups"]}
+            self.assertEqual(groups["smaller"]["channels"][0]["channel_id"], "UC-smaller")
+            self.assertEqual(groups["peer"]["channels"][0]["channel_id"], "UC-peer-similar")
+            self.assertEqual(groups["larger"]["channels"][0]["channel_id"], "UC-larger")
+            self.assertNotIn(
+                "UC-paused",
+                [channel["channel_id"] for group in result["groups"] for channel in group["channels"]],
+            )
+            self.assertIn("共同主題：遊戲", groups["peer"]["channels"][0]["reasons"])
+            self.assertIn("無法確認", result["methodology"]["audience_boundary"])
+            service.database.close()
 
     def test_concurrency_sample_stats_requires_sufficient_coverage(self):
         start = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)

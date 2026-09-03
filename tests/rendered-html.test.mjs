@@ -86,7 +86,7 @@ test("server-renders the local trend dashboard", async () => {
   assert.match(html, /MARKET TRENDS/);
   assert.match(html, /以我的頻道建立比較/);
   assert.match(html, /包含已確認畢業頻道/);
-  assert.match(html, /加入固定比較頻道（最多 5 個）/);
+  assert.match(html, /加入固定比較頻道（最多 6 個）/);
   assert.match(html, /儲存固定比較組合/);
   assert.match(html, /圖表觀察期間/);
   assert.match(html, /自訂天數/);
@@ -104,7 +104,7 @@ test("server-renders the local legal and license notice", async () => {
 });
 
 test("starter preview is fully removed", async () => {
-  const [page, layout, dashboard, insights, trends, styles, creator, candidates, legalConsent, legalFooter, packageJson] = await Promise.all([
+  const [page, layout, dashboard, insights, trends, styles, creator, candidates, legalConsent, legalFooter, productGuide, siteHeader, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8"),
@@ -115,6 +115,8 @@ test("starter preview is fully removed", async () => {
     readFile(new URL("../app/candidates/candidate-review.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/legal-consent.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/legal-footer.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/product-guide.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/site-header.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
   assert.doesNotMatch(page, /_sites-preview|SkeletonPreview|codex-preview/);
@@ -146,6 +148,11 @@ test("starter preview is fully removed", async () => {
   assert.match(dashboard, /aria-expanded={publicTransferExpanded}/);
   assert.match(dashboard, /data\.eligible_channels === 0/);
   assert.match(dashboard, /指定收錄頻道/);
+  assert.match(dashboard, /同步 Taiwan VTuber Data 名錄/);
+  assert.match(dashboard, /不自動刪除既有頻道/);
+  assert.match(dashboard, /再顯示最多 200 個/);
+  assert.match(dashboard, /filteredChannels\.slice\(0, channelDisplayLimit\)/);
+  assert.match(dashboard, /公開數據來源：YouTube Data API/);
   assert.match(dashboard, /setInterval\(updateClock, 60000\)/);
   assert.match(dashboard, /匯出公開監測 ZIP/);
   assert.match(dashboard, /合併（建議）/);
@@ -165,6 +172,8 @@ test("starter preview is fully removed", async () => {
   assert.match(insights, /代表內容/);
   assert.match(insights, /一般影片/);
   assert.match(insights, /背景更新中，閱讀位置會保留/);
+  assert.match(insights, /parameters\.get\("channels"\)/);
+  assert.match(insights, /加入比較頻道（最多 6 個）/);
   assert.match(insights, /看懂內容環境/);
   assert.match(insights, /先選擇一個基準頻道，觀察訂閱規模相近的頻道在做什麼/);
   assert.match(insights, /趨勢與成長比較會隨資料累積而更可靠/);
@@ -180,7 +189,9 @@ test("starter preview is fully removed", async () => {
   assert.match(trends, /固定比較線/);
   assert.match(trends, /className="comparison-control"/);
   assert.match(trends, /className="saved-comparison-toolbar"/);
-  assert.match(trends, /加入固定比較頻道（最多 5 個）/);
+  assert.match(trends, /加入固定比較頻道（最多 6 個）/);
+  assert.match(trends, /setCohortIds\(requestedChannels\)/);
+  assert.match(trends, /setComparisonIds\(requestedChannels\)/);
   assert.doesNotMatch(trends, /className="comparison-builder-footer"/);
   assert.match(styles, /\.trend-control-grid \{ display: grid; grid-template-columns: repeat\(4, minmax\(120px, 1fr\)\)/);
   assert.match(styles, /\.trend-control-grid \.reference-control, \.trend-control-grid \.comparison-control \{ grid-column: span 2; \}/);
@@ -225,6 +236,10 @@ test("starter preview is fully removed", async () => {
   assert.match(creator, /oauthManagerOpen &&/);
   assert.match(creator, /aria-expanded=\{oauthManagerOpen\}/);
   assert.match(creator, /私人資料只屬於這個頻道，不會加入團隊公開合計或其他頻道比較/);
+  assert.match(creator, /為你挑選的參考頻道/);
+  assert.match(creator, /api\/creator\/recommendations/);
+  assert.match(creator, /分析這組內容環境/);
+  assert.match(creator, /recommendations\.methodology\.audience_boundary/);
   assert.ok(creator.indexOf("WORKSPACE VIEW") < creator.indexOf("ADD MANAGED CHANNEL"));
   assert.ok(creator.indexOf("ADD MANAGED CHANNEL") < creator.indexOf("PRIVATE ANALYTICS CONNECTION"));
   assert.match(creator, /已自動沿用監測首頁資料/);
@@ -245,6 +260,12 @@ test("starter preview is fully removed", async () => {
   assert.match(candidates, /候選數不等於收錄數/);
   assert.match(candidates, /YouTube Search API 不提供命中欄位/);
   assert.match(legalConsent, /同意並開始使用/);
+  assert.match(layout, /<ProductGuide \/>/);
+  assert.match(productGuide, /常用指標怎麼看/);
+  assert.match(productGuide, /稍後再看/);
+  assert.match(productGuide, /公開觀看黏著度/);
+  assert.match(siteHeader, /tai-v-pulse-open-guide/);
+  assert.match(siteHeader, /使用教學/);
   assert.match(packageJson, /PolyForm-Noncommercial-1.0.0/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 });
