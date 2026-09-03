@@ -20,6 +20,8 @@
 - 監測首頁 API 改為回傳全部符合門檻的頻道；介面搜尋與篩選套用完整資料集，表格先渲染 200 個並可逐批再顯示 200 個，避免大量名單只停在舊的 500 筆上限或一次建立過大的畫面。
 - `npm run dev`／`build`／`start` 改由跨平台 Node 啟動器設定 Wrangler LOG 路徑，Windows PowerShell 可直接執行；公開白名單同步包含該啟動器。
 - 驗證完成：collector 46 項、rendered HTML 7 項、TypeScript、vinext production build、SQLite `integrity_check` 與外鍵檢查均通過；lint 為 0 errors，變更頁面只有 4 個既有 `<img>` 警告。已以實際 API 讀回 1,340／1,340 個頻道，並完成桌面與 390 × 844 行動版視覺檢查。
+- PR [#10](https://github.com/Shizumu/tai-v-pulse/pull/10) 已 squash merge 至 `main` commit `598beefa366093925c6a5865b2b989eca91e4639`。標籤 `v0.12.0` 的 [GitHub Actions run 33784175100](https://github.com/Shizumu/tai-v-pulse/actions/runs/33784175100) 全部通過，並建立非草稿、非預發佈的正式 [GitHub Release](https://github.com/Shizumu/tai-v-pulse/releases/tag/v0.12.0)。
+- 已重新下載 GitHub Release 資產驗證：公開 ZIP 332,919 bytes、SHA-256 `265e93ef858c22d1c4ae9a5e3eb32c9598d4c05b88cf91ed0382cae2fe5e0bb6`；Windows 安裝程式 429,056 bytes、SHA-256 `2a6630d1764a21586e23e63a542b7b58b6aed1dc4248e0e1953957e5af8f9a94`，檔案版本 `0.12.0.0`／產品版本 `0.12.0`。兩者均與 sidecar 相符；ZIP 共 57 個檔案，manifest 的 56 條項目與其餘 payload 完全吻合，必要的新功能檔案均存在，`.env.example` 的 API Key 為空白，未發現 `.env`、`work/`、SQLite／DB、Studio CSV／TSV、相依套件、LOG、outputs、Git metadata 或 API Key 格式內容。GitHub `releases/latest` 已回傳 `v0.12.0` 與同一組資產資訊，因此 0.10.0 以上啟動器可偵測此版。
 
 更新日期：2026-09-04
 版本：`0.12.0`
